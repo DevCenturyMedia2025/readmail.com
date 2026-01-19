@@ -3,3 +3,8 @@
 credentials.json
 token.json
 .env
+
+# Secrets
+credentials.json
+token.json
+.env
