@@ -1,22 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-Listener Gmail (push) + Pub/Sub (pull) + procesamiento de correos
-+ Validación: deben llegar mínimo 5 PDFs
-+ FILTRO: solo procesar correos que tengan adjuntos (para evitar newsletters / ruido)
+Listener Gmail (push) + Pub/Sub (pull REST) + procesamiento de correos
++ Validación: mínimo N PDFs
++ Filtro: solo correos con adjuntos (evitar ruido)
++ Catálogo de clientes desde Google Sheets
++ Watch auto-renew
++ Robustez:
+  - ACK SIEMPRE por cada evento Pub/Sub (evita redelivery infinito)
+  - Manejo de 404 en messages.get (mensaje ya no existe) => SKIP
+  - Dedupe de mensajes ya procesados (state)
++ ✅ Radicado secuencial estable por correo (idempotente por messageId)
 
-FLUJO GENERAL:
-1) OAuth: Gmail + Google Sheets (token.json / credentials.json)
-2) Lee catálogo de clientes activos desde Sheets (Clientes!A:B)
-3) Crea/renueva watch de Gmail (users.watch) hacia Pub/Sub (topic)
-4) Escucha Pub/Sub con PULL/REST (sin streaming gRPC para evitar errores SSL)
-5) Por cada evento:
-   - Lee historyId
-   - Consulta Gmail History desde last_history_id
-   - Obtiene messageIds nuevos
-   - Por cada mensaje:
-       a) (nuevo) si NO tiene adjuntos → lo ignoramos
-       b) si tiene adjuntos → valida PDFs mínimos
-       c) imprime resultado (y luego tú conectas: responder correo + Drive)
+Requisitos:
+- credentials.json (OAuth desktop)
+- token.json (se genera)
+- Pub/Sub pull REST requiere ADC:
+    gcloud auth application-default login
+- .env con:
+    GCP_PROJECT_ID=...
+    PUBSUB_SUBSCRIPTION=...
+    PUBSUB_TOPIC_FULL=projects/.../topics/...
+    CLIENT_SHEET_ID=...
+  opcionales:
+    CLIENT_SHEET_RANGE=Clientes!A:B
+    GMAIL_LABEL_IDS=INBOX
+    REQUIRED_PDF_COUNT=5
+    ONLY_WITH_ATTACHMENTS=true
+    KEYWORDS_FILTER=factura,cuenta de cobro,soportes
+    RADICADO_PREFIX=RAD
+    RADICADO_RESET_DAILY=true
+    RADICADO_PAD=6
 """
 
 import base64
@@ -25,7 +38,7 @@ import os
 import os.path
 import re
 import time
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 
@@ -45,9 +58,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # -------------------------
-# Pub/Sub client
-# (usa Application Default Credentials:
-#  gcloud auth application-default login)
+# Pub/Sub client (REST)
 # -------------------------
 from google.cloud import pubsub_v1
 
@@ -55,8 +66,6 @@ from google.cloud import pubsub_v1
 # ============================================================
 # SCOPES (PERMISOS) - OAuth
 # ============================================================
-# gmail.readonly: solo lectura (NO puedes marcar leído, mover labels, etc.)
-# spreadsheets.readonly: solo lectura del catálogo de clientes
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -66,101 +75,164 @@ SCOPES = [
 # ============================================================
 # CONFIG GMAIL / SHEETS
 # ============================================================
-
-# Consulta fallback (en este diseño "push" no dependemos de esto,
-# pero sirve si luego agregas un modo fallback por polling)
-GMAIL_QUERY = os.environ.get("GMAIL_QUERY", "is:unread")
-
-# Máximo de mensajes en algunas lógicas (no se usa directamente en push)
-MAX_MESSAGES = int(os.environ.get("MAX_EMAILS", "10"))
-
-# Google Sheet donde está tu catálogo de clientes.
-SHEET_ID = os.environ.get(
-    "CLIENT_SHEET_ID",
-    "14x7UflRW7P9qIHy65biueQUQjn03WBhV7T6l454VUmQ",
-)
-
-# Rango en tu spreadsheet donde está la tabla (A=cliente, B=estado)
-SHEET_RANGE = os.environ.get("CLIENT_SHEET_RANGE", "Clientes!A:B")
-
+SHEET_ID = os.environ.get("CLIENT_SHEET_ID", "14x7UflRW7P9qIHy65biueQUQjn03WBhV7T6l454VUmQ").strip()
+SHEET_RANGE = os.environ.get("CLIENT_SHEET_RANGE", "Clientes!A:B").strip()
 
 # ============================================================
 # CONFIG PUBSUB
 # ============================================================
-
-# Proyecto GCP donde vive Pub/Sub
-GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-
-# Nombre de la suscripción Pub/Sub (solo el ID, no la ruta completa)
-PUBSUB_SUBSCRIPTION_ID = os.environ.get("PUBSUB_SUBSCRIPTION")
-
-# Topic completo (ruta) donde Gmail envía notificaciones
-PUBSUB_TOPIC_FULL = os.environ.get(
-    "PUBSUB_TOPIC_FULL",
-    f"projects/{GCP_PROJECT_ID}/topics/gmail-inbox-events" if GCP_PROJECT_ID else "",
-)
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "").strip()
+PUBSUB_SUBSCRIPTION_ID = os.environ.get("PUBSUB_SUBSCRIPTION", "").strip()
+PUBSUB_TOPIC_FULL = os.environ.get("PUBSUB_TOPIC_FULL", "").strip()
 
 # Labels que Gmail observa para mandar eventos (por defecto: INBOX)
-WATCH_LABEL_IDS = os.environ.get("GMAIL_LABEL_IDS", "INBOX").split(",")
+WATCH_LABEL_IDS = [x.strip() for x in os.environ.get("GMAIL_LABEL_IDS", "INBOX").split(",") if x.strip()]
 
-# Archivo para persistir:
-# - watch_expiration_ms: expiración del watch
-# - last_history_id: el último historyId procesado
+# Archivo para persistir estado
 STATE_FILE = os.environ.get("GMAIL_WATCH_STATE_FILE", "gmail_watch_state.json")
 
+# Pull tuning
+PUBSUB_PULL_MAX = int(os.environ.get("PUBSUB_PULL_MAX", "10"))
+IDLE_SLEEP_SEC = float(os.environ.get("IDLE_SLEEP_SEC", "1.0"))
+WATCH_RENEW_WINDOW_MS = int(os.environ.get("WATCH_RENEW_WINDOW_MS", str(60 * 60 * 1000)))  # 1h
 
 # ============================================================
 # REQUERIMIENTOS DEL NEGOCIO
 # ============================================================
-
-# Cantidad mínima de PDFs requeridos en un correo "válido"
 REQUIRED_PDF_COUNT = int(os.environ.get("REQUIRED_PDF_COUNT", "5"))
 
-# 🔥 NUEVO: si está en "true", solo procesamos mensajes con adjuntos
-ONLY_PROCESS_EMAILS_WITH_ATTACHMENTS = os.environ.get(
-    "ONLY_WITH_ATTACHMENTS", "true"
-).lower() in ("1", "true", "yes", "y", "si")
+ONLY_PROCESS_EMAILS_WITH_ATTACHMENTS = os.environ.get("ONLY_WITH_ATTACHMENTS", "true").lower() in (
+    "1", "true", "yes", "y", "si"
+)
 
-
-# (Opcional) Filtro extra por palabras clave (súper útil)
-# Ej: SOLO procesar si el subject/cuerpo contiene “factura” o “cuenta de cobro”
-# Si no quieres esto, déjalo vacío en .env
 KEYWORDS_FILTER = [
     k.strip().lower()
     for k in os.environ.get("KEYWORDS_FILTER", "").split(",")
     if k.strip()
 ]
-# Ej .env:
-# KEYWORDS_FILTER=factura,cuenta de cobro,cobro,soportes
+
+# ============================================================
+# DEDUPE / CACHE
+# ============================================================
+PROCESSED_CACHE_LIMIT = int(os.environ.get("PROCESSED_CACHE_LIMIT", "2000"))
+
+# ============================================================
+# ✅ RADICADO SECUENCIAL
+# ============================================================
+RADICADO_PREFIX = os.environ.get("RADICADO_PREFIX", "RAD").strip()
+RADICADO_RESET_DAILY = os.environ.get("RADICADO_RESET_DAILY", "true").lower() in ("1", "true", "yes", "y", "si")
+RADICADO_PAD = int(os.environ.get("RADICADO_PAD", "6"))
+RADICADO_MAP_LIMIT = int(os.environ.get("RADICADO_MAP_LIMIT", "5000"))
+
+
+# ============================================================
+# STATE HELPERS
+# ============================================================
+def load_state() -> Dict:
+    """Lee STATE_FILE y retorna dict (o vacío si no existe/está corrupto)."""
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state: Dict) -> None:
+    """Guarda STATE_FILE."""
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def state_get_processed_set(state: Dict) -> Set[str]:
+    arr = state.get("processed_message_ids") or []
+    if not isinstance(arr, list):
+        return set()
+    return set(str(x) for x in arr)
+
+
+def state_add_processed(state: Dict, message_id: str) -> None:
+    s = state_get_processed_set(state)
+    s.add(str(message_id))
+    if len(s) > PROCESSED_CACHE_LIMIT:
+        s = set(list(s)[-PROCESSED_CACHE_LIMIT:])
+    state["processed_message_ids"] = list(s)
+
+
+# ============================================================
+# ✅ RADICADO HELPERS
+# ============================================================
+def _today_yyyymmdd() -> str:
+    return time.strftime("%Y%m%d")
+
+
+def _get_radicado_map(state: Dict) -> Dict[str, str]:
+    m = state.get("message_radicados") or {}
+    return m if isinstance(m, dict) else {}
+
+
+def _set_radicado_map(state: Dict, m: Dict[str, str]) -> None:
+    state["message_radicados"] = m
+
+
+def get_or_create_radicado(message_id: str, state: Dict) -> str:
+    """
+    Crea un radicado secuencial y lo asocia al message_id.
+    Si el message_id ya tiene radicado, devuelve el mismo (idempotente).
+    Formato:
+      - daily reset: RAD-YYYYMMDD-000001
+      - no reset:    RAD-000001
+    """
+    mid = str(message_id)
+    m = _get_radicado_map(state)
+
+    # Si ya existe => estable
+    if mid in m:
+        return m[mid]
+
+    today = _today_yyyymmdd()
+    last_date = str(state.get("radicado_date") or "")
+    counter = int(state.get("radicado_counter") or 0)
+
+    # Reset diario opcional
+    if RADICADO_RESET_DAILY and last_date != today:
+        counter = 0
+
+    counter += 1
+    state["radicado_counter"] = counter
+    state["radicado_date"] = today
+
+    if RADICADO_RESET_DAILY:
+        radicado = f"{RADICADO_PREFIX}-{today}-{counter:0{RADICADO_PAD}d}"
+    else:
+        radicado = f"{RADICADO_PREFIX}-{counter:0{RADICADO_PAD}d}"
+
+    m[mid] = radicado
+
+    # recorte para que no crezca infinito
+    if len(m) > RADICADO_MAP_LIMIT:
+        keys = list(m.keys())[-RADICADO_MAP_LIMIT:]
+        m = {k: m[k] for k in keys}
+
+    _set_radicado_map(state, m)
+    return radicado
 
 
 # ============================================================
 # UTILIDADES DE TEXTO
 # ============================================================
-
 def _normalize_text(value: str) -> str:
-    """
-    Normaliza texto para matching “permisivo”:
-    - lower()
-    - elimina todo lo que no sea a-z o 0-9
-    Ej: "ACME S.A.S" -> "acmesas"
-    """
     return re.sub(r"[^a-z0-9]", "", (value or "").lower())
 
 
 def _decode_body(data: Optional[str]) -> str:
-    """
-    Decodifica base64 URL-safe que Gmail entrega en body.data.
-    Corrige padding si hace falta.
-    """
     if not data:
         return ""
     try:
-        # Gmail puede mandar base64 sin padding correcto
         missing_padding = len(data) % 4
         if missing_padding:
             data += "=" * (4 - missing_padding)
-
         decoded_bytes = base64.urlsafe_b64decode(data)
         return decoded_bytes.decode("utf-8", errors="ignore")
     except Exception:
@@ -168,25 +240,18 @@ def _decode_body(data: Optional[str]) -> str:
 
 
 def extract_plain_text(payload: Dict) -> str:
-    """
-    Extrae texto plano (text/plain) del payload:
-    - Si payload.body.data existe: decodifica y retorna
-    - Si no: recorre parts buscando text/plain
-    - Si hay multiparts anidados: recursión
-    """
     if not payload:
         return ""
 
-    body = payload.get("body", {})
+    body = payload.get("body", {}) or {}
     data = body.get("data")
     if data:
         return _decode_body(data)
 
     for part in payload.get("parts", []) or []:
         mime_type = part.get("mimeType", "")
-
         if mime_type == "text/plain":
-            return _decode_body(part.get("body", {}).get("data"))
+            return _decode_body((part.get("body", {}) or {}).get("data"))
 
         nested = extract_plain_text(part)
         if nested:
@@ -196,31 +261,24 @@ def extract_plain_text(payload: Dict) -> str:
 
 
 def get_header(payload: Dict, name: str) -> str:
-    """
-    Busca y retorna el valor de un header específico (Subject/From/Date/etc)
-    desde payload.headers
-    """
     target = name.lower()
-    for header in payload.get("headers", []):
-        if header.get("name", "").lower() == target:
-            return header.get("value", "")
+    for header in payload.get("headers", []) or []:
+        if (header.get("name", "") or "").lower() == target:
+            return header.get("value", "") or ""
     return ""
+
+
+def passes_keyword_filter(searchable_text: str) -> bool:
+    if not KEYWORDS_FILTER:
+        return True
+    low = (searchable_text or "").lower()
+    return any(k in low for k in KEYWORDS_FILTER)
 
 
 # ============================================================
 # ADJUNTOS: extraer / validar
 # ============================================================
-
 def _collect_attachments(payload: Dict) -> List[Dict[str, Optional[str]]]:
-    """
-    Recorre recursivamente payload/parts y recolecta adjuntos.
-    Un adjunto común viene como:
-      - part.filename != ""
-      - part.body.attachmentId (no siempre, a veces inline)
-
-    Retorna lista de dicts:
-      { filename, mimeType, attachmentId }
-    """
     attachments: List[Dict[str, Optional[str]]] = []
     if not payload:
         return attachments
@@ -231,49 +289,26 @@ def _collect_attachments(payload: Dict) -> List[Dict[str, Optional[str]]]:
         body = part.get("body", {}) or {}
         attachment_id = body.get("attachmentId")
 
-        # Si el filename existe, lo consideramos adjunto/inline con nombre
         if filename:
-            attachments.append(
-                {"filename": filename, "mimeType": mime_type, "attachmentId": attachment_id}
-            )
+            attachments.append({"filename": filename, "mimeType": mime_type, "attachmentId": attachment_id})
 
-        # Buscar adjuntos en subpartes (recursivo)
         attachments.extend(_collect_attachments(part))
 
     return attachments
 
 
 def _is_pdf(att: Dict[str, Optional[str]]) -> bool:
-    """
-    Identifica PDFs por:
-    - mimeType = application/pdf
-    - o filename termina en .pdf
-    """
     fn = (att.get("filename") or "").lower()
     mt = (att.get("mimeType") or "").lower()
     return mt == "application/pdf" or fn.endswith(".pdf")
 
 
 def has_any_attachment(payload: Dict) -> bool:
-    """
-    Retorna True si el correo tiene al menos 1 adjunto con filename.
-    Ojo: esto no cuenta contenido inline sin filename.
-    """
     atts = _collect_attachments(payload)
     return len(atts) > 0
 
 
 def validate_required_pdfs(payload: Dict, required_count: int) -> Dict[str, object]:
-    """
-    Valida que el correo tenga al menos N PDFs.
-
-    Retorna:
-      ok: bool
-      pdf_count: int
-      missing: int
-      pdf_filenames: List[str]
-      all_attachments: List[Dict]
-    """
     atts = _collect_attachments(payload)
     pdfs = [a for a in atts if _is_pdf(a)]
     pdf_names = [a.get("filename") or "(sin nombre)" for a in pdfs]
@@ -293,17 +328,11 @@ def validate_required_pdfs(payload: Dict, required_count: int) -> Dict[str, obje
 # ============================================================
 # SHEETS: CATÁLOGO CLIENTES
 # ============================================================
-
 def load_client_catalog(sheets_service) -> List[Dict[str, Optional[str]]]:
-    """
-    Lee la hoja y construye catálogo de clientes activos.
-    Espera:
-      A: Cliente
-      B: Estado (Activo/active)
+    if not SHEET_ID:
+        print("⚠️ CLIENT_SHEET_ID vacío. Catálogo de clientes deshabilitado.")
+        return []
 
-    Retorna:
-      [{ name, normalized }]
-    """
     try:
         result = (
             sheets_service.spreadsheets()
@@ -314,7 +343,7 @@ def load_client_catalog(sheets_service) -> List[Dict[str, Optional[str]]]:
     except HttpError as error:
         raise RuntimeError(f"No pude leer Sheets. Error: {error}") from error
 
-    values = result.get("values", [])
+    values = result.get("values", []) or []
     catalog: List[Dict[str, Optional[str]]] = []
 
     for row in values:
@@ -335,24 +364,15 @@ def load_client_catalog(sheets_service) -> List[Dict[str, Optional[str]]]:
 
 
 def find_client(text: str, catalog: List[Dict[str, Optional[str]]]) -> Optional[Dict[str, Optional[str]]]:
-    """
-    Busca coincidencia del nombre normalizado del cliente dentro del texto normalizado del correo.
-    """
     normalized_text = _normalize_text(text)
-
     for client in catalog:
         n = client.get("normalized")
         if n and n in normalized_text:
             return client
-
     return None
 
 
 def determine_payment_type(text: str) -> Optional[str]:
-    """
-    Detecta "contado" o "credito" usando patrones.
-    Retorna None si no encuentra nada.
-    """
     t = (text or "").lower()
 
     contado_patterns = [
@@ -382,29 +402,10 @@ def determine_payment_type(text: str) -> Optional[str]:
     return None
 
 
-def passes_keyword_filter(searchable_text: str) -> bool:
-    """
-    Si KEYWORDS_FILTER está vacío => siempre pasa.
-    Si tiene palabras => el correo debe contener al menos 1 keyword.
-    """
-    if not KEYWORDS_FILTER:
-        return True
-
-    low = (searchable_text or "").lower()
-    return any(k in low for k in KEYWORDS_FILTER)
-
-
 # ============================================================
 # OAUTH: Gmail/Sheets
 # ============================================================
-
 def get_oauth_creds() -> Credentials:
-    """
-    Autenticación OAuth:
-    - Usa token.json si existe
-    - Refresca si está expirado
-    - Si falla refresh: borra token.json y pide login por navegador
-    """
     creds = None
 
     if os.path.exists("token.json"):
@@ -432,71 +433,45 @@ def get_oauth_creds() -> Credentials:
 
 
 # ============================================================
-# STATE: watch / historyId
-# ============================================================
-
-def load_state() -> Dict:
-    """Lee STATE_FILE y retorna dict (o vacío si no existe/está corrupto)."""
-    if not os.path.exists(STATE_FILE):
-        return {}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_state(state: Dict) -> None:
-    """Guarda STATE_FILE."""
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-# ============================================================
 # GMAIL WATCH
 # ============================================================
-
 def ensure_gmail_watch(gmail_service) -> Dict:
-    """
-    Crea o renueva el watch de Gmail.
-    - Si ya existe y expira en > 1h: no hace nada.
-    - Si no existe o expira pronto: crea watch nuevo.
-
-    Gmail envía eventos a Pub/Sub. Esos eventos solo traen historyId.
-    """
     if not GCP_PROJECT_ID or not PUBSUB_TOPIC_FULL or not PUBSUB_SUBSCRIPTION_ID:
         raise RuntimeError(
-            "Faltan env vars: GCP_PROJECT_ID, PUBSUB_TOPIC_FULL (o GCP_PROJECT_ID) y PUBSUB_SUBSCRIPTION."
+            "Faltan env vars: GCP_PROJECT_ID, PUBSUB_TOPIC_FULL y PUBSUB_SUBSCRIPTION."
         )
 
     state = load_state()
     now_ms = int(time.time() * 1000)
     expiration = int(state.get("watch_expiration_ms", 0))
 
-    # Si expira en más de 1 hora, mantenemos
-    if expiration and (expiration - now_ms) > (60 * 60 * 1000):
+    # Si expira en más de WATCH_RENEW_WINDOW_MS, no renovamos
+    if expiration and (expiration - now_ms) > WATCH_RENEW_WINDOW_MS:
         return state
 
     body = {
         "topicName": PUBSUB_TOPIC_FULL,
-        "labelIds": [x.strip() for x in WATCH_LABEL_IDS if x.strip()],
+        "labelIds": WATCH_LABEL_IDS,
         "labelFilterBehavior": "INCLUDE",
     }
 
     resp = gmail_service.users().watch(userId="me", body=body).execute()
 
-    new_state = {
+    # mantener last_history_id si ya existía; si no, usar historyId del watch
+    last_h = state.get("last_history_id") or resp.get("historyId")
+
+    new_state = dict(state)
+    new_state.update({
         "watch_started_at_ms": now_ms,
         "watch_expiration_ms": int(resp.get("expiration", 0)),
-        # mantenemos last_history_id si ya lo teníamos (para no perder continuidad)
-        "last_history_id": state.get("last_history_id") or resp.get("historyId"),
-    }
+        "last_history_id": str(last_h) if last_h else None,
+    })
 
     save_state(new_state)
 
     print(
-        f"✅ Watch activo. Expira(ms): {new_state['watch_expiration_ms']} | "
-        f"historyId base: {new_state['last_history_id']}"
+        f"✅ Watch activo. Expira(ms): {new_state.get('watch_expiration_ms')} | "
+        f"last_history_id: {new_state.get('last_history_id')}"
     )
 
     return new_state
@@ -505,16 +480,15 @@ def ensure_gmail_watch(gmail_service) -> Dict:
 # ============================================================
 # HISTORY -> messageIds
 # ============================================================
-
-def fetch_new_message_ids(gmail_service, start_history_id: str) -> Set[str]:
+def fetch_new_message_ids(gmail_service, start_history_id: str) -> Tuple[Set[str], Optional[str]]:
     """
-    Consulta Gmail History y retorna messageIds agregados desde startHistoryId.
-    - Filtra historyTypes=["messageAdded"]
-    - Maneja paginación
-    - Actualiza last_history_id al final
+    Retorna:
+      - set(message_ids) agregados (messageAdded)
+      - latest_history_id (para actualizar last_history_id)
     """
     message_ids: Set[str] = set()
     page_token = None
+    latest_history_id: Optional[str] = None
 
     while True:
         resp = gmail_service.users().history().list(
@@ -531,51 +505,69 @@ def fetch_new_message_ids(gmail_service, start_history_id: str) -> Set[str]:
                     message_ids.add(mid)
 
         page_token = resp.get("nextPageToken")
+        if resp.get("historyId"):
+            latest_history_id = str(resp.get("historyId"))
+
         if page_token:
             continue
 
-        latest = resp.get("historyId")
-        if latest:
-            st = load_state()
-            st["last_history_id"] = str(latest)
-            save_state(st)
-
         break
 
-    return message_ids
+    return message_ids, latest_history_id
+
+
+def update_last_history_id(latest_history_id: Optional[str]) -> None:
+    if not latest_history_id:
+        return
+    st = load_state()
+    st["last_history_id"] = str(latest_history_id)
+    save_state(st)
 
 
 # ============================================================
-# PROCESAR MENSAJE
+# PROCESAR MENSAJE (con 404-skip + radicado + dedupe)
 # ============================================================
+def safe_get_message_full(gmail_service, message_id: str) -> Optional[Dict]:
+    try:
+        return gmail_service.users().messages().get(
+            userId="me",
+            id=message_id,
+            format="full"
+        ).execute()
+    except HttpError as e:
+        # 404: mensaje ya no existe en este buzón (borrado/movido)
+        if getattr(e, "resp", None) is not None and e.resp.status == 404:
+            print(f"⚠️ Gmail 404: messageId {message_id} ya no existe. SKIP.")
+            return None
+        raise
+
 
 def process_message(gmail_service, message_id: str, client_catalog: List[Dict[str, Optional[str]]]) -> None:
-    """
-    Procesa un correo:
-    - descarga mensaje full
-    - (nuevo) filtro: si no hay adjuntos -> ignorar
-    - extrae headers, body
-    - (opcional) filtro por keywords
-    - identifica cliente / tipo de pago
-    - valida PDFs mínimos
-    - imprime resultado
-    """
-    msg = gmail_service.users().messages().get(
-        userId="me",
-        id=message_id,
-        format="full"
-    ).execute()
+    # state y dedupe
+    state = load_state()
+    processed = state_get_processed_set(state)
+    if message_id in processed:
+        return
 
-    payload = msg.get("payload", {})
-    snippet = msg.get("snippet", "")
+    # ✅ radicado estable por message_id
+    radicado = get_or_create_radicado(message_id, state)
+    save_state(state)
 
-    # ✅ NUEVO: filtro "solo adjuntos"
-    if ONLY_PROCESS_EMAILS_WITH_ATTACHMENTS:
-        if not has_any_attachment(payload):
-            # Si quieres ver qué se está ignorando, descomenta el print:
-            # subject_tmp = get_header(payload, "Subject")
-            # print(f"⏭️ Ignorado (sin adjuntos): {subject_tmp or snippet or message_id}")
-            return
+    msg = safe_get_message_full(gmail_service, message_id)
+    if not msg:
+        # 404 => lo marcamos procesado para no insistir
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
+    payload = msg.get("payload", {}) or {}
+    snippet = msg.get("snippet", "") or ""
+
+    # ✅ filtro "solo adjuntos"
+    if ONLY_PROCESS_EMAILS_WITH_ATTACHMENTS and not has_any_attachment(payload):
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
 
     subject = get_header(payload, "Subject")
     from_header = get_header(payload, "From")
@@ -584,18 +576,19 @@ def process_message(gmail_service, message_id: str, client_catalog: List[Dict[st
 
     searchable_text = f"{subject}\n{from_header}\n{body_text}\n{snippet}"
 
-    # ✅ Opcional: filtro por keywords (si KEYWORDS_FILTER no está vacío)
+    # ✅ filtro por keywords opcional
     if not passes_keyword_filter(searchable_text):
-        # print(f"⏭️ Ignorado (sin keywords): {subject or snippet or message_id}")
+        state_add_processed(state, message_id)
+        save_state(state)
         return
 
     client = find_client(searchable_text, client_catalog) if client_catalog else None
     payment_type = determine_payment_type(searchable_text)
-
     pdf_validation = validate_required_pdfs(payload, required_count=REQUIRED_PDF_COUNT)
 
     print("\n" + "=" * 70)
-    print(f"🆕 Nuevo evento → Message ID: {message_id}")
+    print(f"🆕 Procesado → Message ID: {message_id}")
+    print(f"🧾 Radicado: {radicado}")
     print(f"From: {from_header or '(sin From)'}")
     print(f"Date: {date_header or '(sin Date)'}")
     print(f"Subject: {subject or snippet or '(sin subject)'}")
@@ -605,7 +598,7 @@ def process_message(gmail_service, message_id: str, client_catalog: List[Dict[st
     if not pdf_validation["ok"]:
         print("🚫 Estado: RECHAZADO")
         print(
-            f"Motivo: PDF incompletos. Llegaron {pdf_validation['pdf_count']} / "
+            f"Motivo: PDFs incompletos. Llegaron {pdf_validation['pdf_count']} / "
             f"{REQUIRED_PDF_COUNT} (faltan {pdf_validation['missing']})."
         )
         print("PDFs detectados:", pdf_validation["pdf_filenames"])
@@ -616,18 +609,15 @@ def process_message(gmail_service, message_id: str, client_catalog: List[Dict[st
 
     print("=" * 70)
 
+    # ✅ marcar procesado
+    state_add_processed(state, message_id)
+    save_state(state)
+
 
 # ============================================================
-# PUBSUB LISTENER (PULL/REST)
+# PUBSUB LISTENER (PULL/REST) - ACK SIEMPRE
 # ============================================================
-
 def listen_pubsub(gmail_service, client_catalog: List[Dict[str, Optional[str]]]) -> None:
-    """
-    Listener Pub/Sub por PULL usando REST (sin streaming gRPC).
-    - Hace pull cada ~1s si no hay mensajes
-    - ACK al final de procesar
-    - Backoff exponencial si hay error de red
-    """
     subscriber = pubsub_v1.SubscriberClient(transport="rest")
     subscription_path = f"projects/{GCP_PROJECT_ID}/subscriptions/{PUBSUB_SUBSCRIPTION_ID}"
     print(f"👂 Escuchando Pub/Sub (PULL/REST): {subscription_path}")
@@ -636,49 +626,65 @@ def listen_pubsub(gmail_service, client_catalog: List[Dict[str, Optional[str]]])
 
     while True:
         try:
+            # renovar watch periódicamente (barato)
+            ensure_gmail_watch(gmail_service)
+
             response = subscriber.pull(
-                request={"subscription": subscription_path, "max_messages": 10}
+                request={"subscription": subscription_path, "max_messages": PUBSUB_PULL_MAX}
             )
 
-            # Si no hay mensajes, dormimos 1s y seguimos
             if not response.received_messages:
-                time.sleep(1)
+                time.sleep(IDLE_SLEEP_SEC)
                 backoff = 1
                 continue
 
-            ack_ids = []
-
-            # Procesamos cada evento Pub/Sub
             for rm in response.received_messages:
-                ack_ids.append(rm.ack_id)
+                ack_id = rm.ack_id
 
-                raw = rm.message.data.decode("utf-8")
-                payload = json.loads(raw)
+                try:
+                    raw = rm.message.data.decode("utf-8")
+                    payload = json.loads(raw)
 
-                history_id = str(payload.get("historyId", "")).strip()
-                email_addr = payload.get("emailAddress", "")
+                    history_id = str(payload.get("historyId", "")).strip()
+                    email_addr = payload.get("emailAddress", "")
 
-                if not history_id:
-                    # Sin historyId no podemos consultar Gmail History
-                    print("⚠️ Evento sin historyId (lo ignoro).")
-                    continue
+                    if not history_id:
+                        print("⚠️ Evento sin historyId (lo ignoro).")
+                        continue
 
-                state = load_state()
-                start_history = str(state.get("last_history_id") or history_id)
+                    state = load_state()
+                    last_history = str(state.get("last_history_id") or "").strip()
 
-                new_ids = fetch_new_message_ids(gmail_service, start_history)
+                    # Si es primer arranque y no hay last_history_id, inicializamos y ya
+                    if not last_history:
+                        update_last_history_id(history_id)
+                        print(f"🔧 Inicialicé last_history_id={history_id} (primer evento).")
+                        continue
 
-                if not new_ids:
-                    print(f"🔔 Evento ({email_addr}) historyId={history_id} → sin messageAdded nuevos (normal).")
-                else:
-                    print(f"🔔 Evento ({email_addr}) historyId={history_id} → {len(new_ids)} mensaje(s) nuevo(s)")
-                    for mid in new_ids:
-                        process_message(gmail_service, mid, client_catalog)
+                    new_ids, latest_history = fetch_new_message_ids(gmail_service, last_history)
 
-            # ACK: confirmamos a Pub/Sub que ya procesamos esos eventos
-            subscriber.acknowledge(
-                request={"subscription": subscription_path, "ack_ids": ack_ids}
-            )
+                    # actualizamos last_history_id siempre al latest (si viene)
+                    if latest_history:
+                        update_last_history_id(latest_history)
+
+                    if not new_ids:
+                        print(f"🔔 Evento ({email_addr}) historyId={history_id} → sin messageAdded nuevos (normal).")
+                    else:
+                        print(f"🔔 Evento ({email_addr}) historyId={history_id} → {len(new_ids)} mensaje(s) nuevo(s)")
+                        for mid in new_ids:
+                            process_message(gmail_service, mid, client_catalog)
+
+                except Exception as e:
+                    print(f"❌ Error procesando evento Pub/Sub: {e}")
+
+                finally:
+                    # ✅ ACK SIEMPRE (evita reentregas infinitas)
+                    try:
+                        subscriber.acknowledge(
+                            request={"subscription": subscription_path, "ack_ids": [ack_id]}
+                        )
+                    except Exception as e:
+                        print(f"⚠️ No pude ACK (Pub/Sub reintentará): {e}")
 
             backoff = 1
 
@@ -694,26 +700,20 @@ def listen_pubsub(gmail_service, client_catalog: List[Dict[str, Optional[str]]])
 # ============================================================
 # MAIN
 # ============================================================
-
 def main():
-    """
-    Orquestador:
-    - OAuth Gmail/Sheets
-    - Construye services
-    - Carga catálogo de clientes
-    - Asegura watch
-    - Escucha Pub/Sub
-    """
     creds = get_oauth_creds()
 
     gmail_service = build("gmail", "v1", credentials=creds)
     sheets_service = build("sheets", "v4", credentials=creds)
 
+    # sanity check: quién es "me"
+    profile = gmail_service.users().getProfile(userId="me").execute()
+    print("✅ Autenticado como:", profile.get("emailAddress"))
+
     client_catalog = load_client_catalog(sheets_service)
     print(f"✅ Catálogo cargado: {len(client_catalog)} clientes activos")
 
     ensure_gmail_watch(gmail_service)
-
     listen_pubsub(gmail_service, client_catalog)
 
 

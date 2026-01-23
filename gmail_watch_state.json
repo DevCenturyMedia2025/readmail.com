@@ -1,5 +1,17 @@
 {
   "watch_started_at_ms": 1768945515833,
   "watch_expiration_ms": 1769550316488,
-  "last_history_id": "608609"
+  "last_history_id": "610847",
+  "radicado_counter": 3,
+  "radicado_date": "20260123",
+  "message_radicados": {
+    "19bec4672c1b4ce6": "RAD-20260123-000001",
+    "19bebdd9d72ba235": "RAD-20260123-000002",
+    "19becbd458e40455": "RAD-20260123-000003"
+  },
+  "processed_message_ids": [
+    "19bec4672c1b4ce6",
+    "19bebdd9d72ba235",
+    "19becbd458e40455"
+  ]
 }
