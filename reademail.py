@@ -1,27 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-Listener Gmail (push) + Pub/Sub (pull REST) + procesamiento de correos
-+ Validación: mínimo N PDFs
-+ Filtro: solo correos con adjuntos (evitar ruido)
-+ Catálogo de clientes desde Google Sheets
-+ Watch auto-renew
-+ Robustez:
-  - ACK SIEMPRE por cada evento Pub/Sub (evita redelivery infinito)
-  - Manejo de 404 en messages.get (mensaje ya no existe) => SKIP
-  - Dedupe de mensajes ya procesados (state)
-+ ✅ Radicado secuencial estable por correo (idempotente por messageId)
+Gmail push listener: Gmail Watch -> Pub/Sub (PULL/REST) -> History -> Messages
+
+Incluye:
+- ✅ Radicado secuencial estable por correo (idempotente por Gmail messageId)
+- ✅ Validaciones del comunicado 2026:
+  - Recepción: L–V 9:00 a.m. a 5:00 p.m.
+  - Cierre mensual 2026 (si llega después => RECHAZADO)
+  - No links (http/https/www) => RECHAZADO
+  - Adjuntos obligatorios (y validación por tipo de factura)
+- ✅ Formato obligatorio en ASUNTO o CUERPO:
+  - CLIENTE: <nombre>
+  - COBRO: CONTADO | CREDITO | ANTICIPO
+  - FACTURA: NORMAL | ELECTRONICA
+- ✅ Reglas de adjuntos según FACTURA:
+  - ELECTRONICA: PDF + XML (obligatorios), y NO otros tipos
+  - NORMAL: SOLO PDF (XML prohibido)
+- ✅ Reglas base:
+  - Mínimo REQUIRED_PDF_COUNT PDFs
+  - (opcional) solo procesar si hay adjuntos
+  - (opcional) filtro keywords
+- ✅ Robustez:
+  - ACK SIEMPRE por cada evento Pub/Sub
+  - Manejo 404 en messages.get => SKIP
+  - Dedupe por state file
+  - Watch auto-renew
 
 Requisitos:
 - credentials.json (OAuth desktop)
 - token.json (se genera)
 - Pub/Sub pull REST requiere ADC:
     gcloud auth application-default login
-- .env con:
+- .env mínimo:
     GCP_PROJECT_ID=...
     PUBSUB_SUBSCRIPTION=...
     PUBSUB_TOPIC_FULL=projects/.../topics/...
     CLIENT_SHEET_ID=...
-  opcionales:
+Opcionales:
     CLIENT_SHEET_RANGE=Clientes!A:B
     GMAIL_LABEL_IDS=INBOX
     REQUIRED_PDF_COUNT=5
@@ -41,15 +56,8 @@ import time
 from typing import Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
-
-# -------------------------
-# Carga variables desde .env
-# -------------------------
 load_dotenv()
 
-# -------------------------
-# Google Auth / APIs
-# -------------------------
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
@@ -57,48 +65,36 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# -------------------------
-# Pub/Sub client (REST)
-# -------------------------
 from google.cloud import pubsub_v1
+
+from datetime import datetime, timezone, timedelta
 
 
 # ============================================================
-# SCOPES (PERMISOS) - OAuth
+# SCOPES
 # ============================================================
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 
-
 # ============================================================
-# CONFIG GMAIL / SHEETS
+# CONFIG (ENV)
 # ============================================================
 SHEET_ID = os.environ.get("CLIENT_SHEET_ID", "14x7UflRW7P9qIHy65biueQUQjn03WBhV7T6l454VUmQ").strip()
 SHEET_RANGE = os.environ.get("CLIENT_SHEET_RANGE", "Clientes!A:B").strip()
 
-# ============================================================
-# CONFIG PUBSUB
-# ============================================================
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "").strip()
 PUBSUB_SUBSCRIPTION_ID = os.environ.get("PUBSUB_SUBSCRIPTION", "").strip()
 PUBSUB_TOPIC_FULL = os.environ.get("PUBSUB_TOPIC_FULL", "").strip()
 
-# Labels que Gmail observa para mandar eventos (por defecto: INBOX)
 WATCH_LABEL_IDS = [x.strip() for x in os.environ.get("GMAIL_LABEL_IDS", "INBOX").split(",") if x.strip()]
-
-# Archivo para persistir estado
 STATE_FILE = os.environ.get("GMAIL_WATCH_STATE_FILE", "gmail_watch_state.json")
 
-# Pull tuning
 PUBSUB_PULL_MAX = int(os.environ.get("PUBSUB_PULL_MAX", "10"))
 IDLE_SLEEP_SEC = float(os.environ.get("IDLE_SLEEP_SEC", "1.0"))
 WATCH_RENEW_WINDOW_MS = int(os.environ.get("WATCH_RENEW_WINDOW_MS", str(60 * 60 * 1000)))  # 1h
 
-# ============================================================
-# REQUERIMIENTOS DEL NEGOCIO
-# ============================================================
 REQUIRED_PDF_COUNT = int(os.environ.get("REQUIRED_PDF_COUNT", "5"))
 
 ONLY_PROCESS_EMAILS_WITH_ATTACHMENTS = os.environ.get("ONLY_WITH_ATTACHMENTS", "true").lower() in (
@@ -111,25 +107,29 @@ KEYWORDS_FILTER = [
     if k.strip()
 ]
 
-# ============================================================
-# DEDUPE / CACHE
-# ============================================================
 PROCESSED_CACHE_LIMIT = int(os.environ.get("PROCESSED_CACHE_LIMIT", "2000"))
 
-# ============================================================
-# ✅ RADICADO SECUENCIAL
-# ============================================================
+# ✅ RADICADO
 RADICADO_PREFIX = os.environ.get("RADICADO_PREFIX", "RAD").strip()
 RADICADO_RESET_DAILY = os.environ.get("RADICADO_RESET_DAILY", "true").lower() in ("1", "true", "yes", "y", "si")
 RADICADO_PAD = int(os.environ.get("RADICADO_PAD", "6"))
 RADICADO_MAP_LIMIT = int(os.environ.get("RADICADO_MAP_LIMIT", "5000"))
 
+# ✅ Reglas comunicado 2026
+TZ_BOGOTA = timezone(timedelta(hours=-5))
+RECEPTION_START_HOUR = 9
+RECEPTION_END_HOUR = 17
+
+CLOSING_2026 = {
+    1: 28, 2: 25, 3: 27, 4: 28, 5: 27, 6: 24,
+    7: 29, 8: 27, 9: 28, 10: 28, 11: 26, 12: 14
+}
+
 
 # ============================================================
-# STATE HELPERS
+# STATE
 # ============================================================
 def load_state() -> Dict:
-    """Lee STATE_FILE y retorna dict (o vacío si no existe/está corrupto)."""
     if not os.path.exists(STATE_FILE):
         return {}
     try:
@@ -138,19 +138,15 @@ def load_state() -> Dict:
     except Exception:
         return {}
 
-
 def save_state(state: Dict) -> None:
-    """Guarda STATE_FILE."""
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
-
 
 def state_get_processed_set(state: Dict) -> Set[str]:
     arr = state.get("processed_message_ids") or []
     if not isinstance(arr, list):
         return set()
     return set(str(x) for x in arr)
-
 
 def state_add_processed(state: Dict, message_id: str) -> None:
     s = state_get_processed_set(state)
@@ -161,33 +157,22 @@ def state_add_processed(state: Dict, message_id: str) -> None:
 
 
 # ============================================================
-# ✅ RADICADO HELPERS
+# RADICADO
 # ============================================================
 def _today_yyyymmdd() -> str:
     return time.strftime("%Y%m%d")
-
 
 def _get_radicado_map(state: Dict) -> Dict[str, str]:
     m = state.get("message_radicados") or {}
     return m if isinstance(m, dict) else {}
 
-
 def _set_radicado_map(state: Dict, m: Dict[str, str]) -> None:
     state["message_radicados"] = m
 
-
 def get_or_create_radicado(message_id: str, state: Dict) -> str:
-    """
-    Crea un radicado secuencial y lo asocia al message_id.
-    Si el message_id ya tiene radicado, devuelve el mismo (idempotente).
-    Formato:
-      - daily reset: RAD-YYYYMMDD-000001
-      - no reset:    RAD-000001
-    """
     mid = str(message_id)
     m = _get_radicado_map(state)
 
-    # Si ya existe => estable
     if mid in m:
         return m[mid]
 
@@ -195,7 +180,6 @@ def get_or_create_radicado(message_id: str, state: Dict) -> str:
     last_date = str(state.get("radicado_date") or "")
     counter = int(state.get("radicado_counter") or 0)
 
-    # Reset diario opcional
     if RADICADO_RESET_DAILY and last_date != today:
         counter = 0
 
@@ -210,7 +194,6 @@ def get_or_create_radicado(message_id: str, state: Dict) -> str:
 
     m[mid] = radicado
 
-    # recorte para que no crezca infinito
     if len(m) > RADICADO_MAP_LIMIT:
         keys = list(m.keys())[-RADICADO_MAP_LIMIT:]
         m = {k: m[k] for k in keys}
@@ -220,11 +203,10 @@ def get_or_create_radicado(message_id: str, state: Dict) -> str:
 
 
 # ============================================================
-# UTILIDADES DE TEXTO
+# TEXT UTIL
 # ============================================================
 def _normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (value or "").lower())
-
 
 def _decode_body(data: Optional[str]) -> str:
     if not data:
@@ -238,11 +220,9 @@ def _decode_body(data: Optional[str]) -> str:
     except Exception:
         return ""
 
-
 def extract_plain_text(payload: Dict) -> str:
     if not payload:
         return ""
-
     body = payload.get("body", {}) or {}
     data = body.get("data")
     if data:
@@ -252,13 +232,10 @@ def extract_plain_text(payload: Dict) -> str:
         mime_type = part.get("mimeType", "")
         if mime_type == "text/plain":
             return _decode_body((part.get("body", {}) or {}).get("data"))
-
         nested = extract_plain_text(part)
         if nested:
             return nested
-
     return ""
-
 
 def get_header(payload: Dict, name: str) -> str:
     target = name.lower()
@@ -267,16 +244,60 @@ def get_header(payload: Dict, name: str) -> str:
             return header.get("value", "") or ""
     return ""
 
-
 def passes_keyword_filter(searchable_text: str) -> bool:
     if not KEYWORDS_FILTER:
         return True
     low = (searchable_text or "").lower()
     return any(k in low for k in KEYWORDS_FILTER)
 
+def contains_forbidden_links(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"(https?://|www\.)", text, re.IGNORECASE))
+
 
 # ============================================================
-# ADJUNTOS: extraer / validar
+# TIME RULES
+# ============================================================
+def gmail_internaldate_to_dt_bogota(msg: Dict) -> Optional[datetime]:
+    try:
+        ms = int(msg.get("internalDate", 0))
+        if not ms:
+            return None
+        dt_utc = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        return dt_utc.astimezone(TZ_BOGOTA)
+    except Exception:
+        return None
+
+def is_within_receiving_window(dt: datetime) -> bool:
+    if not dt:
+        return True
+    weekday = dt.weekday()  # 0=Mon..6=Sun
+    if weekday > 4:
+        return False
+    hour, minute = dt.hour, dt.minute
+    if hour < RECEPTION_START_HOUR:
+        return False
+    if hour > RECEPTION_END_HOUR:
+        return False
+    if hour == RECEPTION_END_HOUR and minute > 0:
+        return False
+    return True
+
+def is_after_monthly_closing_2026(dt: datetime) -> bool:
+    if not dt:
+        return False
+    if dt.year != 2026:
+        return False
+    close_day = CLOSING_2026.get(dt.month)
+    if not close_day:
+        return False
+    closing_date = datetime(dt.year, dt.month, close_day, 23, 59, 59, tzinfo=dt.tzinfo)
+    return dt > closing_date
+
+
+# ============================================================
+# ATTACHMENTS
 # ============================================================
 def _collect_attachments(payload: Dict) -> List[Dict[str, Optional[str]]]:
     attachments: List[Dict[str, Optional[str]]] = []
@@ -296,23 +317,23 @@ def _collect_attachments(payload: Dict) -> List[Dict[str, Optional[str]]]:
 
     return attachments
 
-
 def _is_pdf(att: Dict[str, Optional[str]]) -> bool:
     fn = (att.get("filename") or "").lower()
     mt = (att.get("mimeType") or "").lower()
     return mt == "application/pdf" or fn.endswith(".pdf")
 
+def _is_xml(att: Dict[str, Optional[str]]) -> bool:
+    fn = (att.get("filename") or "").lower()
+    mt = (att.get("mimeType") or "").lower()
+    return fn.endswith(".xml") or mt in ("application/xml", "text/xml")
 
 def has_any_attachment(payload: Dict) -> bool:
-    atts = _collect_attachments(payload)
-    return len(atts) > 0
-
+    return len(_collect_attachments(payload)) > 0
 
 def validate_required_pdfs(payload: Dict, required_count: int) -> Dict[str, object]:
     atts = _collect_attachments(payload)
     pdfs = [a for a in atts if _is_pdf(a)]
     pdf_names = [a.get("filename") or "(sin nombre)" for a in pdfs]
-
     pdf_count = len(pdfs)
     missing = max(0, required_count - pdf_count)
 
@@ -326,20 +347,84 @@ def validate_required_pdfs(payload: Dict, required_count: int) -> Dict[str, obje
 
 
 # ============================================================
-# SHEETS: CATÁLOGO CLIENTES
+# ✅ NUEVO: CAMPOS OBLIGATORIOS EN ASUNTO/CUERPO
+# ============================================================
+def parse_radicacion_fields(subject: str, body_text: str) -> Dict[str, Optional[str]]:
+    """
+    Busca en asunto o cuerpo:
+      CLIENTE: <texto>
+      COBRO: CONTADO | CREDITO | CRÉDITO | ANTICIPO
+      FACTURA: NORMAL | ELECTRONICA | ELECTRÓNICA
+    Captura hasta salto de línea o |.
+    """
+    haystack = f"{subject or ''}\n{body_text or ''}"
+
+    def pick(pattern: str) -> Optional[str]:
+        m = re.search(pattern, haystack, flags=re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    cliente = pick(r"CLIENTE\s*:\s*([^\n\|]+)")
+    cobro = pick(r"COBRO\s*:\s*(CONTADO|CREDITO|CRÉDITO|ANTICIPO)")
+    factura = pick(r"FACTURA\s*:\s*(NORMAL|ELECTRONICA|ELECTRÓNICA)")
+
+    if cobro:
+        cobro = cobro.upper().replace("CRÉDITO", "CREDITO")
+    if factura:
+        factura = factura.upper().replace("ELECTRÓNICA", "ELECTRONICA")
+
+    return {"cliente": cliente, "cobro": cobro, "factura": factura}
+
+def validate_required_radicacion_fields(fields: Dict[str, Optional[str]]) -> List[str]:
+    missing = []
+    if not fields.get("cliente"):
+        missing.append("CLIENTE")
+    if not fields.get("cobro"):
+        missing.append("COBRO (CONTADO|CREDITO|ANTICIPO)")
+    if not fields.get("factura"):
+        missing.append("FACTURA (NORMAL|ELECTRONICA)")
+    return missing
+
+def validate_invoice_type_attachments(factura_type: str, attachments: List[Dict[str, Optional[str]]]) -> List[str]:
+    """
+    Reglas duras:
+    - ELECTRONICA: debe tener >=1 PDF y >=1 XML. Solo PDF/XML permitidos.
+    - NORMAL: solo PDF (si trae XML => error).
+    """
+    errors = []
+    has_pdf = any(_is_pdf(a) for a in attachments)
+    has_xml = any(_is_xml(a) for a in attachments)
+
+    if factura_type == "ELECTRONICA":
+        # no permitir otros tipos
+        for a in attachments:
+            if not (_is_pdf(a) or _is_xml(a)):
+                errors.append(f"Adjunto no permitido para FACTURA ELECTRÓNICA: {a.get('filename')}")
+        if not has_pdf:
+            errors.append("FACTURA ELECTRÓNICA requiere PDF (representación gráfica).")
+        if not has_xml:
+            errors.append("FACTURA ELECTRÓNICA requiere XML.")
+    else:  # NORMAL
+        for a in attachments:
+            if not _is_pdf(a):
+                errors.append(f"Adjunto no permitido (FACTURA NORMAL solo PDF): {a.get('filename')}")
+        if has_xml:
+            errors.append("FACTURA NORMAL no debe incluir XML (solo PDF).")
+
+    return errors
+
+
+# ============================================================
+# SHEETS: CLIENT CATALOG
 # ============================================================
 def load_client_catalog(sheets_service) -> List[Dict[str, Optional[str]]]:
     if not SHEET_ID:
-        print("⚠️ CLIENT_SHEET_ID vacío. Catálogo de clientes deshabilitado.")
+        print("⚠️ CLIENT_SHEET_ID vacío. Catálogo deshabilitado.")
         return []
 
     try:
-        result = (
-            sheets_service.spreadsheets()
-            .values()
-            .get(spreadsheetId=SHEET_ID, range=SHEET_RANGE)
-            .execute()
-        )
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=SHEET_RANGE
+        ).execute()
     except HttpError as error:
         raise RuntimeError(f"No pude leer Sheets. Error: {error}") from error
 
@@ -349,61 +434,37 @@ def load_client_catalog(sheets_service) -> List[Dict[str, Optional[str]]]:
     for row in values:
         if not row:
             continue
-
         name = (row[0] or "").strip()
         if not name or name.lower() == "cliente":
             continue
-
         status = (row[1] if len(row) > 1 else "").strip().lower()
         if status not in {"activo", "active"}:
             continue
-
         catalog.append({"name": name, "normalized": _normalize_text(name)})
 
     return catalog
 
-
-def find_client(text: str, catalog: List[Dict[str, Optional[str]]]) -> Optional[Dict[str, Optional[str]]]:
-    normalized_text = _normalize_text(text)
-    for client in catalog:
-        n = client.get("normalized")
-        if n and n in normalized_text:
-            return client
-    return None
-
-
-def determine_payment_type(text: str) -> Optional[str]:
-    t = (text or "").lower()
-
-    contado_patterns = [
-        r"\bcontado\b",
-        r"\bcontra\s*entrega\b",
-        r"\binmediato\b",
-        r"\bde\s*una\b",
-        r"\bmismo\s*d[ií]a\b",
-    ]
-
-    credito_patterns = [
-        r"\bcredito\b", r"\bcrédito\b",
-        r"\bplazo\b",
-        r"\bnet\s*30\b", r"\bnet\s*45\b", r"\bnet\s*60\b",
-        r"\b30\s*d[ií]as\b", r"\b45\s*d[ií]as\b", r"\b60\s*d[ií]as\b", r"\b90\s*d[ií]as\b",
-        r"\ba\s*\d{2}\s*d[ií]as\b",
-    ]
-
-    for p in contado_patterns:
-        if re.search(p, t):
-            return "contado"
-
-    for p in credito_patterns:
-        if re.search(p, t):
-            return "credito"
-
+def find_client_exact_or_normalized(cliente_field: str, catalog: List[Dict[str, Optional[str]]]) -> Optional[Dict[str, Optional[str]]]:
+    """
+    Valida CLIENTE declarado contra catálogo activo.
+    Matching permisivo por normalizado.
+    """
+    if not cliente_field:
+        return None
+    n = _normalize_text(cliente_field)
+    for c in catalog:
+        if c.get("normalized") == n:
+            return c
+    # Permite "contiene" (por si ponen ACME SAS y en catálogo ACME S.A.S)
+    for c in catalog:
+        cn = c.get("normalized") or ""
+        if cn and (cn in n or n in cn):
+            return c
     return None
 
 
 # ============================================================
-# OAUTH: Gmail/Sheets
+# OAUTH
 # ============================================================
 def get_oauth_creds() -> Credentials:
     creds = None
@@ -433,19 +494,16 @@ def get_oauth_creds() -> Credentials:
 
 
 # ============================================================
-# GMAIL WATCH
+# WATCH
 # ============================================================
 def ensure_gmail_watch(gmail_service) -> Dict:
     if not GCP_PROJECT_ID or not PUBSUB_TOPIC_FULL or not PUBSUB_SUBSCRIPTION_ID:
-        raise RuntimeError(
-            "Faltan env vars: GCP_PROJECT_ID, PUBSUB_TOPIC_FULL y PUBSUB_SUBSCRIPTION."
-        )
+        raise RuntimeError("Faltan env vars: GCP_PROJECT_ID, PUBSUB_TOPIC_FULL, PUBSUB_SUBSCRIPTION.")
 
     state = load_state()
     now_ms = int(time.time() * 1000)
     expiration = int(state.get("watch_expiration_ms", 0))
 
-    # Si expira en más de WATCH_RENEW_WINDOW_MS, no renovamos
     if expiration and (expiration - now_ms) > WATCH_RENEW_WINDOW_MS:
         return state
 
@@ -457,7 +515,6 @@ def ensure_gmail_watch(gmail_service) -> Dict:
 
     resp = gmail_service.users().watch(userId="me", body=body).execute()
 
-    # mantener last_history_id si ya existía; si no, usar historyId del watch
     last_h = state.get("last_history_id") or resp.get("historyId")
 
     new_state = dict(state)
@@ -473,19 +530,13 @@ def ensure_gmail_watch(gmail_service) -> Dict:
         f"✅ Watch activo. Expira(ms): {new_state.get('watch_expiration_ms')} | "
         f"last_history_id: {new_state.get('last_history_id')}"
     )
-
     return new_state
 
 
 # ============================================================
-# HISTORY -> messageIds
+# HISTORY
 # ============================================================
 def fetch_new_message_ids(gmail_service, start_history_id: str) -> Tuple[Set[str], Optional[str]]:
-    """
-    Retorna:
-      - set(message_ids) agregados (messageAdded)
-      - latest_history_id (para actualizar last_history_id)
-    """
     message_ids: Set[str] = set()
     page_token = None
     latest_history_id: Optional[str] = None
@@ -515,7 +566,6 @@ def fetch_new_message_ids(gmail_service, start_history_id: str) -> Tuple[Set[str
 
     return message_ids, latest_history_id
 
-
 def update_last_history_id(latest_history_id: Optional[str]) -> None:
     if not latest_history_id:
         return
@@ -525,7 +575,7 @@ def update_last_history_id(latest_history_id: Optional[str]) -> None:
 
 
 # ============================================================
-# PROCESAR MENSAJE (con 404-skip + radicado + dedupe)
+# MESSAGE PROCESSING
 # ============================================================
 def safe_get_message_full(gmail_service, message_id: str) -> Optional[Dict]:
     try:
@@ -535,27 +585,34 @@ def safe_get_message_full(gmail_service, message_id: str) -> Optional[Dict]:
             format="full"
         ).execute()
     except HttpError as e:
-        # 404: mensaje ya no existe en este buzón (borrado/movido)
         if getattr(e, "resp", None) is not None and e.resp.status == 404:
             print(f"⚠️ Gmail 404: messageId {message_id} ya no existe. SKIP.")
             return None
         raise
 
+def reject_print(radicado: str, subject: str, reason_lines: List[str], extra: Optional[List[str]] = None) -> None:
+    print("\n" + "=" * 70)
+    print(f"🧾 Radicado: {radicado}")
+    print("🚫 Estado: RECHAZADO")
+    for r in reason_lines:
+        print(f"Motivo: {r}")
+    if extra:
+        for x in extra:
+            print(x)
+    print(f"Subject: {subject or '(sin subject)'}")
+    print("=" * 70)
 
 def process_message(gmail_service, message_id: str, client_catalog: List[Dict[str, Optional[str]]]) -> None:
-    # state y dedupe
     state = load_state()
     processed = state_get_processed_set(state)
     if message_id in processed:
         return
 
-    # ✅ radicado estable por message_id
     radicado = get_or_create_radicado(message_id, state)
     save_state(state)
 
     msg = safe_get_message_full(gmail_service, message_id)
     if not msg:
-        # 404 => lo marcamos procesado para no insistir
         state_add_processed(state, message_id)
         save_state(state)
         return
@@ -563,53 +620,131 @@ def process_message(gmail_service, message_id: str, client_catalog: List[Dict[st
     payload = msg.get("payload", {}) or {}
     snippet = msg.get("snippet", "") or ""
 
-    # ✅ filtro "solo adjuntos"
+    # Fecha/hora real de llegada
+    received_dt = gmail_internaldate_to_dt_bogota(msg)
+
+    # Headers/body
+    subject = get_header(payload, "Subject")
+    from_header = get_header(payload, "From")
+    body_text = extract_plain_text(payload)
+
+    searchable_text = f"{subject}\n{from_header}\n{body_text}\n{snippet}"
+
+    # Filtro adjuntos (ruido)
     if ONLY_PROCESS_EMAILS_WITH_ATTACHMENTS and not has_any_attachment(payload):
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    subject = get_header(payload, "Subject")
-    from_header = get_header(payload, "From")
-    date_header = get_header(payload, "Date")
-    body_text = extract_plain_text(payload)
+    # No links
+    if contains_forbidden_links(searchable_text):
+        reject_print(
+            radicado, subject,
+            ["El correo contiene enlaces (http/https/www). Deben adjuntar los archivos (sin links)."]
+        )
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
 
-    searchable_text = f"{subject}\n{from_header}\n{body_text}\n{snippet}"
+    # Horario
+    if received_dt and not is_within_receiving_window(received_dt):
+        reject_print(
+            radicado, subject,
+            [f"Fuera de horario de recepción (L–V 9:00 a.m. a 5:00 p.m.). Llegó: {received_dt.isoformat()}"]
+        )
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
 
-    # ✅ filtro por keywords opcional
+    # Cierre mensual 2026
+    if received_dt and is_after_monthly_closing_2026(received_dt):
+        reject_print(
+            radicado, subject,
+            [f"Llegó después de la fecha de cierre del mes (calendario 2026). Llegó: {received_dt.date().isoformat()}"]
+        )
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
+    # Keywords opcional
     if not passes_keyword_filter(searchable_text):
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    client = find_client(searchable_text, client_catalog) if client_catalog else None
-    payment_type = determine_payment_type(searchable_text)
+    attachments = _collect_attachments(payload)
+
+    # ✅ NUEVO: campos obligatorios del comunicado (asunto o cuerpo)
+    fields = parse_radicacion_fields(subject, body_text)
+    missing_fields = validate_required_radicacion_fields(fields)
+    if missing_fields:
+        reject_print(
+            radicado, subject,
+            ["Falta información obligatoria en ASUNTO o CUERPO."],
+            [f"Faltantes: {', '.join(missing_fields)}",
+             "Ejemplo: RADICACIÓN | CLIENTE: ACME SAS | COBRO: CREDITO | FACTURA: ELECTRONICA"]
+        )
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
+    # Validar CLIENTE declarado contra catálogo activo
+    client_obj = find_client_exact_or_normalized(fields["cliente"], client_catalog) if client_catalog else None
+    if client_catalog and not client_obj:
+        reject_print(
+            radicado, subject,
+            ["CLIENTE no existe en el catálogo o no está activo."],
+            [f"CLIENTE declarado: {fields.get('cliente')}"]
+        )
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
+    # Validación adjuntos por tipo de factura declarado
+    invoice_attach_errors = validate_invoice_type_attachments(fields["factura"], attachments)
+    if invoice_attach_errors:
+        reject_print(
+            radicado, subject,
+            ["Adjuntos no cumplen el tipo de FACTURA declarado."],
+            [" - " + e for e in invoice_attach_errors]
+        )
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
+    # Validación PDFs mínimos (tu regla base)
     pdf_validation = validate_required_pdfs(payload, required_count=REQUIRED_PDF_COUNT)
+    if not pdf_validation["ok"]:
+        reject_print(
+            radicado, subject,
+            [f"PDF incompletos. Llegaron {pdf_validation['pdf_count']} / {REQUIRED_PDF_COUNT} (faltan {pdf_validation['missing']})."],
+            [f"PDFs: {pdf_validation['pdf_filenames']}"]
+        )
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
+    # ✅ ACEPTADO
+    cobro = fields["cobro"].lower()  # contado|credito|anticipo
+    factura = fields["factura"]      # NORMAL|ELECTRONICA
 
     print("\n" + "=" * 70)
     print(f"🆕 Procesado → Message ID: {message_id}")
     print(f"🧾 Radicado: {radicado}")
+    if received_dt:
+        print(f"🕒 Recibido (Bogotá): {received_dt.isoformat()}")
     print(f"From: {from_header or '(sin From)'}")
-    print(f"Date: {date_header or '(sin Date)'}")
     print(f"Subject: {subject or snippet or '(sin subject)'}")
-    print(f"Cliente: {client['name'] if client else 'no identificado (o no activo)'}")
-    print(f"Tipo: {payment_type or 'indeterminado'}")
-
-    if not pdf_validation["ok"]:
-        print("🚫 Estado: RECHAZADO")
-        print(
-            f"Motivo: PDFs incompletos. Llegaron {pdf_validation['pdf_count']} / "
-            f"{REQUIRED_PDF_COUNT} (faltan {pdf_validation['missing']})."
-        )
-        print("PDFs detectados:", pdf_validation["pdf_filenames"])
-    else:
-        print("✅ Estado: ACEPTADO")
-        print(f"Adjuntos OK: {pdf_validation['pdf_count']} PDFs detectados.")
-        print("PDFs:", pdf_validation["pdf_filenames"])
-
+    print(f"CLIENTE: {client_obj['name'] if client_obj else fields['cliente']}")
+    print(f"COBRO: {cobro}")
+    print(f"FACTURA: {factura}")
+    print("✅ Estado: ACEPTADO")
+    print(f"Adjuntos OK: {pdf_validation['pdf_count']} PDFs detectados.")
+    if factura == "ELECTRONICA":
+        print("XML detectado:", any(_is_xml(a) for a in attachments))
+    print("PDFs:", pdf_validation["pdf_filenames"])
     print("=" * 70)
 
-    # ✅ marcar procesado
     state_add_processed(state, message_id)
     save_state(state)
 
@@ -626,7 +761,6 @@ def listen_pubsub(gmail_service, client_catalog: List[Dict[str, Optional[str]]])
 
     while True:
         try:
-            # renovar watch periódicamente (barato)
             ensure_gmail_watch(gmail_service)
 
             response = subscriber.pull(
@@ -655,7 +789,6 @@ def listen_pubsub(gmail_service, client_catalog: List[Dict[str, Optional[str]]])
                     state = load_state()
                     last_history = str(state.get("last_history_id") or "").strip()
 
-                    # Si es primer arranque y no hay last_history_id, inicializamos y ya
                     if not last_history:
                         update_last_history_id(history_id)
                         print(f"🔧 Inicialicé last_history_id={history_id} (primer evento).")
@@ -663,7 +796,6 @@ def listen_pubsub(gmail_service, client_catalog: List[Dict[str, Optional[str]]])
 
                     new_ids, latest_history = fetch_new_message_ids(gmail_service, last_history)
 
-                    # actualizamos last_history_id siempre al latest (si viene)
                     if latest_history:
                         update_last_history_id(latest_history)
 
@@ -706,7 +838,6 @@ def main():
     gmail_service = build("gmail", "v1", credentials=creds)
     sheets_service = build("sheets", "v4", credentials=creds)
 
-    # sanity check: quién es "me"
     profile = gmail_service.users().getProfile(userId="me").execute()
     print("✅ Autenticado como:", profile.get("emailAddress"))
 
