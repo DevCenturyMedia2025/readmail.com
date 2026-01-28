@@ -4,11 +4,12 @@ Gmail push listener: Gmail Watch -> Pub/Sub (PULL/REST) -> History -> Messages
 
 Incluye:
 - ✅ Radicado secuencial estable por correo (idempotente por Gmail messageId)
+- ✅ Respuesta automática por correo (APROBADO / RECHAZADO)
 - ✅ Validaciones del comunicado 2026:
-  - Recepción: L–V 9:00 a.m. a 5:00 p.m.
+  - Recepción: L–V 9:00 a.m. a 5:00 p.m. (Bogotá)
   - Cierre mensual 2026 (si llega después => RECHAZADO)
   - No links (http/https/www) => RECHAZADO
-  - Adjuntos obligatorios (y validación por tipo de factura)
+  - Adjuntos obligatorios y reglas por tipo de factura
 - ✅ Formato obligatorio en ASUNTO o CUERPO:
   - CLIENTE: <nombre>
   - COBRO: CONTADO | CREDITO | ANTICIPO
@@ -23,7 +24,7 @@ Incluye:
 - ✅ Robustez:
   - ACK SIEMPRE por cada evento Pub/Sub
   - Manejo 404 en messages.get => SKIP
-  - Dedupe por state file
+  - Dedupe por state file (processed/replied)
   - Watch auto-renew
 
 Requisitos:
@@ -36,15 +37,6 @@ Requisitos:
     PUBSUB_SUBSCRIPTION=...
     PUBSUB_TOPIC_FULL=projects/.../topics/...
     CLIENT_SHEET_ID=...
-Opcionales:
-    CLIENT_SHEET_RANGE=Clientes!A:B
-    GMAIL_LABEL_IDS=INBOX
-    REQUIRED_PDF_COUNT=5
-    ONLY_WITH_ATTACHMENTS=true
-    KEYWORDS_FILTER=factura,cuenta de cobro,soportes
-    RADICADO_PREFIX=RAD
-    RADICADO_RESET_DAILY=true
-    RADICADO_PAD=6
 """
 
 import base64
@@ -58,6 +50,10 @@ from typing import Dict, List, Optional, Set, Tuple
 from dotenv import load_dotenv
 load_dotenv()
 
+from datetime import datetime, timezone, timedelta
+from email.mime.text import MIMEText
+from email.utils import parseaddr
+
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
@@ -67,15 +63,16 @@ from googleapiclient.errors import HttpError
 
 from google.cloud import pubsub_v1
 
-from datetime import datetime, timezone, timedelta
-
 
 # ============================================================
-# SCOPES
+# SCOPES (IMPORTANTE: para enviar correo, necesitas gmail.send)
 # ============================================================
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",  # ✅ para responder correos
     "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.file",
+
 ]
 
 # ============================================================
@@ -142,11 +139,13 @@ def save_state(state: Dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def state_get_processed_set(state: Dict) -> Set[str]:
-    arr = state.get("processed_message_ids") or []
+def _as_set(arr) -> Set[str]:
     if not isinstance(arr, list):
         return set()
     return set(str(x) for x in arr)
+
+def state_get_processed_set(state: Dict) -> Set[str]:
+    return _as_set(state.get("processed_message_ids") or [])
 
 def state_add_processed(state: Dict, message_id: str) -> None:
     s = state_get_processed_set(state)
@@ -154,6 +153,14 @@ def state_add_processed(state: Dict, message_id: str) -> None:
     if len(s) > PROCESSED_CACHE_LIMIT:
         s = set(list(s)[-PROCESSED_CACHE_LIMIT:])
     state["processed_message_ids"] = list(s)
+
+def state_has_replied(state: Dict, message_id: str) -> bool:
+    return str(message_id) in _as_set(state.get("replied_message_ids") or [])
+
+def state_mark_replied(state: Dict, message_id: str) -> None:
+    s = _as_set(state.get("replied_message_ids") or [])
+    s.add(str(message_id))
+    state["replied_message_ids"] = list(s)
 
 
 # ============================================================
@@ -347,7 +354,7 @@ def validate_required_pdfs(payload: Dict, required_count: int) -> Dict[str, obje
 
 
 # ============================================================
-# ✅ NUEVO: CAMPOS OBLIGATORIOS EN ASUNTO/CUERPO
+# CAMPOS OBLIGATORIOS EN ASUNTO/CUERPO
 # ============================================================
 def parse_radicacion_fields(subject: str, body_text: str) -> Dict[str, Optional[str]]:
     """
@@ -395,7 +402,6 @@ def validate_invoice_type_attachments(factura_type: str, attachments: List[Dict[
     has_xml = any(_is_xml(a) for a in attachments)
 
     if factura_type == "ELECTRONICA":
-        # no permitir otros tipos
         for a in attachments:
             if not (_is_pdf(a) or _is_xml(a)):
                 errors.append(f"Adjunto no permitido para FACTURA ELECTRÓNICA: {a.get('filename')}")
@@ -445,17 +451,12 @@ def load_client_catalog(sheets_service) -> List[Dict[str, Optional[str]]]:
     return catalog
 
 def find_client_exact_or_normalized(cliente_field: str, catalog: List[Dict[str, Optional[str]]]) -> Optional[Dict[str, Optional[str]]]:
-    """
-    Valida CLIENTE declarado contra catálogo activo.
-    Matching permisivo por normalizado.
-    """
     if not cliente_field:
         return None
     n = _normalize_text(cliente_field)
     for c in catalog:
         if c.get("normalized") == n:
             return c
-    # Permite "contiene" (por si ponen ACME SAS y en catálogo ACME S.A.S)
     for c in catalog:
         cn = c.get("normalized") or ""
         if cn and (cn in n or n in cn):
@@ -561,7 +562,6 @@ def fetch_new_message_ids(gmail_service, start_history_id: str) -> Tuple[Set[str
 
         if page_token:
             continue
-
         break
 
     return message_ids, latest_history_id
@@ -572,6 +572,79 @@ def update_last_history_id(latest_history_id: Optional[str]) -> None:
     st = load_state()
     st["last_history_id"] = str(latest_history_id)
     save_state(st)
+
+
+# ============================================================
+# EMAIL REPLY (APROBADO / RECHAZADO)
+# ============================================================
+def _extract_sender_email(from_header: str) -> Optional[str]:
+    _, email = parseaddr(from_header or "")
+    return email or None
+
+def _create_raw_email(to_email: str, subject: str, body: str) -> str:
+    msg = MIMEText(body, _charset="utf-8")
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    return raw
+
+def send_reply_email(gmail_service, original_msg: Dict, to_email: str, subject: str, body: str) -> None:
+    thread_id = original_msg.get("threadId")
+    raw = _create_raw_email(to_email, subject, body)
+
+    send_body = {"raw": raw}
+    if thread_id:
+        send_body["threadId"] = thread_id
+
+    gmail_service.users().messages().send(userId="me", body=send_body).execute()
+
+def build_rejected_email(radicado: str, fields: Dict[str, Optional[str]], reasons: List[str]) -> Tuple[str, str]:
+    subject = f"RECHAZADO – No fue posible radicar tu facturación (ID: {radicado})"
+    cliente = fields.get("cliente") or "NO IDENTIFICADO"
+    cobro = fields.get("cobro") or "NO INFORMADO"
+    factura = fields.get("factura") or "NO INFORMADO"
+
+    body = (
+        "Hola,\n\n"
+        "Recibimos tu correo de facturación, pero NO fue posible radicarlo porque está incompleto o no cumple el formato.\n\n"
+        f"ID interno (radicado): {radicado}\n"
+        "Estado: RECHAZADO\n"
+        f"Cliente: {cliente}\n"
+        f"Tipo de cobro: {cobro} (CONTADO / CREDITO / ANTICIPO)\n"
+        f"Tipo de factura: {factura} (NORMAL / ELECTRONICA)\n\n"
+        "Motivos del rechazo:\n"
+        + "".join([f"- {r}\n" for r in reasons]) +
+        "\nQué debes corregir y reenviar (en un solo correo):\n"
+        "1) En asunto o cuerpo indicar: CLIENTE + COBRO + FACTURA.\n"
+        "2) Adjuntar soportes en PDF (y XML si aplica para ELECTRONICA).\n"
+        "3) Sin links: no http/https/www.\n\n"
+        "Ejemplo válido:\n"
+        "CLIENTE: ACME SAS | COBRO: CREDITO | FACTURA: ELECTRONICA\n\n"
+        "Gracias,\n"
+        "Equipo de Facturación\n"
+    )
+    return subject, body
+
+def build_approved_email(radicado: str, fields: Dict[str, Optional[str]], pdf_count: int) -> Tuple[str, str]:
+    subject = f"APROBADO – Facturación recibida y radicada correctamente (ID: {radicado})"
+    cliente = fields.get("cliente") or "NO IDENTIFICADO"
+    cobro = fields.get("cobro") or "NO INFORMADO"
+    factura = fields.get("factura") or "NO INFORMADO"
+
+    body = (
+        "Hola,\n\n"
+        "✅ Confirmamos que tu correo de facturación fue recibido y validado correctamente.\n\n"
+        f"ID interno (radicado): {radicado}\n"
+        "Estado: APROBADO / RECIBIDO OK\n"
+        f"Cliente: {cliente}\n"
+        f"Tipo de cobro: {cobro} (CONTADO / CREDITO / ANTICIPO)\n"
+        f"Tipo de factura: {factura} (NORMAL / ELECTRONICA)\n"
+        f"Adjuntos validados: {pdf_count} PDF(s)\n\n"
+        "Tu solicitud queda en proceso según los tiempos internos de revisión y pago.\n\n"
+        "Gracias,\n"
+        "Equipo de Facturación\n"
+    )
+    return subject, body
 
 
 # ============================================================
@@ -590,23 +663,15 @@ def safe_get_message_full(gmail_service, message_id: str) -> Optional[Dict]:
             return None
         raise
 
-def reject_print(radicado: str, subject: str, reason_lines: List[str], extra: Optional[List[str]] = None) -> None:
-    print("\n" + "=" * 70)
-    print(f"🧾 Radicado: {radicado}")
-    print("🚫 Estado: RECHAZADO")
-    for r in reason_lines:
-        print(f"Motivo: {r}")
-    if extra:
-        for x in extra:
-            print(x)
-    print(f"Subject: {subject or '(sin subject)'}")
-    print("=" * 70)
-
 def process_message(gmail_service, message_id: str, client_catalog: List[Dict[str, Optional[str]]]) -> None:
     state = load_state()
-    processed = state_get_processed_set(state)
-    if message_id in processed:
+
+    # Si ya lo procesamos, no repetimos
+    if message_id in state_get_processed_set(state):
         return
+
+    # Si ya respondimos antes (por reintentos), no volvemos a enviar email
+    already_replied = state_has_replied(state, message_id)
 
     radicado = get_or_create_radicado(message_id, state)
     save_state(state)
@@ -628,6 +693,13 @@ def process_message(gmail_service, message_id: str, client_catalog: List[Dict[st
     from_header = get_header(payload, "From")
     body_text = extract_plain_text(payload)
 
+    to_email = _extract_sender_email(from_header)
+    if not to_email:
+        print(f"⚠️ No pude extraer email del remitente. From: {from_header}")
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
     searchable_text = f"{subject}\n{from_header}\n{body_text}\n{snippet}"
 
     # Filtro adjuntos (ruido)
@@ -636,32 +708,41 @@ def process_message(gmail_service, message_id: str, client_catalog: List[Dict[st
         save_state(state)
         return
 
-    # No links
+    # Rechazo por links
     if contains_forbidden_links(searchable_text):
-        reject_print(
-            radicado, subject,
-            ["El correo contiene enlaces (http/https/www). Deben adjuntar los archivos (sin links)."]
-        )
+        if not already_replied:
+            reasons = ["El correo contiene enlaces (http/https/www). Deben adjuntar los archivos (sin links)."]
+            subj, body = build_rejected_email(radicado, {}, reasons)
+            send_reply_email(gmail_service, msg, to_email, subj, body)
+            state_mark_replied(state, message_id)
+            save_state(state)
+
         state_add_processed(state, message_id)
         save_state(state)
         return
 
     # Horario
     if received_dt and not is_within_receiving_window(received_dt):
-        reject_print(
-            radicado, subject,
-            [f"Fuera de horario de recepción (L–V 9:00 a.m. a 5:00 p.m.). Llegó: {received_dt.isoformat()}"]
-        )
+        if not already_replied:
+            reasons = [f"Fuera de horario de recepción (L–V 9:00 a.m. a 5:00 p.m.). Llegó: {received_dt.isoformat()}"]
+            subj, body = build_rejected_email(radicado, {}, reasons)
+            send_reply_email(gmail_service, msg, to_email, subj, body)
+            state_mark_replied(state, message_id)
+            save_state(state)
+
         state_add_processed(state, message_id)
         save_state(state)
         return
 
     # Cierre mensual 2026
     if received_dt and is_after_monthly_closing_2026(received_dt):
-        reject_print(
-            radicado, subject,
-            [f"Llegó después de la fecha de cierre del mes (calendario 2026). Llegó: {received_dt.date().isoformat()}"]
-        )
+        if not already_replied:
+            reasons = [f"Llegó después de la fecha de cierre del mes (calendario 2026). Llegó: {received_dt.date().isoformat()}"]
+            subj, body = build_rejected_email(radicado, {}, reasons)
+            send_reply_email(gmail_service, msg, to_email, subj, body)
+            state_mark_replied(state, message_id)
+            save_state(state)
+
         state_add_processed(state, message_id)
         save_state(state)
         return
@@ -674,40 +755,51 @@ def process_message(gmail_service, message_id: str, client_catalog: List[Dict[st
 
     attachments = _collect_attachments(payload)
 
-    # ✅ NUEVO: campos obligatorios del comunicado (asunto o cuerpo)
+    # Campos obligatorios del comunicado
     fields = parse_radicacion_fields(subject, body_text)
     missing_fields = validate_required_radicacion_fields(fields)
     if missing_fields:
-        reject_print(
-            radicado, subject,
-            ["Falta información obligatoria en ASUNTO o CUERPO."],
-            [f"Faltantes: {', '.join(missing_fields)}",
-             "Ejemplo: RADICACIÓN | CLIENTE: ACME SAS | COBRO: CREDITO | FACTURA: ELECTRONICA"]
-        )
+        if not already_replied:
+            reasons = [
+                "Falta información obligatoria en ASUNTO o CUERPO.",
+                f"Faltantes: {', '.join(missing_fields)}"
+            ]
+            subj, body = build_rejected_email(radicado, fields, reasons)
+            send_reply_email(gmail_service, msg, to_email, subj, body)
+            state_mark_replied(state, message_id)
+            save_state(state)
+
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # Validar CLIENTE declarado contra catálogo activo
+    # Validar CLIENTE contra catálogo
     client_obj = find_client_exact_or_normalized(fields["cliente"], client_catalog) if client_catalog else None
     if client_catalog and not client_obj:
-        reject_print(
-            radicado, subject,
-            ["CLIENTE no existe en el catálogo o no está activo."],
-            [f"CLIENTE declarado: {fields.get('cliente')}"]
-        )
+        if not already_replied:
+            reasons = [
+                "CLIENTE no existe en el catálogo o no está activo.",
+                f"CLIENTE declarado: {fields.get('cliente')}"
+            ]
+            subj, body = build_rejected_email(radicado, fields, reasons)
+            send_reply_email(gmail_service, msg, to_email, subj, body)
+            state_mark_replied(state, message_id)
+            save_state(state)
+
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # Validación adjuntos por tipo de factura declarado
+    # Validación adjuntos por tipo de factura
     invoice_attach_errors = validate_invoice_type_attachments(fields["factura"], attachments)
     if invoice_attach_errors:
-        reject_print(
-            radicado, subject,
-            ["Adjuntos no cumplen el tipo de FACTURA declarado."],
-            [" - " + e for e in invoice_attach_errors]
-        )
+        if not already_replied:
+            reasons = ["Adjuntos no cumplen el tipo de FACTURA declarado."] + invoice_attach_errors
+            subj, body = build_rejected_email(radicado, fields, reasons)
+            send_reply_email(gmail_service, msg, to_email, subj, body)
+            state_mark_replied(state, message_id)
+            save_state(state)
+
         state_add_processed(state, message_id)
         save_state(state)
         return
@@ -715,19 +807,28 @@ def process_message(gmail_service, message_id: str, client_catalog: List[Dict[st
     # Validación PDFs mínimos (tu regla base)
     pdf_validation = validate_required_pdfs(payload, required_count=REQUIRED_PDF_COUNT)
     if not pdf_validation["ok"]:
-        reject_print(
-            radicado, subject,
-            [f"PDF incompletos. Llegaron {pdf_validation['pdf_count']} / {REQUIRED_PDF_COUNT} (faltan {pdf_validation['missing']})."],
-            [f"PDFs: {pdf_validation['pdf_filenames']}"]
-        )
+        if not already_replied:
+            reasons = [
+                f"PDF incompletos. Llegaron {pdf_validation['pdf_count']} / {REQUIRED_PDF_COUNT} (faltan {pdf_validation['missing']}).",
+                f"PDFs detectados: {', '.join(pdf_validation['pdf_filenames']) if pdf_validation['pdf_filenames'] else '(ninguno)'}"
+            ]
+            subj, body = build_rejected_email(radicado, fields, reasons)
+            send_reply_email(gmail_service, msg, to_email, subj, body)
+            state_mark_replied(state, message_id)
+            save_state(state)
+
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # ✅ ACEPTADO
-    cobro = fields["cobro"].lower()  # contado|credito|anticipo
-    factura = fields["factura"]      # NORMAL|ELECTRONICA
+    # ✅ ACEPTADO → enviar confirmación
+    if not already_replied:
+        subj, body = build_approved_email(radicado, fields, pdf_validation["pdf_count"])
+        send_reply_email(gmail_service, msg, to_email, subj, body)
+        state_mark_replied(state, message_id)
+        save_state(state)
 
+    # Logs locales
     print("\n" + "=" * 70)
     print(f"🆕 Procesado → Message ID: {message_id}")
     print(f"🧾 Radicado: {radicado}")
@@ -736,13 +837,10 @@ def process_message(gmail_service, message_id: str, client_catalog: List[Dict[st
     print(f"From: {from_header or '(sin From)'}")
     print(f"Subject: {subject or snippet or '(sin subject)'}")
     print(f"CLIENTE: {client_obj['name'] if client_obj else fields['cliente']}")
-    print(f"COBRO: {cobro}")
-    print(f"FACTURA: {factura}")
+    print(f"COBRO: {fields['cobro']}")
+    print(f"FACTURA: {fields['factura']}")
     print("✅ Estado: ACEPTADO")
     print(f"Adjuntos OK: {pdf_validation['pdf_count']} PDFs detectados.")
-    if factura == "ELECTRONICA":
-        print("XML detectado:", any(_is_xml(a) for a in attachments))
-    print("PDFs:", pdf_validation["pdf_filenames"])
     print("=" * 70)
 
     state_add_processed(state, message_id)
@@ -833,6 +931,9 @@ def listen_pubsub(gmail_service, client_catalog: List[Dict[str, Optional[str]]])
 # MAIN
 # ============================================================
 def main():
+    if not GCP_PROJECT_ID or not PUBSUB_SUBSCRIPTION_ID or not PUBSUB_TOPIC_FULL:
+        raise RuntimeError("Faltan env vars: GCP_PROJECT_ID, PUBSUB_SUBSCRIPTION, PUBSUB_TOPIC_FULL.")
+
     creds = get_oauth_creds()
 
     gmail_service = build("gmail", "v1", credentials=creds)
