@@ -5,53 +5,70 @@ Gmail push listener: Gmail Watch -> Pub/Sub (PULL/REST) -> History -> Messages
 Incluye:
 - ✅ Radicado secuencial estable por correo (idempotente por Gmail messageId)
 - ✅ Respuesta automática por correo (APROBADO / RECHAZADO)
-- ✅ Validaciones comunicado 2026:
+- ✅ Etiquetado automático:
+  - Facturación Aceptada
+  - Facturación Rechazada
+  - (Opcional) archivar (remover INBOX) para simular “mover”
+- ✅ Validaciones del comunicado 2026:
   - Recepción: L–V 9:00 a.m. a 5:00 p.m. (Bogotá)
   - Cierre mensual 2026 (si llega después => RECHAZADO)
   - No links (http/https/www) => RECHAZADO
   - Adjuntos obligatorios y reglas por tipo de factura
-- ✅ Formato obligatorio en ASUNTO o CUERPO (case-insensitive):
+- ✅ Formato obligatorio en ASUNTO o CUERPO:
   - CLIENTE: <nombre>
   - COBRO: CONTADO | CREDITO | ANTICIPO
   - FACTURA: NORMAL | ELECTRONICA
-- ✅ Parser tolerante “pegado”:
-  - "Cliente: Ecopetrol Cobro: Credito Factura: Normal" ✅
-  - "CLIENTE: Ecopetrol | COBRO: CREDITO | FACTURA: NORMAL" ✅
-- ✅ Reglas de adjuntos:
-  - ELECTRONICA: (PDF + XML) O (2 PDFs). Solo PDF/XML permitidos
-  - NORMAL: SOLO PDF (XML prohibido)
-- ✅ Regla base PDFs:
-  - NORMAL: mínimo REQUIRED_PDF_COUNT PDFs
-  - ELECTRONICA: mínimo 1 PDF (porque puede venir 1 PDF + 1 XML)
-- ✅ Robustez: ACK SIEMPRE, manejo 404, dedupe state, watch renew
+- ✅ Reglas de adjuntos según FACTURA (AJUSTADO):
+  - ELECTRONICA: aceptable si:
+        (1 PDF) o (2 PDFs) o (1 PDF + 1 XML)
+    y NO otros tipos (excepto ZIP como contenedor).
+  - NORMAL: SOLO PDF (excepto ZIP como contenedor), y mínimo REQUIRED_PDF_COUNT PDFs
+- ✅ ZIP:
+  - Si llega ZIP, se inspecciona y se cuentan PDFs/XML adentro (con límites anti-zipbomb).
+  - Si Drive está activo, también se suben los archivos extraídos.
+- ✅ Robustez:
+  - ACK SIEMPRE por cada evento Pub/Sub
+  - Manejo 404 en messages.get => SKIP
+  - Dedupe por state file (processed/replied)
+  - Watch auto-renew
 
-✅ Drive:
-- 📁 Guarda contenido del correo en Google Drive en la ruta “del diagrama”:
-  DriveRoot/
-    Clientes/<CLIENTE>/<COBRO>/YYYY/MM/<RADICADO>/{email.eml,email.txt,metadata.json,adjuntos/*}   (APROBADO)
-    Clientes/<CLIENTE>/Rechazado/YYYY/MM/<RADICADO>/{...}                                       (RECHAZADO con cliente)
-    Cliente_no_identificado/YYYY/MM/<RADICADO>/{...}                                            (RECHAZADO sin cliente)
+✅ Drive (NUEVA ESTRUCTURA PEDIDA):
+CARPETA_MADRE
+├── clientes
+│   └── <cliente>
+│       ├── anticipo
+│       │   └── <año>
+│       │       └── <mes>
+│       │           └── <radicado>
+│       ├── credito
+│       │   └── <año>
+│       │       └── <mes>
+│       │           └── <radicado>
+│       ├── contado
+│       │   └── <año>
+│       │       └── <mes>
+│       │           └── <radicado>
+│       └── rechazado
+│           └── <año>
+│               └── <mes>
+│                   └── <radicado>
+└── rechazados
+    └── rechazados sin identificar
+        └── <año>
+            └── <mes>
+                └── <radicado>
 
-Requisitos:
-- credentials.json (OAuth desktop)
-- token.json (se genera)
-- Pub/Sub pull REST requiere ADC:
-    gcloud auth application-default login
-- .env mínimo:
-    GCP_PROJECT_ID=...
-    PUBSUB_SUBSCRIPTION=...
-    PUBSUB_TOPIC_FULL=projects/.../topics/...
-    CLIENT_SHEET_ID=...
-- .env Drive (opcional):
-    DRIVE_ROOT_FOLDER_ID=...        # si no lo pones, crea/usa carpeta por DRIVE_ROOT_FOLDER_NAME
-    DRIVE_ROOT_FOLDER_NAME=Facturacion2026
-    DRIVE_USE_SHARED_DRIVE=false
-    DRIVE_SHARED_DRIVE_ID=...
+Dentro de <radicado> se sube:
+  - email.eml
+  - email.txt
+  - metadata.json
+  - adjuntos/*
+  - adjuntos/_extraidos/<zipname>/*   (si hay ZIP)
 
-⚠️ IMPORTANTE:
-- Para Drive estable (sin líos de permisos con carpetas existentes),
-  se usa scope https://www.googleapis.com/auth/drive (NO drive.file).
-  Si cambiaste scopes, borra token.json y vuelve a autenticar.
+⚠️ NOTA SCOPES DRIVE:
+- Para crear/buscar carpetas existentes de forma estable se usa scope DRIVE FULL:
+  https://www.googleapis.com/auth/drive
+- Si vienes usando drive.file y cambiaste scopes: borra token.json y re-autentica.
 """
 
 import base64
@@ -60,6 +77,8 @@ import os
 import os.path
 import re
 import time
+import io
+import zipfile
 from typing import Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
@@ -81,19 +100,21 @@ from google.cloud import pubsub_v1
 
 
 # ============================================================
-# SCOPES
+# SCOPES (IMPORTANTE: para enviar correo, necesitas gmail.send)
 # ============================================================
 SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",  # ✅ labels/archivar
     "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.send",    # ✅ responder
     "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive",  # ✅ drive full
+    "https://www.googleapis.com/auth/drive",         # ✅ Drive full (carpetas existentes)
 ]
+
 
 # ============================================================
 # CONFIG (ENV)
 # ============================================================
-SHEET_ID = os.environ.get("CLIENT_SHEET_ID", "").strip() or "14x7UflRW7P9qIHy65biueQUQjn03WBhV7T6l454VUmQ"
+SHEET_ID = os.environ.get("CLIENT_SHEET_ID", "14x7UflRW7P9qIHy65biueQUQjn03WBhV7T6l454VUmQ").strip()
 SHEET_RANGE = os.environ.get("CLIENT_SHEET_RANGE", "Clientes!A:B").strip()
 
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "").strip()
@@ -137,13 +158,23 @@ CLOSING_2026 = {
     7: 29, 8: 27, 9: 28, 10: 28, 11: 26, 12: 14
 }
 
-# ✅ Drive
-DRIVE_ROOT_FOLDER_ID = os.environ.get("DRIVE_ROOT_FOLDER_ID", "1ICV3tQy_yea0LxNdlCLOZaTAnJoVbMJk").strip()
+# ✅ LABELS (mover a etiquetas)
+LABEL_ACCEPTED_NAME = os.environ.get("LABEL_ACCEPTED_NAME", "Facturación Aceptada").strip()
+LABEL_REJECTED_NAME = os.environ.get("LABEL_REJECTED_NAME", "Facturación Rechazada").strip()
+ARCHIVE_ON_STATUS = os.environ.get("ARCHIVE_ON_STATUS", "true").lower() in ("1", "true", "yes", "y", "si")
+
+# ✅ DRIVE (CARPETA_MADRE)
+DRIVE_ROOT_FOLDER_ID = os.environ.get("DRIVE_ROOT_FOLDER_ID", "").strip()  # recomendado: ID real de CARPETA_MADRE
 DRIVE_ROOT_FOLDER_NAME = os.environ.get("DRIVE_ROOT_FOLDER_NAME", "Facturacion2026").strip()
 DRIVE_USE_SHARED_DRIVE = os.environ.get("DRIVE_USE_SHARED_DRIVE", "false").lower() in ("1", "true", "yes", "y", "si")
 DRIVE_SHARED_DRIVE_ID = os.environ.get("DRIVE_SHARED_DRIVE_ID", "").strip()
-
 DRIVE_DEDUPE_ATTACHMENTS = os.environ.get("DRIVE_DEDUPE_ATTACHMENTS", "true").lower() in ("1", "true", "yes", "y", "si")
+
+# ✅ ZIP SAFETY (anti zip-bomb)
+MAX_ZIP_BYTES = int(os.environ.get("MAX_ZIP_BYTES", str(25 * 1024 * 1024)))  # 25MB zip adjunto
+MAX_ZIP_FILES = int(os.environ.get("MAX_ZIP_FILES", "200"))                 # max entradas
+MAX_ZIP_TOTAL_UNCOMPRESSED = int(os.environ.get("MAX_ZIP_TOTAL_UNCOMPRESSED", str(150 * 1024 * 1024)))  # 150MB
+MAX_ZIP_SINGLE_FILE = int(os.environ.get("MAX_ZIP_SINGLE_FILE", str(25 * 1024 * 1024)))  # 25MB por archivo
 
 
 # ============================================================
@@ -327,7 +358,7 @@ def is_after_monthly_closing_2026(dt: datetime) -> bool:
 
 
 # ============================================================
-# ATTACHMENTS
+# ATTACHMENTS + ZIP
 # ============================================================
 def _collect_attachments(payload: Dict) -> List[Dict[str, Optional[str]]]:
     attachments: List[Dict[str, Optional[str]]] = []
@@ -357,21 +388,220 @@ def _is_xml(att: Dict[str, Optional[str]]) -> bool:
     mt = (att.get("mimeType") or "").lower()
     return fn.endswith(".xml") or mt in ("application/xml", "text/xml")
 
+def _is_zip(att: Dict[str, Optional[str]]) -> bool:
+    fn = (att.get("filename") or "").lower()
+    mt = (att.get("mimeType") or "").lower()
+    return fn.endswith(".zip") or mt in ("application/zip", "application/x-zip-compressed")
+
 def has_any_attachment(payload: Dict) -> bool:
     return len(_collect_attachments(payload)) > 0
 
-def validate_required_pdfs(payload: Dict, required_count: int) -> Dict[str, object]:
+def gmail_download_attachment_bytes(gmail_service, message_id: str, attachment_id: str) -> bytes:
+    att = gmail_service.users().messages().attachments().get(
+        userId="me", messageId=message_id, id=attachment_id
+    ).execute()
+    data = att.get("data", "") or ""
+    return base64.urlsafe_b64decode(data.encode("utf-8"))
+
+def _is_safe_zip_member(name: str) -> bool:
+    if not name:
+        return False
+    n = name.replace("\\", "/")
+    if n.startswith("/") or n.startswith("../") or "/../" in n:
+        return False
+    return True
+
+def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes) -> Dict[str, object]:
+    """
+    Lee el ZIP en memoria, lista archivos, cuenta PDFs/XML.
+    Incluye límites básicos anti zip-bomb.
+    """
+    out = {
+        "zip_filename": zip_filename,
+        "ok": True,
+        "error": None,
+        "files": [],  # [{"name":..., "size":..., "is_pdf":..., "is_xml":...}]
+        "pdf_count": 0,
+        "xml_count": 0,
+        "total_uncompressed": 0,
+    }
+
+    try:
+        if zip_bytes is None:
+            out["ok"] = False
+            out["error"] = "ZIP vacío"
+            return out
+
+        if len(zip_bytes) > MAX_ZIP_BYTES:
+            out["ok"] = False
+            out["error"] = f"ZIP excede MAX_ZIP_BYTES ({len(zip_bytes)} > {MAX_ZIP_BYTES})"
+            return out
+
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            infos = zf.infolist()
+            if len(infos) > MAX_ZIP_FILES:
+                out["ok"] = False
+                out["error"] = f"ZIP tiene demasiados archivos ({len(infos)} > {MAX_ZIP_FILES})"
+                return out
+
+            total = 0
+            files = []
+            pdf_count = 0
+            xml_count = 0
+
+            for info in infos:
+                if info.is_dir():
+                    continue
+
+                if info.flag_bits & 0x1:
+                    out["ok"] = False
+                    out["error"] = "ZIP encriptado/protegido con contraseña (no permitido)."
+                    return out
+
+                name = info.filename
+                if not _is_safe_zip_member(name):
+                    out["ok"] = False
+                    out["error"] = f"ZIP contiene ruta insegura: {name}"
+                    return out
+
+                size = int(getattr(info, "file_size", 0) or 0)
+                if size > MAX_ZIP_SINGLE_FILE:
+                    out["ok"] = False
+                    out["error"] = f"Archivo dentro del ZIP demasiado grande: {name} ({size} > {MAX_ZIP_SINGLE_FILE})"
+                    return out
+
+                total += size
+                if total > MAX_ZIP_TOTAL_UNCOMPRESSED:
+                    out["ok"] = False
+                    out["error"] = f"ZIP excede total descomprimido ({total} > {MAX_ZIP_TOTAL_UNCOMPRESSED})"
+                    return out
+
+                lower = name.lower()
+                is_pdf = lower.endswith(".pdf")
+                is_xml = lower.endswith(".xml")
+                if is_pdf:
+                    pdf_count += 1
+                if is_xml:
+                    xml_count += 1
+
+                files.append({
+                    "name": name,
+                    "size": size,
+                    "is_pdf": is_pdf,
+                    "is_xml": is_xml,
+                })
+
+            out["files"] = files
+            out["pdf_count"] = pdf_count
+            out["xml_count"] = xml_count
+            out["total_uncompressed"] = total
+            return out
+
+    except zipfile.BadZipFile:
+        out["ok"] = False
+        out["error"] = "ZIP corrupto o inválido"
+        return out
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = f"Error leyendo ZIP: {e}"
+        return out
+
+def extract_zip_files(zip_filename: str, zip_bytes: bytes) -> Dict[str, object]:
+    """
+    Extrae archivos del ZIP en memoria (solo para subir a Drive).
+    Respeta los mismos límites anti zip-bomb.
+    Devuelve lista de archivos: [{"name":..., "bytes":..., "mime":...}]
+    """
+    analysis = analyze_zip_bytes(zip_filename, zip_bytes)
+    if not analysis.get("ok"):
+        return {"ok": False, "error": analysis.get("error"), "files": []}
+
+    files_out = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for f in analysis.get("files", []) or []:
+                name = f.get("name")
+                if not name or not _is_safe_zip_member(name):
+                    continue
+                raw = zf.read(name)  # ya limitado por file_size checks arriba
+                mime = "application/octet-stream"
+                ln = name.lower()
+                if ln.endswith(".pdf"):
+                    mime = "application/pdf"
+                elif ln.endswith(".xml"):
+                    mime = "application/xml"
+                files_out.append({"name": name, "bytes": raw, "mime": mime})
+
+        return {"ok": True, "error": None, "files": files_out}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e), "files": []}
+
+def analyze_zip_attachments(gmail_service, message_id: str, attachments: List[Dict[str, Optional[str]]]) -> List[Dict[str, object]]:
+    """
+    Descarga ZIPs adjuntos y devuelve análisis por cada ZIP.
+    """
+    results = []
+    for a in attachments:
+        if not _is_zip(a):
+            continue
+        fn = (a.get("filename") or "").strip() or "archivo.zip"
+        att_id = a.get("attachmentId")
+        if not att_id:
+            results.append({
+                "zip_filename": fn,
+                "ok": False,
+                "error": "ZIP sin attachmentId",
+                "files": [],
+                "pdf_count": 0,
+                "xml_count": 0,
+                "total_uncompressed": 0,
+            })
+            continue
+        try:
+            zb = gmail_download_attachment_bytes(gmail_service, message_id, att_id)
+            results.append(analyze_zip_bytes(fn, zb))
+        except Exception as e:
+            results.append({
+                "zip_filename": fn,
+                "ok": False,
+                "error": f"No pude descargar ZIP: {e}",
+                "files": [],
+                "pdf_count": 0,
+                "xml_count": 0,
+                "total_uncompressed": 0,
+            })
+    return results
+
+def _zip_counts(zip_analysis: List[Dict[str, object]]) -> Dict[str, int]:
+    pdf_zip = 0
+    xml_zip = 0
+    for z in zip_analysis or []:
+        if not z.get("ok"):
+            continue
+        pdf_zip += int(z.get("pdf_count") or 0)
+        xml_zip += int(z.get("xml_count") or 0)
+    return {"pdf_zip": pdf_zip, "xml_zip": xml_zip}
+
+def validate_required_pdfs(payload: Dict, required_count: int, zip_analysis: Optional[List[Dict[str, object]]] = None) -> Dict[str, object]:
     atts = _collect_attachments(payload)
-    pdfs = [a for a in atts if _is_pdf(a)]
-    pdf_names = [a.get("filename") or "(sin nombre)" for a in pdfs]
-    pdf_count = len(pdfs)
-    missing = max(0, required_count - pdf_count)
+    pdfs_direct = [a for a in atts if _is_pdf(a)]
+    pdf_names = [a.get("filename") or "(sin nombre)" for a in pdfs_direct]
+
+    counts = _zip_counts(zip_analysis or [])
+    pdf_count_zip = counts["pdf_zip"]
+
+    pdf_count_direct = len(pdfs_direct)
+    pdf_total = pdf_count_direct + pdf_count_zip
+    missing = max(0, required_count - pdf_total)
 
     return {
-        "ok": pdf_count >= required_count,
-        "pdf_count": pdf_count,
+        "ok": pdf_total >= required_count,
+        "pdf_count": pdf_total,
         "missing": missing,
         "pdf_filenames": pdf_names,
+        "pdf_count_direct": pdf_count_direct,
+        "pdf_count_zip": pdf_count_zip,
         "all_attachments": atts,
     }
 
@@ -380,36 +610,20 @@ def validate_required_pdfs(payload: Dict, required_count: int) -> Dict[str, obje
 # CAMPOS OBLIGATORIOS EN ASUNTO/CUERPO
 # ============================================================
 def parse_radicacion_fields(subject: str, body_text: str) -> Dict[str, Optional[str]]:
-    """
-    Lee CLIENTE / COBRO / FACTURA en asunto o cuerpo, aunque venga “pegado”.
-    Extrae el valor de cada campo hasta que aparezca la siguiente etiqueta.
-    """
     haystack = f"{subject or ''}\n{body_text or ''}"
-    hs = re.sub(r"\s+", " ", haystack).strip()
 
-    def pick_label(label: str) -> Optional[str]:
-        pattern = rf"{label}\s*:\s*(.+?)(?=\s+(CLIENTE|COBRO|FACTURA)\s*:|$)"
-        m = re.search(pattern, hs, flags=re.IGNORECASE)
+    def pick(pattern: str) -> Optional[str]:
+        m = re.search(pattern, haystack, flags=re.IGNORECASE)
         return m.group(1).strip() if m else None
 
-    cliente = pick_label("CLIENTE")
-    cobro   = pick_label("COBRO")
-    factura = pick_label("FACTURA")
-
-    if cliente:
-        cliente = cliente.strip(" |;-")
+    cliente = pick(r"CLIENTE\s*:\s*([^\n\|]+)")
+    cobro = pick(r"COBRO\s*:\s*(CONTADO|CREDITO|CRÉDITO|ANTICIPO)")
+    factura = pick(r"FACTURA\s*:\s*(NORMAL|ELECTRONICA|ELECTRÓNICA)")
 
     if cobro:
-        cobro = cobro.upper().replace("CRÉDITO", "CREDITO").strip(" |;-")
-        cobro = re.sub(r"[^A-Z]", "", cobro)
-        if cobro not in {"CONTADO", "CREDITO", "ANTICIPO"}:
-            cobro = None
-
+        cobro = cobro.upper().replace("CRÉDITO", "CREDITO")
     if factura:
-        factura = factura.upper().replace("ELECTRÓNICA", "ELECTRONICA").strip(" |;-")
-        factura = re.sub(r"[^A-Z]", "", factura)
-        if factura not in {"NORMAL", "ELECTRONICA"}:
-            factura = None
+        factura = factura.upper().replace("ELECTRÓNICA", "ELECTRONICA")
 
     return {"cliente": cliente, "cobro": cobro, "factura": factura}
 
@@ -423,34 +637,83 @@ def validate_required_radicacion_fields(fields: Dict[str, Optional[str]]) -> Lis
         missing.append("FACTURA (NORMAL|ELECTRONICA)")
     return missing
 
-def validate_invoice_type_attachments(factura_type: str, attachments: List[Dict[str, Optional[str]]]) -> List[str]:
+def validate_invoice_type_attachments(
+    factura_type: str,
+    attachments: List[Dict[str, Optional[str]]],
+    zip_analysis: Optional[List[Dict[str, object]]] = None
+) -> List[str]:
     """
-    Reglas duras (según tu ajuste):
-    - ELECTRONICA: OK si (>=1 PDF y >=1 XML) OR (>=2 PDFs). Solo PDF/XML permitidos.
-    - NORMAL: solo PDF (si trae XML u otro tipo => error).
+    AJUSTADO:
+      - ZIP es permitido como contenedor (pero su contenido debe cumplir la regla).
+      - ELECTRONICA: acepta (1 PDF) o (2 PDFs) o (1 PDF + 1 XML) considerando ZIP.
+      - NORMAL: permite solo PDF (y ZIP conteniendo solo PDF). XML prohibido. Además mínimo PDFs se valida aparte.
     """
-    errors: List[str] = []
-    ft = (factura_type or "").upper().strip()
+    errors = []
 
-    pdf_count = sum(1 for a in attachments if _is_pdf(a))
-    xml_count = sum(1 for a in attachments if _is_xml(a))
+    pdf_direct = sum(1 for a in attachments if _is_pdf(a))
+    xml_direct = sum(1 for a in attachments if _is_xml(a))
 
-    if ft == "ELECTRONICA":
-        # Solo permitidos PDF/XML
-        for a in attachments:
+    counts = _zip_counts(zip_analysis or [])
+    pdf_zip = counts["pdf_zip"]
+    xml_zip = counts["xml_zip"]
+
+    pdf_total = pdf_direct + pdf_zip
+    xml_total = xml_direct + xml_zip
+
+    # 1) Validar tipos directos (permitimos ZIP)
+    for a in attachments:
+        if _is_zip(a):
+            continue
+        if factura_type == "ELECTRONICA":
             if not (_is_pdf(a) or _is_xml(a)):
                 errors.append(f"Adjunto no permitido para FACTURA ELECTRÓNICA: {a.get('filename')}")
-
-        ok = (pdf_count >= 1 and xml_count >= 1) or (pdf_count >= 2)
-        if not ok:
-            errors.append("FACTURA ELECTRÓNICA debe traer (PDF + XML) o (2 PDFs).")
-
-    else:  # NORMAL
-        for a in attachments:
+        else:  # NORMAL
             if not _is_pdf(a):
                 errors.append(f"Adjunto no permitido (FACTURA NORMAL solo PDF): {a.get('filename')}")
-        if xml_count > 0:
-            errors.append("FACTURA NORMAL no debe incluir XML (solo PDF).")
+
+    # 2) Validar contenido del ZIP (si se pudo leer)
+    for z in zip_analysis or []:
+        if not z.get("ok"):
+            # Si llega ZIP pero no se puede leer -> rechaza
+            errors.append(f"ZIP no se pudo procesar ({z.get('zip_filename')}): {z.get('error')}")
+            continue
+        for f in z.get("files", []) or []:
+            name = (f.get("name") or "")
+            is_pdf = bool(f.get("is_pdf"))
+            is_xml = bool(f.get("is_xml"))
+            if factura_type == "ELECTRONICA":
+                if not (is_pdf or is_xml):
+                    errors.append(f"Archivo no permitido dentro del ZIP para ELECTRÓNICA: {z.get('zip_filename')} → {name}")
+            else:  # NORMAL
+                if not is_pdf:
+                    errors.append(f"Archivo no permitido dentro del ZIP para NORMAL (solo PDF): {z.get('zip_filename')} → {name}")
+
+    if errors:
+        return errors
+
+    # 3) Reglas específicas por tipo (AJUSTADO)
+    if factura_type == "ELECTRONICA":
+        # Aceptable si:
+        # - 1 PDF (con o sin XML)
+        # - 2 PDFs
+        # - 1 PDF + 1 XML
+        if pdf_total < 1:
+            errors.append("FACTURA ELECTRÓNICA requiere al menos 1 PDF (directo o dentro de ZIP).")
+        else:
+            if pdf_total == 1:
+                # ok aunque XML sea 0 o 1+
+                pass
+            elif pdf_total >= 2:
+                # ok (dos PDFs o más)
+                pass
+
+        # no exigimos XML obligatorio porque tú lo pediste así (1 PDF solo también vale)
+        # pero si llega, lo permitimos.
+        return errors
+
+    # NORMAL:
+    if xml_total > 0:
+        errors.append("FACTURA NORMAL no debe incluir XML (solo PDF).")
 
     return errors
 
@@ -528,6 +791,76 @@ def get_oauth_creds() -> Credentials:
             token.write(creds.to_json())
 
     return creds
+
+
+# ============================================================
+# LABELS (crear / buscar / aplicar)
+# ============================================================
+def get_label_id_by_name(gmail_service, label_name: str) -> Optional[str]:
+    try:
+        resp = gmail_service.users().labels().list(userId="me").execute()
+        for lb in resp.get("labels", []) or []:
+            if (lb.get("name", "") or "").strip().lower() == label_name.strip().lower():
+                return lb.get("id")
+        return None
+    except HttpError as e:
+        print(f"⚠️ Error listando labels: {e}")
+        return None
+
+def ensure_label_exists(gmail_service, label_name: str) -> Optional[str]:
+    lid = get_label_id_by_name(gmail_service, label_name)
+    if lid:
+        return lid
+    try:
+        created = gmail_service.users().labels().create(
+            userId="me",
+            body={
+                "name": label_name,
+                "labelListVisibility": "labelShow",
+                "messageListVisibility": "show",
+                "type": "user",
+            },
+        ).execute()
+        return created.get("id")
+    except HttpError as e:
+        print(f"⚠️ No pude crear la etiqueta '{label_name}': {e}")
+        return None
+
+def apply_status_labels(gmail_service, message_id: str, status: str) -> None:
+    accepted_id = ensure_label_exists(gmail_service, LABEL_ACCEPTED_NAME)
+    rejected_id = ensure_label_exists(gmail_service, LABEL_REJECTED_NAME)
+
+    add_ids = []
+    remove_ids = []
+
+    if status == "accepted":
+        if accepted_id:
+            add_ids.append(accepted_id)
+        if rejected_id:
+            remove_ids.append(rejected_id)
+    elif status == "rejected":
+        if rejected_id:
+            add_ids.append(rejected_id)
+        if accepted_id:
+            remove_ids.append(accepted_id)
+    else:
+        return
+
+    if ARCHIVE_ON_STATUS:
+        remove_ids.append("INBOX")  # archiva (sale de recibidos)
+
+    add_ids = list(dict.fromkeys(add_ids))
+    remove_ids = list(dict.fromkeys(remove_ids))
+
+    try:
+        gmail_service.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": add_ids, "removeLabelIds": remove_ids}
+        ).execute()
+        print(f"🏷️ Etiquetas aplicadas ({status}) a messageId={message_id}")
+    except HttpError as e:
+        print(f"⚠️ No pude aplicar etiquetas a {message_id}: {e}")
 
 
 # ============================================================
@@ -652,9 +985,7 @@ def build_rejected_email(radicado: str, fields: Dict[str, Optional[str]], reason
         + "".join([f"- {r}\n" for r in reasons]) +
         "\nQué debes corregir y reenviar (en un solo correo):\n"
         "1) En asunto o cuerpo indicar: CLIENTE + COBRO + FACTURA.\n"
-        "2) Adjuntar soportes:\n"
-        "   - NORMAL: PDFs\n"
-        "   - ELECTRONICA: (PDF + XML) o (2 PDFs)\n"
+        "2) Adjuntar soportes en PDF (y XML si aplica para ELECTRONICA).\n"
         "3) Sin links: no http/https/www.\n\n"
         "Ejemplo válido:\n"
         "CLIENTE: ACME SAS | COBRO: CREDITO | FACTURA: ELECTRONICA\n\n"
@@ -663,7 +994,7 @@ def build_rejected_email(radicado: str, fields: Dict[str, Optional[str]], reason
     )
     return subject, body
 
-def build_approved_email(radicado: str, fields: Dict[str, Optional[str]], pdf_count: int) -> Tuple[str, str]:
+def build_approved_email(radicado: str, fields: Dict[str, Optional[str]], pdf_total: int) -> Tuple[str, str]:
     subject = f"APROBADO – Facturación recibida y radicada correctamente (ID: {radicado})"
     cliente = fields.get("cliente") or "NO IDENTIFICADO"
     cobro = fields.get("cobro") or "NO INFORMADO"
@@ -677,7 +1008,7 @@ def build_approved_email(radicado: str, fields: Dict[str, Optional[str]], pdf_co
         f"Cliente: {cliente}\n"
         f"Tipo de cobro: {cobro} (CONTADO / CREDITO / ANTICIPO)\n"
         f"Tipo de factura: {factura} (NORMAL / ELECTRONICA)\n"
-        f"Adjuntos validados: {pdf_count} PDF(s)\n\n"
+        f"PDFs detectados (directo + ZIP): {pdf_total}\n\n"
         "Tu solicitud queda en proceso según los tiempos internos de revisión y pago.\n\n"
         "Gracias,\n"
         "Equipo de Facturación\n"
@@ -686,7 +1017,7 @@ def build_approved_email(radicado: str, fields: Dict[str, Optional[str]], pdf_co
 
 
 # ============================================================
-# DRIVE (carpetas + subida de contenido)
+# DRIVE (carpetas + subida de contenido) - NUEVA ESTRUCTURA
 # ============================================================
 def _drive_list_kwargs():
     if DRIVE_USE_SHARED_DRIVE:
@@ -744,9 +1075,6 @@ def drive_get_or_create_folder(drive_service, parent_id: str, name: str) -> str:
     return folder["id"]
 
 def drive_create_root_if_needed(drive_service) -> Optional[str]:
-    """
-    Si DRIVE_ROOT_FOLDER_ID viene, lo valida. Si no hay acceso, crea/usa root por nombre.
-    """
     if DRIVE_ROOT_FOLDER_ID:
         try:
             drive_service.files().get(
@@ -756,7 +1084,7 @@ def drive_create_root_if_needed(drive_service) -> Optional[str]:
             ).execute()
             return DRIVE_ROOT_FOLDER_ID
         except Exception as e:
-            print(f"⚠️ Sin acceso a DRIVE_ROOT_FOLDER_ID={DRIVE_ROOT_FOLDER_ID}. Crearé uno nuevo. Error: {e}")
+            print(f"⚠️ Sin acceso a DRIVE_ROOT_FOLDER_ID={DRIVE_ROOT_FOLDER_ID}. Intentaré por nombre. Error: {e}")
 
     safe_name = DRIVE_ROOT_FOLDER_NAME.replace("'", "\\'")
     q = (
@@ -785,54 +1113,48 @@ def drive_upload_bytes(drive_service, parent_id: str, filename: str, data: bytes
     ).execute()
     return f["id"]
 
-def gmail_download_attachment_bytes(gmail_service, message_id: str, attachment_id: str) -> bytes:
-    att = gmail_service.users().messages().attachments().get(
-        userId="me", messageId=message_id, id=attachment_id
-    ).execute()
-    data = att.get("data", "") or ""
-    return base64.urlsafe_b64decode(data.encode("utf-8"))
+def _cobro_to_folder_name(cobro: Optional[str]) -> str:
+    c = (cobro or "").upper().strip()
+    if c == "CONTADO":
+        return "contado"
+    if c == "CREDITO":
+        return "credito"
+    if c == "ANTICIPO":
+        return "anticipo"
+    return "contado"  # fallback
 
-def drive_build_radicado_folder(
+def drive_build_radicado_folder_new_structure(
     drive_service,
     root_id: str,
-    estado: str,  # "APROBADO"|"RECHAZADO"
-    cliente: str,
-    cobro: Optional[str],
+    estado: str,                   # "accepted"|"rejected"
+    cliente_name: Optional[str],   # nombre final de cliente (si existe)
+    cobro: Optional[str],          # CONTADO|CREDITO|ANTICIPO
     radicado: str,
     received_dt: Optional[datetime],
     cliente_identificado: bool,
 ) -> str:
-    """
-    Ruta “del diagrama”:
-      root/Clientes/<CLIENTE>/<COBRO>/YYYY/MM/<RADICADO>                     (APROBADO)
-      root/Clientes/<CLIENTE>/Rechazado/YYYY/MM/<RADICADO>                   (RECHAZADO con cliente)
-      root/Cliente_no_identificado/YYYY/MM/<RADICADO>                        (RECHAZADO sin cliente)
-    """
     if not received_dt:
         received_dt = datetime.now(TZ_BOGOTA)
 
     yyyy = f"{received_dt.year:04d}"
     mm = f"{received_dt.month:02d}"
 
-    if estado.upper() == "APROBADO":
-        base = drive_get_or_create_folder(drive_service, root_id, "Clientes")
-        cliente_folder = (cliente or "NO_IDENTIFICADO").strip() or "NO_IDENTIFICADO"
-        base = drive_get_or_create_folder(drive_service, base, cliente_folder)
-
-        cobro_folder = (cobro or "NO_INFORMADO").upper()
-        base = drive_get_or_create_folder(drive_service, base, cobro_folder)
+    if estado == "accepted":
+        base = drive_get_or_create_folder(drive_service, root_id, "clientes")
+        base = drive_get_or_create_folder(drive_service, base, (cliente_name or "NO_IDENTIFICADO").strip() or "NO_IDENTIFICADO")
+        base = drive_get_or_create_folder(drive_service, base, _cobro_to_folder_name(cobro))
     else:
-        if cliente_identificado and (cliente or "").strip():
-            base = drive_get_or_create_folder(drive_service, root_id, "Clientes")
-            base = drive_get_or_create_folder(drive_service, base, cliente.strip())
-            base = drive_get_or_create_folder(drive_service, base, "Rechazado")
+        if cliente_identificado and (cliente_name or "").strip():
+            base = drive_get_or_create_folder(drive_service, root_id, "clientes")
+            base = drive_get_or_create_folder(drive_service, base, cliente_name.strip())
+            base = drive_get_or_create_folder(drive_service, base, "rechazado")
         else:
-            base = drive_get_or_create_folder(drive_service, root_id, "Cliente_no_identificado")
+            base = drive_get_or_create_folder(drive_service, root_id, "rechazados")
+            base = drive_get_or_create_folder(drive_service, base, "rechazados sin identificar")
 
     base = drive_get_or_create_folder(drive_service, base, yyyy)
     base = drive_get_or_create_folder(drive_service, base, mm)
     base = drive_get_or_create_folder(drive_service, base, radicado)
-
     drive_get_or_create_folder(drive_service, base, "adjuntos")
     return base
 
@@ -843,8 +1165,8 @@ def store_email_to_drive(
     message_id: str,
     msg_full: Dict,
     radicado: str,
-    estado: str,
-    cliente: str,
+    estado: str,  # "accepted"|"rejected"
+    cliente_name: Optional[str],
     cobro: Optional[str],
     fields: Dict[str, Optional[str]],
     subject: str,
@@ -852,21 +1174,18 @@ def store_email_to_drive(
     received_dt: Optional[datetime],
     reasons: Optional[List[str]],
     attachments: List[Dict[str, Optional[str]]],
+    zip_analysis: Optional[List[Dict[str, object]]] = None,
 ) -> None:
-    """
-    Sube:
-      - email.eml (raw)
-      - email.txt
-      - metadata.json
-      - adjuntos/*
-    """
-    cliente_identificado = bool((cliente or "").strip()) and (cliente.strip() not in ("NO_IDENTIFICADO", "NO IDENTIFICADO"))
+    if not drive_service or not root_id:
+        return
 
-    rad_folder_id = drive_build_radicado_folder(
+    cliente_identificado = bool((cliente_name or "").strip()) and (cliente_name.strip().lower() not in {"no_identificado", "no identificado"})
+
+    rad_folder_id = drive_build_radicado_folder_new_structure(
         drive_service=drive_service,
         root_id=root_id,
         estado=estado,
-        cliente=cliente,
+        cliente_name=cliente_name,
         cobro=cobro,
         radicado=radicado,
         received_dt=received_dt,
@@ -901,19 +1220,22 @@ def store_email_to_drive(
 
     # 3) metadata.json
     try:
+        payload = (msg_full.get("payload") or {})
         metadata = {
             "radicado": radicado,
             "estado": estado,
             "cliente": fields.get("cliente"),
+            "cliente_resuelto": cliente_name,
             "cobro": fields.get("cobro"),
             "factura": fields.get("factura"),
             "message_id": message_id,
             "thread_id": msg_full.get("threadId"),
             "subject": subject,
-            "from": get_header((msg_full.get("payload") or {}), "From"),
+            "from": get_header(payload, "From"),
             "received_dt_bogota": received_dt.isoformat() if received_dt else None,
             "rejection_reasons": reasons or [],
             "attachments": [{"filename": a.get("filename"), "mimeType": a.get("mimeType")} for a in attachments],
+            "zip_analysis": zip_analysis or [],
         }
         drive_upload_bytes(
             drive_service,
@@ -931,6 +1253,7 @@ def store_email_to_drive(
         if not adj_folder_id:
             adj_folder_id = drive_get_or_create_folder(drive_service, rad_folder_id, "adjuntos")
 
+        # Subir adjuntos directos (incluye ZIP)
         for a in attachments:
             filename = (a.get("filename") or "").strip()
             att_id = a.get("attachmentId")
@@ -950,6 +1273,52 @@ def store_email_to_drive(
                 drive_upload_bytes(drive_service, adj_folder_id, filename, content, mt)
             except Exception as e:
                 print(f"⚠️ No pude subir adjunto a Drive ({filename}): {e}")
+
+        # Subir extraídos de ZIP
+        zip_atts = [a for a in attachments if _is_zip(a)]
+        if zip_atts:
+            extra_root = drive_get_or_create_folder(drive_service, adj_folder_id, "_extraidos")
+
+            for a in zip_atts:
+                fn = (a.get("filename") or "archivo.zip").strip()
+                att_id = a.get("attachmentId")
+                if not att_id:
+                    continue
+
+                try:
+                    zb = gmail_download_attachment_bytes(gmail_service, message_id, att_id)
+                    extracted = extract_zip_files(fn, zb)
+                    if not extracted.get("ok"):
+                        continue
+
+                    zip_folder = drive_get_or_create_folder(drive_service, extra_root, fn)
+
+                    for f in extracted.get("files", []) or []:
+                        name = (f.get("name") or "").replace("\\", "/")
+                        data = f.get("bytes") or b""
+                        mime = f.get("mime") or "application/octet-stream"
+
+                        # crear subcarpetas si hay rutas
+                        parts = [p for p in name.split("/") if p]
+                        if not parts:
+                            continue
+
+                        current_parent = zip_folder
+                        for folder_part in parts[:-1]:
+                            current_parent = drive_get_or_create_folder(drive_service, current_parent, folder_part)
+
+                        final_name = parts[-1]
+                        if DRIVE_DEDUPE_ATTACHMENTS:
+                            try:
+                                if drive_file_exists(drive_service, current_parent, final_name):
+                                    continue
+                            except Exception:
+                                pass
+
+                        drive_upload_bytes(drive_service, current_parent, final_name, data, mime)
+
+                except Exception as e:
+                    print(f"⚠️ Drive: fallo subiendo extraídos ZIP ({fn}): {e}")
 
     except Exception as e:
         print(f"⚠️ Drive: fallo subiendo adjuntos ({radicado}): {e}")
@@ -974,7 +1343,6 @@ def safe_get_message_full(gmail_service, message_id: str) -> Optional[Dict]:
 def process_message(gmail_service, drive_service, message_id: str, client_catalog: List[Dict[str, Optional[str]]]) -> None:
     state = load_state()
 
-    # dedupe
     if message_id in state_get_processed_set(state):
         return
 
@@ -1006,9 +1374,18 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         return
 
     searchable_text = f"{subject}\n{from_header}\n{body_text}\n{snippet}"
+
+    if ONLY_PROCESS_EMAILS_WITH_ATTACHMENTS and not has_any_attachment(payload):
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
     attachments = _collect_attachments(payload)
 
-    # Drive root
+    # ✅ analizar ZIPs (si hay)
+    zip_analysis = analyze_zip_attachments(gmail_service, message_id, attachments) if any(_is_zip(a) for a in attachments) else []
+
+    # Drive root (una sola vez por mensaje)
     root_id = None
     if drive_service:
         try:
@@ -1017,14 +1394,11 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
             print(f"⚠️ Drive deshabilitado por error creando/validando root: {e}")
             root_id = None
 
-    # ruido sin adjuntos
-    if ONLY_PROCESS_EMAILS_WITH_ATTACHMENTS and not has_any_attachment(payload):
-        state_add_processed(state, message_id)
-        save_state(state)
-        return
-
-    # links prohibidos
+    # -------------------------
+    # RECHAZO: links
+    # -------------------------
     if contains_forbidden_links(searchable_text):
+        apply_status_labels(gmail_service, message_id, "rejected")
         reasons = ["El correo contiene enlaces (http/https/www). Deben adjuntar los archivos (sin links)."]
 
         if not already_replied:
@@ -1036,17 +1410,20 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         if root_id:
             store_email_to_drive(
                 gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
-                message_id=message_id, msg_full=msg, radicado=radicado, estado="RECHAZADO",
-                cliente="NO_IDENTIFICADO", cobro=None, fields={}, subject=subject, body_text=body_text,
-                received_dt=received_dt, reasons=reasons, attachments=attachments
+                message_id=message_id, msg_full=msg, radicado=radicado, estado="rejected",
+                cliente_name=None, cobro=None, fields={}, subject=subject, body_text=body_text,
+                received_dt=received_dt, reasons=reasons, attachments=attachments, zip_analysis=zip_analysis
             )
 
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # horario
+    # -------------------------
+    # RECHAZO: horario
+    # -------------------------
     if received_dt and not is_within_receiving_window(received_dt):
+        apply_status_labels(gmail_service, message_id, "rejected")
         reasons = [f"Fuera de horario de recepción (L–V 9:00 a.m. a 5:00 p.m.). Llegó: {received_dt.isoformat()}"]
 
         if not already_replied:
@@ -1058,17 +1435,20 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         if root_id:
             store_email_to_drive(
                 gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
-                message_id=message_id, msg_full=msg, radicado=radicado, estado="RECHAZADO",
-                cliente="NO_IDENTIFICADO", cobro=None, fields={}, subject=subject, body_text=body_text,
-                received_dt=received_dt, reasons=reasons, attachments=attachments
+                message_id=message_id, msg_full=msg, radicado=radicado, estado="rejected",
+                cliente_name=None, cobro=None, fields={}, subject=subject, body_text=body_text,
+                received_dt=received_dt, reasons=reasons, attachments=attachments, zip_analysis=zip_analysis
             )
 
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # cierre mensual 2026
+    # -------------------------
+    # RECHAZO: cierre mensual 2026
+    # -------------------------
     if received_dt and is_after_monthly_closing_2026(received_dt):
+        apply_status_labels(gmail_service, message_id, "rejected")
         reasons = [f"Llegó después de la fecha de cierre del mes (calendario 2026). Llegó: {received_dt.date().isoformat()}"]
 
         if not already_replied:
@@ -1080,26 +1460,30 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         if root_id:
             store_email_to_drive(
                 gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
-                message_id=message_id, msg_full=msg, radicado=radicado, estado="RECHAZADO",
-                cliente="NO_IDENTIFICADO", cobro=None, fields={}, subject=subject, body_text=body_text,
-                received_dt=received_dt, reasons=reasons, attachments=attachments
+                message_id=message_id, msg_full=msg, radicado=radicado, estado="rejected",
+                cliente_name=None, cobro=None, fields={}, subject=subject, body_text=body_text,
+                received_dt=received_dt, reasons=reasons, attachments=attachments, zip_analysis=zip_analysis
             )
 
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # keywords opcional
+    # Keywords opcional
     if not passes_keyword_filter(searchable_text):
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # campos obligatorios
+    # Campos obligatorios del comunicado
     fields = parse_radicacion_fields(subject, body_text)
     missing_fields = validate_required_radicacion_fields(fields)
     if missing_fields:
-        reasons = ["Falta información obligatoria en ASUNTO o CUERPO.", f"Faltantes: {', '.join(missing_fields)}"]
+        apply_status_labels(gmail_service, message_id, "rejected")
+        reasons = [
+            "Falta información obligatoria en ASUNTO o CUERPO.",
+            f"Faltantes: {', '.join(missing_fields)}"
+        ]
 
         if not already_replied:
             subj, body = build_rejected_email(radicado, fields, reasons)
@@ -1107,77 +1491,27 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
             state_mark_replied(state, message_id)
             save_state(state)
 
+        cliente_guess = (fields.get("cliente") or "").strip() or None
         if root_id:
             store_email_to_drive(
                 gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
-                message_id=message_id, msg_full=msg, radicado=radicado, estado="RECHAZADO",
-                cliente=fields.get("cliente") or "NO_IDENTIFICADO", cobro=fields.get("cobro"),
-                fields=fields, subject=subject, body_text=body_text, received_dt=received_dt,
-                reasons=reasons, attachments=attachments
+                message_id=message_id, msg_full=msg, radicado=radicado, estado="rejected",
+                cliente_name=cliente_guess, cobro=fields.get("cobro"), fields=fields, subject=subject,
+                body_text=body_text, received_dt=received_dt, reasons=reasons,
+                attachments=attachments, zip_analysis=zip_analysis
             )
 
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # validar cliente con catálogo
+    # Validar CLIENTE contra catálogo
     client_obj = find_client_exact_or_normalized(fields["cliente"], client_catalog) if client_catalog else None
     if client_catalog and not client_obj:
-        reasons = ["CLIENTE no existe en el catálogo o no está activo.", f"CLIENTE declarado: {fields.get('cliente')}"]
-
-        if not already_replied:
-            subj, body = build_rejected_email(radicado, fields, reasons)
-            send_reply_email(gmail_service, msg, to_email, subj, body)
-            state_mark_replied(state, message_id)
-            save_state(state)
-
-        if root_id:
-            store_email_to_drive(
-                gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
-                message_id=message_id, msg_full=msg, radicado=radicado, estado="RECHAZADO",
-                cliente=fields.get("cliente") or "NO_IDENTIFICADO", cobro=fields.get("cobro"),
-                fields=fields, subject=subject, body_text=body_text, received_dt=received_dt,
-                reasons=reasons, attachments=attachments
-            )
-
-        state_add_processed(state, message_id)
-        save_state(state)
-        return
-
-    # validar adjuntos por tipo factura
-    invoice_attach_errors = validate_invoice_type_attachments(fields["factura"], attachments)
-    if invoice_attach_errors:
-        reasons = ["Adjuntos no cumplen el tipo de FACTURA declarado."] + invoice_attach_errors
-
-        if not already_replied:
-            subj, body = build_rejected_email(radicado, fields, reasons)
-            send_reply_email(gmail_service, msg, to_email, subj, body)
-            state_mark_replied(state, message_id)
-            save_state(state)
-
-        if root_id:
-            store_email_to_drive(
-                gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
-                message_id=message_id, msg_full=msg, radicado=radicado, estado="RECHAZADO",
-                cliente=client_obj["name"] if client_obj else (fields.get("cliente") or "NO_IDENTIFICADO"),
-                cobro=fields.get("cobro"), fields=fields, subject=subject, body_text=body_text,
-                received_dt=received_dt, reasons=reasons, attachments=attachments
-            )
-
-        state_add_processed(state, message_id)
-        save_state(state)
-        return
-
-    # ✅ validar PDFs mínimos (dinámico por tipo)
-    required = REQUIRED_PDF_COUNT
-    if (fields.get("factura") or "").upper() == "ELECTRONICA":
-        required = 1  # porque puede ser 1 PDF + 1 XML (o 2 PDFs)
-
-    pdf_validation = validate_required_pdfs(payload, required_count=required)
-    if not pdf_validation["ok"]:
+        apply_status_labels(gmail_service, message_id, "rejected")
         reasons = [
-            f"PDF incompletos. Llegaron {pdf_validation['pdf_count']} / {required} (faltan {pdf_validation['missing']}).",
-            f"PDFs detectados: {', '.join(pdf_validation['pdf_filenames']) if pdf_validation['pdf_filenames'] else '(ninguno)'}"
+            "CLIENTE no existe en el catálogo o no está activo.",
+            f"CLIENTE declarado: {fields.get('cliente')}"
         ]
 
         if not already_replied:
@@ -1189,17 +1523,77 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         if root_id:
             store_email_to_drive(
                 gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
-                message_id=message_id, msg_full=msg, radicado=radicado, estado="RECHAZADO",
-                cliente=client_obj["name"] if client_obj else (fields.get("cliente") or "NO_IDENTIFICADO"),
-                cobro=fields.get("cobro"), fields=fields, subject=subject, body_text=body_text,
-                received_dt=received_dt, reasons=reasons, attachments=attachments
+                message_id=message_id, msg_full=msg, radicado=radicado, estado="rejected",
+                cliente_name=None, cobro=fields.get("cobro"), fields=fields, subject=subject,
+                body_text=body_text, received_dt=received_dt, reasons=reasons,
+                attachments=attachments, zip_analysis=zip_analysis
             )
 
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # ✅ APROBADO
+    # ✅ Validación adjuntos por tipo de factura (incluye ZIP)
+    invoice_attach_errors = validate_invoice_type_attachments(fields["factura"], attachments, zip_analysis=zip_analysis)
+    if invoice_attach_errors:
+        apply_status_labels(gmail_service, message_id, "rejected")
+        reasons = ["Adjuntos no cumplen el tipo de FACTURA declarado."] + invoice_attach_errors
+
+        if not already_replied:
+            subj, body = build_rejected_email(radicado, fields, reasons)
+            send_reply_email(gmail_service, msg, to_email, subj, body)
+            state_mark_replied(state, message_id)
+            save_state(state)
+
+        if root_id:
+            store_email_to_drive(
+                gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
+                message_id=message_id, msg_full=msg, radicado=radicado, estado="rejected",
+                cliente_name=client_obj["name"] if client_obj else None,
+                cobro=fields.get("cobro"), fields=fields, subject=subject, body_text=body_text,
+                received_dt=received_dt, reasons=reasons, attachments=attachments, zip_analysis=zip_analysis
+            )
+
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
+    # ✅ PDFs detectados (directo + zip) para logs/correos/metadata
+    pdf_validation = validate_required_pdfs(payload, required_count=REQUIRED_PDF_COUNT, zip_analysis=zip_analysis)
+
+    # ✅ Regla PDFs mínimos SOLO para FACTURA NORMAL
+    if fields["factura"] == "NORMAL":
+        if not pdf_validation["ok"]:
+            apply_status_labels(gmail_service, message_id, "rejected")
+            reasons = [
+                f"PDF incompletos. Llegaron {pdf_validation['pdf_count']} / {REQUIRED_PDF_COUNT} (faltan {pdf_validation['missing']}).",
+                f"PDFs directos: {pdf_validation['pdf_count_direct']} | PDFs en ZIP: {pdf_validation['pdf_count_zip']}",
+                f"PDFs directos detectados: {', '.join(pdf_validation['pdf_filenames']) if pdf_validation['pdf_filenames'] else '(ninguno)'}"
+            ]
+
+            if not already_replied:
+                subj, body = build_rejected_email(radicado, fields, reasons)
+                send_reply_email(gmail_service, msg, to_email, subj, body)
+                state_mark_replied(state, message_id)
+                save_state(state)
+
+            if root_id:
+                store_email_to_drive(
+                    gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
+                    message_id=message_id, msg_full=msg, radicado=radicado, estado="rejected",
+                    cliente_name=client_obj["name"] if client_obj else None,
+                    cobro=fields.get("cobro"), fields=fields, subject=subject, body_text=body_text,
+                    received_dt=received_dt, reasons=reasons, attachments=attachments, zip_analysis=zip_analysis
+                )
+
+            state_add_processed(state, message_id)
+            save_state(state)
+            return
+
+    # -------------------------
+    # ✅ ACEPTADO
+    # -------------------------
+    apply_status_labels(gmail_service, message_id, "accepted")
     if not already_replied:
         subj, body = build_approved_email(radicado, fields, pdf_validation["pdf_count"])
         send_reply_email(gmail_service, msg, to_email, subj, body)
@@ -1207,14 +1601,15 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         save_state(state)
 
     if root_id:
-        cliente_name = client_obj["name"] if client_obj else (fields.get("cliente") or "NO_IDENTIFICADO")
         store_email_to_drive(
             gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
-            message_id=message_id, msg_full=msg, radicado=radicado, estado="APROBADO",
-            cliente=cliente_name, cobro=fields.get("cobro"), fields=fields, subject=subject,
-            body_text=body_text, received_dt=received_dt, reasons=None, attachments=attachments
+            message_id=message_id, msg_full=msg, radicado=radicado, estado="accepted",
+            cliente_name=client_obj["name"] if client_obj else (fields.get("cliente") or None),
+            cobro=fields.get("cobro"), fields=fields, subject=subject, body_text=body_text,
+            received_dt=received_dt, reasons=None, attachments=attachments, zip_analysis=zip_analysis
         )
 
+    # Logs locales
     print("\n" + "=" * 70)
     print(f"🆕 Procesado → Message ID: {message_id}")
     print(f"🧾 Radicado: {radicado}")
@@ -1225,8 +1620,11 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
     print(f"CLIENTE: {client_obj['name'] if client_obj else fields['cliente']}")
     print(f"COBRO: {fields['cobro']}")
     print(f"FACTURA: {fields['factura']}")
-    print("✅ Estado: APROBADO")
-    print(f"Adjuntos OK: {pdf_validation['pdf_count']} PDFs detectados.")
+    print("✅ Estado: ACEPTADO")
+    print(f"PDFs detectados total (directo+ZIP): {pdf_validation['pdf_count']}")
+    if zip_analysis:
+        for z in zip_analysis:
+            print(f"📦 ZIP: {z.get('zip_filename')} | ok={z.get('ok')} | pdf={z.get('pdf_count')} | xml={z.get('xml_count')} | err={z.get('error')}")
     print("=" * 70)
 
     state_add_processed(state, message_id)
