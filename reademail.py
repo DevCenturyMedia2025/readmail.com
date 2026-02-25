@@ -10,19 +10,18 @@ Incluye:
   - Facturación Rechazada
   - (Opcional) archivar (remover INBOX) para simular “mover”
 - ✅ Validaciones del comunicado 2026:
-  - Recepción: L–V 9:00 a.m. a 5:00 p.m. (Bogotá)
+  - Recepción: L–V 9:00 a.m. a 6:00 p.m. (Bogotá)
   - Cierre mensual 2026 (si llega después => RECHAZADO)
-  - No links (http/https/www) => RECHAZADO
   - Adjuntos obligatorios y reglas por tipo de factura
 - ✅ Formato obligatorio en ASUNTO o CUERPO:
   - CLIENTE: <nombre>
   - COBRO: CONTADO | CREDITO | ANTICIPO
-  - FACTURA: NORMAL | ELECTRONICA
+  - FACTURA: CUENTA DE COBRO | ELECTRONICA
 - ✅ Reglas de adjuntos según FACTURA (AJUSTADO):
-  - ELECTRONICA: aceptable si:
-        (1 PDF) o (2 PDFs) o (1 PDF + 1 XML)
-    y NO otros tipos (excepto ZIP como contenedor).
-  - NORMAL: SOLO PDF (excepto ZIP como contenedor), y mínimo REQUIRED_PDF_COUNT PDFs
+  - ELECTRONICA: requisito mínimo:
+        (2 PDFs) o (1 PDF + 1 XML) sumando adjuntos directos y ZIP (incluyendo ZIP dentro de ZIP).
+    Adjuntos extra (ej. XLS, imágenes) no bloquean la radicación.
+  - CUENTA DE COBRO: SOLO PDF (excepto ZIP como contenedor), y mínimo REQUIRED_PDF_COUNT PDFs
 - ✅ ZIP:
   - Si llega ZIP, se inspecciona y se cuentan PDFs/XML adentro (con límites anti-zipbomb).
   - Si Drive está activo, también se suben los archivos extraídos.
@@ -151,7 +150,7 @@ RADICADO_MAP_LIMIT = int(os.environ.get("RADICADO_MAP_LIMIT", "5000"))
 # ✅ Reglas comunicado 2026
 TZ_BOGOTA = timezone(timedelta(hours=-5))
 RECEPTION_START_HOUR = 9
-RECEPTION_END_HOUR = 17
+RECEPTION_END_HOUR = 18
 
 CLOSING_2026 = {
     1: 28, 2: 25, 3: 27, 4: 28, 5: 27, 6: 24,
@@ -175,6 +174,7 @@ MAX_ZIP_BYTES = int(os.environ.get("MAX_ZIP_BYTES", str(25 * 1024 * 1024)))  # 2
 MAX_ZIP_FILES = int(os.environ.get("MAX_ZIP_FILES", "200"))                 # max entradas
 MAX_ZIP_TOTAL_UNCOMPRESSED = int(os.environ.get("MAX_ZIP_TOTAL_UNCOMPRESSED", str(150 * 1024 * 1024)))  # 150MB
 MAX_ZIP_SINGLE_FILE = int(os.environ.get("MAX_ZIP_SINGLE_FILE", str(25 * 1024 * 1024)))  # 25MB por archivo
+MAX_ZIP_NESTING = int(os.environ.get("MAX_ZIP_NESTING", "2"))  # Profundidad permitida (2 => ZIP dentro de ZIP)
 
 
 # ============================================================
@@ -311,6 +311,7 @@ def passes_keyword_filter(searchable_text: str) -> bool:
     low = (searchable_text or "").lower()
     return any(k in low for k in KEYWORDS_FILTER)
 
+# (Opcional) Ya NO se usa, pero lo dejo por si lo quieres después.
 def contains_forbidden_links(text: str) -> bool:
     if not text:
         return False
@@ -393,6 +394,9 @@ def _is_zip(att: Dict[str, Optional[str]]) -> bool:
     mt = (att.get("mimeType") or "").lower()
     return fn.endswith(".zip") or mt in ("application/zip", "application/x-zip-compressed")
 
+def has_invoice_attachments(attachments: List[Dict[str, Optional[str]]]) -> bool:
+    return any(_is_pdf(a) or _is_xml(a) or _is_zip(a) for a in (attachments or []))
+
 def has_any_attachment(payload: Dict) -> bool:
     return len(_collect_attachments(payload)) > 0
 
@@ -411,16 +415,12 @@ def _is_safe_zip_member(name: str) -> bool:
         return False
     return True
 
-def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes) -> Dict[str, object]:
-    """
-    Lee el ZIP en memoria, lista archivos, cuenta PDFs/XML.
-    Incluye límites básicos anti zip-bomb.
-    """
+def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes, _depth: int = 1) -> Dict[str, object]:
     out = {
         "zip_filename": zip_filename,
         "ok": True,
         "error": None,
-        "files": [],  # [{"name":..., "size":..., "is_pdf":..., "is_xml":...}]
+        "files": [],
         "pdf_count": 0,
         "xml_count": 0,
         "total_uncompressed": 0,
@@ -470,26 +470,59 @@ def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes) -> Dict[str, object]:
                     out["error"] = f"Archivo dentro del ZIP demasiado grande: {name} ({size} > {MAX_ZIP_SINGLE_FILE})"
                     return out
 
+                lower = name.lower()
+                is_pdf = lower.endswith(".pdf")
+                is_xml = lower.endswith(".xml")
+                is_nested_zip = lower.endswith(".zip")
+
+                entry = {
+                    "name": name,
+                    "size": size,
+                    "is_pdf": is_pdf,
+                    "is_xml": is_xml,
+                    "is_zip": is_nested_zip,
+                }
+                files.append(entry)
+
+                if is_nested_zip:
+                    if _depth >= MAX_ZIP_NESTING:
+                        out["ok"] = False
+                        out["error"] = (
+                            f"ZIP anidado excede profundidad permitida (MAX_ZIP_NESTING={MAX_ZIP_NESTING}). "
+                            f"Archivo: {name}"
+                        )
+                        return out
+                    nested_bytes = zf.read(name)
+                    nested_analysis = analyze_zip_bytes(
+                        f"{zip_filename}/{name}",
+                        nested_bytes,
+                        _depth=_depth + 1
+                    )
+                    if not nested_analysis.get("ok"):
+                        out["ok"] = False
+                        nested_error = nested_analysis.get("error") or "Error en ZIP anidado"
+                        out["error"] = f"{name}: {nested_error}"
+                        return out
+                    entry["nested"] = nested_analysis
+                    pdf_count += int(nested_analysis.get("pdf_count") or 0)
+                    xml_count += int(nested_analysis.get("xml_count") or 0)
+                    total += int(nested_analysis.get("total_uncompressed") or 0)
+                    if total > MAX_ZIP_TOTAL_UNCOMPRESSED:
+                        out["ok"] = False
+                        out["error"] = f"ZIP excede total descomprimido ({total} > {MAX_ZIP_TOTAL_UNCOMPRESSED})"
+                        return out
+                    continue
+
                 total += size
                 if total > MAX_ZIP_TOTAL_UNCOMPRESSED:
                     out["ok"] = False
                     out["error"] = f"ZIP excede total descomprimido ({total} > {MAX_ZIP_TOTAL_UNCOMPRESSED})"
                     return out
 
-                lower = name.lower()
-                is_pdf = lower.endswith(".pdf")
-                is_xml = lower.endswith(".xml")
                 if is_pdf:
                     pdf_count += 1
                 if is_xml:
                     xml_count += 1
-
-                files.append({
-                    "name": name,
-                    "size": size,
-                    "is_pdf": is_pdf,
-                    "is_xml": is_xml,
-                })
 
             out["files"] = files
             out["pdf_count"] = pdf_count
@@ -507,40 +540,48 @@ def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes) -> Dict[str, object]:
         return out
 
 def extract_zip_files(zip_filename: str, zip_bytes: bytes) -> Dict[str, object]:
-    """
-    Extrae archivos del ZIP en memoria (solo para subir a Drive).
-    Respeta los mismos límites anti zip-bomb.
-    Devuelve lista de archivos: [{"name":..., "bytes":..., "mime":...}]
-    """
     analysis = analyze_zip_bytes(zip_filename, zip_bytes)
     if not analysis.get("ok"):
         return {"ok": False, "error": analysis.get("error"), "files": []}
 
-    files_out = []
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            for f in analysis.get("files", []) or []:
-                name = f.get("name")
+    files_out: List[Dict[str, object]] = []
+
+    def _extract_level(current_bytes: bytes, node: Dict[str, object], prefix: str = "") -> None:
+        with zipfile.ZipFile(io.BytesIO(current_bytes)) as zf:
+            for f in node.get("files", []) or []:
+                name = (f.get("name") or "").strip()
                 if not name or not _is_safe_zip_member(name):
                     continue
-                raw = zf.read(name)  # ya limitado por file_size checks arriba
+                try:
+                    raw = zf.read(name)
+                except KeyError:
+                    continue
+
+                normalized = name.replace("\\", "/")
+                full_name = "/".join(part for part in [prefix, normalized] if part)
+
+                if f.get("is_zip"):
+                    nested = f.get("nested")
+                    if nested:
+                        _extract_level(raw, nested, full_name or normalized)
+                    continue
+
                 mime = "application/octet-stream"
-                ln = name.lower()
-                if ln.endswith(".pdf"):
+                lower = normalized.lower()
+                if lower.endswith(".pdf"):
                     mime = "application/pdf"
-                elif ln.endswith(".xml"):
+                elif lower.endswith(".xml"):
                     mime = "application/xml"
-                files_out.append({"name": name, "bytes": raw, "mime": mime})
 
+                files_out.append({"name": full_name or normalized, "bytes": raw, "mime": mime})
+
+    try:
+        _extract_level(zip_bytes, analysis, "")
         return {"ok": True, "error": None, "files": files_out}
-
     except Exception as e:
         return {"ok": False, "error": str(e), "files": []}
 
 def analyze_zip_attachments(gmail_service, message_id: str, attachments: List[Dict[str, Optional[str]]]) -> List[Dict[str, object]]:
-    """
-    Descarga ZIPs adjuntos y devuelve análisis por cada ZIP.
-    """
     results = []
     for a in attachments:
         if not _is_zip(a):
@@ -549,13 +590,8 @@ def analyze_zip_attachments(gmail_service, message_id: str, attachments: List[Di
         att_id = a.get("attachmentId")
         if not att_id:
             results.append({
-                "zip_filename": fn,
-                "ok": False,
-                "error": "ZIP sin attachmentId",
-                "files": [],
-                "pdf_count": 0,
-                "xml_count": 0,
-                "total_uncompressed": 0,
+                "zip_filename": fn, "ok": False, "error": "ZIP sin attachmentId",
+                "files": [], "pdf_count": 0, "xml_count": 0, "total_uncompressed": 0
             })
             continue
         try:
@@ -563,13 +599,8 @@ def analyze_zip_attachments(gmail_service, message_id: str, attachments: List[Di
             results.append(analyze_zip_bytes(fn, zb))
         except Exception as e:
             results.append({
-                "zip_filename": fn,
-                "ok": False,
-                "error": f"No pude descargar ZIP: {e}",
-                "files": [],
-                "pdf_count": 0,
-                "xml_count": 0,
-                "total_uncompressed": 0,
+                "zip_filename": fn, "ok": False, "error": f"No pude descargar ZIP: {e}",
+                "files": [], "pdf_count": 0, "xml_count": 0, "total_uncompressed": 0
             })
     return results
 
@@ -582,6 +613,30 @@ def _zip_counts(zip_analysis: List[Dict[str, object]]) -> Dict[str, int]:
         pdf_zip += int(z.get("pdf_count") or 0)
         xml_zip += int(z.get("xml_count") or 0)
     return {"pdf_zip": pdf_zip, "xml_zip": xml_zip}
+
+def _iter_zip_leaf_files(analysis: Dict[str, object]) -> List[Dict[str, object]]:
+    flat: List[Dict[str, object]] = []
+
+    def _walk(node: Dict[str, object], prefix: str) -> None:
+        for f in node.get("files", []) or []:
+            name = (f.get("name") or "").strip()
+            if not name:
+                continue
+            normalized = name.replace("\\", "/")
+            full_name = "/".join(part for part in [prefix, normalized] if part)
+            if f.get("is_zip"):
+                nested = f.get("nested")
+                if nested:
+                    _walk(nested, full_name)
+                continue
+            flat.append({
+                "name": full_name or normalized,
+                "is_pdf": bool(f.get("is_pdf")),
+                "is_xml": bool(f.get("is_xml")),
+            })
+
+    _walk(analysis or {}, "")
+    return flat
 
 def validate_required_pdfs(payload: Dict, required_count: int, zip_analysis: Optional[List[Dict[str, object]]] = None) -> Dict[str, object]:
     atts = _collect_attachments(payload)
@@ -618,12 +673,15 @@ def parse_radicacion_fields(subject: str, body_text: str) -> Dict[str, Optional[
 
     cliente = pick(r"CLIENTE\s*:\s*([^\n\|]+)")
     cobro = pick(r"COBRO\s*:\s*(CONTADO|CREDITO|CRÉDITO|ANTICIPO)")
-    factura = pick(r"FACTURA\s*:\s*(NORMAL|ELECTRONICA|ELECTRÓNICA)")
+    factura = pick(r"FACTURA\s*:\s*(CUENTA\s+DE\s+COBRO|CUENTADECOBRO|ELECTRONICA|ELECTRÓNICA)")
 
     if cobro:
         cobro = cobro.upper().replace("CRÉDITO", "CREDITO")
     if factura:
         factura = factura.upper().replace("ELECTRÓNICA", "ELECTRONICA")
+        factura_compact = factura.replace(" ", "")
+        if factura_compact == "CUENTADECOBRO":
+            factura = "CUENTA DE COBRO"
 
     return {"cliente": cliente, "cobro": cobro, "factura": factura}
 
@@ -634,7 +692,7 @@ def validate_required_radicacion_fields(fields: Dict[str, Optional[str]]) -> Lis
     if not fields.get("cobro"):
         missing.append("COBRO (CONTADO|CREDITO|ANTICIPO)")
     if not fields.get("factura"):
-        missing.append("FACTURA (NORMAL|ELECTRONICA)")
+        missing.append("FACTURA (CUENTA DE COBRO|ELECTRONICA)")
     return missing
 
 def validate_invoice_type_attachments(
@@ -642,12 +700,6 @@ def validate_invoice_type_attachments(
     attachments: List[Dict[str, Optional[str]]],
     zip_analysis: Optional[List[Dict[str, object]]] = None
 ) -> List[str]:
-    """
-    AJUSTADO:
-      - ZIP es permitido como contenedor (pero su contenido debe cumplir la regla).
-      - ELECTRONICA: acepta (1 PDF) o (2 PDFs) o (1 PDF + 1 XML) considerando ZIP.
-      - NORMAL: permite solo PDF (y ZIP conteniendo solo PDF). XML prohibido. Además mínimo PDFs se valida aparte.
-    """
     errors = []
 
     pdf_direct = sum(1 for a in attachments if _is_pdf(a))
@@ -664,56 +716,50 @@ def validate_invoice_type_attachments(
     for a in attachments:
         if _is_zip(a):
             continue
-        if factura_type == "ELECTRONICA":
-            if not (_is_pdf(a) or _is_xml(a)):
-                errors.append(f"Adjunto no permitido para FACTURA ELECTRÓNICA: {a.get('filename')}")
-        else:  # NORMAL
+        if factura_type == "CUENTA DE COBRO":
             if not _is_pdf(a):
-                errors.append(f"Adjunto no permitido (FACTURA NORMAL solo PDF): {a.get('filename')}")
+                errors.append(f"Adjunto no permitido (FACTURA CUENTA DE COBRO solo PDF): {a.get('filename')}")
 
     # 2) Validar contenido del ZIP (si se pudo leer)
     for z in zip_analysis or []:
         if not z.get("ok"):
-            # Si llega ZIP pero no se puede leer -> rechaza
             errors.append(f"ZIP no se pudo procesar ({z.get('zip_filename')}): {z.get('error')}")
             continue
-        for f in z.get("files", []) or []:
-            name = (f.get("name") or "")
+        for f in _iter_zip_leaf_files(z):
+            name = f.get("name") or ""
             is_pdf = bool(f.get("is_pdf"))
             is_xml = bool(f.get("is_xml"))
-            if factura_type == "ELECTRONICA":
-                if not (is_pdf or is_xml):
-                    errors.append(f"Archivo no permitido dentro del ZIP para ELECTRÓNICA: {z.get('zip_filename')} → {name}")
-            else:  # NORMAL
+            if factura_type == "CUENTA DE COBRO":
                 if not is_pdf:
-                    errors.append(f"Archivo no permitido dentro del ZIP para NORMAL (solo PDF): {z.get('zip_filename')} → {name}")
+                    errors.append(
+                        f"Archivo no permitido dentro del ZIP para CUENTA DE COBRO (solo PDF): "
+                        f"{z.get('zip_filename')} → {name}"
+                    )
 
     if errors:
         return errors
 
-    # 3) Reglas específicas por tipo (AJUSTADO)
+    # 3) Reglas específicas por tipo
     if factura_type == "ELECTRONICA":
-        # Aceptable si:
-        # - 1 PDF (con o sin XML)
-        # - 2 PDFs
-        # - 1 PDF + 1 XML
-        if pdf_total < 1:
-            errors.append("FACTURA ELECTRÓNICA requiere al menos 1 PDF (directo o dentro de ZIP).")
-        else:
-            if pdf_total == 1:
-                # ok aunque XML sea 0 o 1+
-                pass
-            elif pdf_total >= 2:
-                # ok (dos PDFs o más)
-                pass
-
-        # no exigimos XML obligatorio porque tú lo pediste así (1 PDF solo también vale)
-        # pero si llega, lo permitimos.
+        has_two_pdfs = pdf_total >= 2
+        has_pdf_xml_mix = (pdf_total >= 1) and (xml_total >= 1)
+        if not (has_two_pdfs or has_pdf_xml_mix):
+            errors.append(
+                "FACTURA ELECTRÓNICA requiere mínimo (2 PDFs) o (1 PDF + 1 XML) "
+                "sumando adjuntos directos y ZIP (incluyendo ZIP dentro de ZIP)."
+            )
+            errors.append(
+                f"Detectados → PDFs: {pdf_total} (directos {pdf_direct}, ZIP {pdf_zip}) | "
+                f"XML: {xml_total} (directos {xml_direct}, ZIP {xml_zip})."
+            )
         return errors
 
-    # NORMAL:
-    if xml_total > 0:
-        errors.append("FACTURA NORMAL no debe incluir XML (solo PDF).")
+    if factura_type == "CUENTA DE COBRO":
+        if xml_total > 0:
+            errors.append("FACTURA CUENTA DE COBRO no debe incluir XML (solo PDF).")
+        return errors
+
+    errors.append(f"Tipo de FACTURA desconocido: {factura_type}")
 
     return errors
 
@@ -980,13 +1026,12 @@ def build_rejected_email(radicado: str, fields: Dict[str, Optional[str]], reason
         "Estado: RECHAZADO\n"
         f"Cliente: {cliente}\n"
         f"Tipo de cobro: {cobro} (CONTADO / CREDITO / ANTICIPO)\n"
-        f"Tipo de factura: {factura} (NORMAL / ELECTRONICA)\n\n"
+        f"Tipo de factura: {factura} (CUENTA DE COBRO / ELECTRONICA)\n\n"
         "Motivos del rechazo:\n"
         + "".join([f"- {r}\n" for r in reasons]) +
         "\nQué debes corregir y reenviar (en un solo correo):\n"
         "1) En asunto o cuerpo indicar: CLIENTE + COBRO + FACTURA.\n"
-        "2) Adjuntar soportes en PDF (y XML si aplica para ELECTRONICA).\n"
-        "3) Sin links: no http/https/www.\n\n"
+        "2) Adjuntar soportes en PDF (y XML si aplica para ELECTRONICA).\n\n"
         "Ejemplo válido:\n"
         "CLIENTE: ACME SAS | COBRO: CREDITO | FACTURA: ELECTRONICA\n\n"
         "Gracias,\n"
@@ -1007,7 +1052,7 @@ def build_approved_email(radicado: str, fields: Dict[str, Optional[str]], pdf_to
         "Estado: APROBADO / RECIBIDO OK\n"
         f"Cliente: {cliente}\n"
         f"Tipo de cobro: {cobro} (CONTADO / CREDITO / ANTICIPO)\n"
-        f"Tipo de factura: {factura} (NORMAL / ELECTRONICA)\n"
+        f"Tipo de factura: {factura} (CUENTA DE COBRO / ELECTRONICA)\n"
         f"PDFs detectados (directo + ZIP): {pdf_total}\n\n"
         "Tu solicitud queda en proceso según los tiempos internos de revisión y pago.\n\n"
         "Gracias,\n"
@@ -1036,16 +1081,9 @@ def _drive_create_kwargs():
 
 def drive_file_exists(drive_service, parent_id: str, filename: str) -> bool:
     safe_name = filename.replace("'", "\\'")
-    q = (
-        f"'{parent_id}' in parents "
-        "and trashed=false "
-        f"and name='{safe_name}'"
-    )
+    q = f"'{parent_id}' in parents and trashed=false and name='{safe_name}'"
     res = drive_service.files().list(
-        q=q,
-        fields="files(id,name)",
-        pageSize=1,
-        **_drive_list_kwargs()
+        q=q, fields="files(id,name)", pageSize=1, **_drive_list_kwargs()
     ).execute()
     return bool(res.get("files"))
 
@@ -1058,10 +1096,7 @@ def drive_find_folder(drive_service, parent_id: str, name: str) -> Optional[str]
         "and trashed=false"
     )
     res = drive_service.files().list(
-        q=q,
-        fields="files(id,name)",
-        pageSize=10,
-        **_drive_list_kwargs()
+        q=q, fields="files(id,name)", pageSize=10, **_drive_list_kwargs()
     ).execute()
     files = res.get("files", [])
     return files[0]["id"] if files else None
@@ -1078,20 +1113,14 @@ def drive_create_root_if_needed(drive_service) -> Optional[str]:
     if DRIVE_ROOT_FOLDER_ID:
         try:
             drive_service.files().get(
-                fileId=DRIVE_ROOT_FOLDER_ID,
-                fields="id,name",
-                **_drive_create_kwargs()
+                fileId=DRIVE_ROOT_FOLDER_ID, fields="id,name", **_drive_create_kwargs()
             ).execute()
             return DRIVE_ROOT_FOLDER_ID
         except Exception as e:
             print(f"⚠️ Sin acceso a DRIVE_ROOT_FOLDER_ID={DRIVE_ROOT_FOLDER_ID}. Intentaré por nombre. Error: {e}")
 
     safe_name = DRIVE_ROOT_FOLDER_NAME.replace("'", "\\'")
-    q = (
-        "mimeType='application/vnd.google-apps.folder' "
-        f"and name='{safe_name}' "
-        "and trashed=false"
-    )
+    q = "mimeType='application/vnd.google-apps.folder' and trashed=false and name='%s'" % safe_name
     res = drive_service.files().list(q=q, fields="files(id,name)", pageSize=10, **_drive_list_kwargs()).execute()
     files = res.get("files", [])
     if files:
@@ -1106,10 +1135,7 @@ def drive_upload_bytes(drive_service, parent_id: str, filename: str, data: bytes
     media = MediaInMemoryUpload(data, mimetype=mime_type, resumable=False)
     meta = {"name": filename, "parents": [parent_id]}
     f = drive_service.files().create(
-        body=meta,
-        media_body=media,
-        fields="id",
-        **_drive_create_kwargs()
+        body=meta, media_body=media, fields="id", **_drive_create_kwargs()
     ).execute()
     return f["id"]
 
@@ -1121,14 +1147,14 @@ def _cobro_to_folder_name(cobro: Optional[str]) -> str:
         return "credito"
     if c == "ANTICIPO":
         return "anticipo"
-    return "contado"  # fallback
+    return "contado"
 
 def drive_build_radicado_folder_new_structure(
     drive_service,
     root_id: str,
-    estado: str,                   # "accepted"|"rejected"
-    cliente_name: Optional[str],   # nombre final de cliente (si existe)
-    cobro: Optional[str],          # CONTADO|CREDITO|ANTICIPO
+    estado: str,
+    cliente_name: Optional[str],
+    cobro: Optional[str],
     radicado: str,
     received_dt: Optional[datetime],
     cliente_identificado: bool,
@@ -1165,7 +1191,7 @@ def store_email_to_drive(
     message_id: str,
     msg_full: Dict,
     radicado: str,
-    estado: str,  # "accepted"|"rejected"
+    estado: str,
     cliente_name: Optional[str],
     cobro: Optional[str],
     fields: Dict[str, Optional[str]],
@@ -1192,7 +1218,6 @@ def store_email_to_drive(
         cliente_identificado=cliente_identificado,
     )
 
-    # Idempotencia: si ya existe metadata.json, no duplicamos
     try:
         if drive_file_exists(drive_service, rad_folder_id, "metadata.json"):
             print(f"ℹ️ Drive: ya existe metadata.json para {radicado}, no duplico subida.")
@@ -1200,7 +1225,6 @@ def store_email_to_drive(
     except Exception as e:
         print(f"⚠️ Drive: no pude verificar metadata.json (continuo). Error: {e}")
 
-    # 1) email.eml
     try:
         raw_msg = gmail_service.users().messages().get(userId="me", id=message_id, format="raw").execute()
         raw_b64 = raw_msg.get("raw", "") or ""
@@ -1209,7 +1233,6 @@ def store_email_to_drive(
     except Exception as e:
         print(f"⚠️ No pude subir email.eml ({radicado}): {e}")
 
-    # 2) email.txt
     try:
         drive_upload_bytes(
             drive_service, rad_folder_id, "email.txt",
@@ -1218,7 +1241,6 @@ def store_email_to_drive(
     except Exception as e:
         print(f"⚠️ No pude subir email.txt ({radicado}): {e}")
 
-    # 3) metadata.json
     try:
         payload = (msg_full.get("payload") or {})
         metadata = {
@@ -1247,13 +1269,11 @@ def store_email_to_drive(
     except Exception as e:
         print(f"⚠️ No pude subir metadata.json ({radicado}): {e}")
 
-    # 4) adjuntos/*
     try:
         adj_folder_id = drive_find_folder(drive_service, rad_folder_id, "adjuntos")
         if not adj_folder_id:
             adj_folder_id = drive_get_or_create_folder(drive_service, rad_folder_id, "adjuntos")
 
-        # Subir adjuntos directos (incluye ZIP)
         for a in attachments:
             filename = (a.get("filename") or "").strip()
             att_id = a.get("attachmentId")
@@ -1274,7 +1294,6 @@ def store_email_to_drive(
             except Exception as e:
                 print(f"⚠️ No pude subir adjunto a Drive ({filename}): {e}")
 
-        # Subir extraídos de ZIP
         zip_atts = [a for a in attachments if _is_zip(a)]
         if zip_atts:
             extra_root = drive_get_or_create_folder(drive_service, adj_folder_id, "_extraidos")
@@ -1298,7 +1317,6 @@ def store_email_to_drive(
                         data = f.get("bytes") or b""
                         mime = f.get("mime") or "application/octet-stream"
 
-                        # crear subcarpetas si hay rutas
                         parts = [p for p in name.split("/") if p]
                         if not parts:
                             continue
@@ -1382,10 +1400,8 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
 
     attachments = _collect_attachments(payload)
 
-    # ✅ analizar ZIPs (si hay)
     zip_analysis = analyze_zip_attachments(gmail_service, message_id, attachments) if any(_is_zip(a) for a in attachments) else []
 
-    # Drive root (una sola vez por mensaje)
     root_id = None
     if drive_service:
         try:
@@ -1395,36 +1411,11 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
             root_id = None
 
     # -------------------------
-    # RECHAZO: links
-    # -------------------------
-    if contains_forbidden_links(searchable_text):
-        apply_status_labels(gmail_service, message_id, "rejected")
-        reasons = ["El correo contiene enlaces (http/https/www). Deben adjuntar los archivos (sin links)."]
-
-        if not already_replied:
-            subj, body = build_rejected_email(radicado, {}, reasons)
-            send_reply_email(gmail_service, msg, to_email, subj, body)
-            state_mark_replied(state, message_id)
-            save_state(state)
-
-        if root_id:
-            store_email_to_drive(
-                gmail_service=gmail_service, drive_service=drive_service, root_id=root_id,
-                message_id=message_id, msg_full=msg, radicado=radicado, estado="rejected",
-                cliente_name=None, cobro=None, fields={}, subject=subject, body_text=body_text,
-                received_dt=received_dt, reasons=reasons, attachments=attachments, zip_analysis=zip_analysis
-            )
-
-        state_add_processed(state, message_id)
-        save_state(state)
-        return
-
-    # -------------------------
     # RECHAZO: horario
     # -------------------------
     if received_dt and not is_within_receiving_window(received_dt):
         apply_status_labels(gmail_service, message_id, "rejected")
-        reasons = [f"Fuera de horario de recepción (L–V 9:00 a.m. a 5:00 p.m.). Llegó: {received_dt.isoformat()}"]
+        reasons = [f"Fuera de horario de recepción (L–V 9:00 a.m. a 6:00 p.m.). Llegó: {received_dt.isoformat()}"]
 
         if not already_replied:
             subj, body = build_rejected_email(radicado, {}, reasons)
@@ -1469,13 +1460,11 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         save_state(state)
         return
 
-    # Keywords opcional
     if not passes_keyword_filter(searchable_text):
         state_add_processed(state, message_id)
         save_state(state)
         return
 
-    # Campos obligatorios del comunicado
     fields = parse_radicacion_fields(subject, body_text)
     missing_fields = validate_required_radicacion_fields(fields)
     if missing_fields:
@@ -1505,7 +1494,6 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         save_state(state)
         return
 
-    # Validar CLIENTE contra catálogo
     client_obj = find_client_exact_or_normalized(fields["cliente"], client_catalog) if client_catalog else None
     if client_catalog and not client_obj:
         apply_status_labels(gmail_service, message_id, "rejected")
@@ -1533,7 +1521,6 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         save_state(state)
         return
 
-    # ✅ Validación adjuntos por tipo de factura (incluye ZIP)
     invoice_attach_errors = validate_invoice_type_attachments(fields["factura"], attachments, zip_analysis=zip_analysis)
     if invoice_attach_errors:
         apply_status_labels(gmail_service, message_id, "rejected")
@@ -1558,11 +1545,9 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
         save_state(state)
         return
 
-    # ✅ PDFs detectados (directo + zip) para logs/correos/metadata
     pdf_validation = validate_required_pdfs(payload, required_count=REQUIRED_PDF_COUNT, zip_analysis=zip_analysis)
 
-    # ✅ Regla PDFs mínimos SOLO para FACTURA NORMAL
-    if fields["factura"] == "NORMAL":
+    if fields["factura"] == "CUENTA DE COBRO":
         if not pdf_validation["ok"]:
             apply_status_labels(gmail_service, message_id, "rejected")
             reasons = [
@@ -1590,9 +1575,6 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
             save_state(state)
             return
 
-    # -------------------------
-    # ✅ ACEPTADO
-    # -------------------------
     apply_status_labels(gmail_service, message_id, "accepted")
     if not already_replied:
         subj, body = build_approved_email(radicado, fields, pdf_validation["pdf_count"])
@@ -1609,7 +1591,6 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
             received_dt=received_dt, reasons=None, attachments=attachments, zip_analysis=zip_analysis
         )
 
-    # Logs locales
     print("\n" + "=" * 70)
     print(f"🆕 Procesado → Message ID: {message_id}")
     print(f"🧾 Radicado: {radicado}")
@@ -1634,12 +1615,27 @@ def process_message(gmail_service, drive_service, message_id: str, client_catalo
 # ============================================================
 # PUBSUB LISTENER (PULL/REST) - ACK SIEMPRE
 # ============================================================
-def listen_pubsub(gmail_service, drive_service, client_catalog: List[Dict[str, Optional[str]]]) -> None:
+def listen_pubsub(
+    gmail_service,
+    drive_service,
+    sheets_service,
+    client_catalog: List[Dict[str, Optional[str]]]
+) -> None:
     subscriber = pubsub_v1.SubscriberClient(transport="rest")
     subscription_path = f"projects/{GCP_PROJECT_ID}/subscriptions/{PUBSUB_SUBSCRIPTION_ID}"
     print(f"👂 Escuchando Pub/Sub (PULL/REST): {subscription_path}")
 
     backoff = 1
+    catalog_data = client_catalog or []
+
+    def refresh_catalog() -> None:
+        nonlocal catalog_data
+        try:
+            updated = load_client_catalog(sheets_service)
+            catalog_data = updated
+            print(f"🔄 Catálogo de clientes actualizado: {len(catalog_data)} clientes activos")
+        except Exception as e:
+            print(f"⚠️ No pude refrescar el catálogo de clientes: {e}")
 
     while True:
         try:
@@ -1685,8 +1681,9 @@ def listen_pubsub(gmail_service, drive_service, client_catalog: List[Dict[str, O
                         print(f"🔔 Evento ({email_addr}) historyId={history_id} → sin messageAdded nuevos (normal).")
                     else:
                         print(f"🔔 Evento ({email_addr}) historyId={history_id} → {len(new_ids)} mensaje(s) nuevo(s)")
+                        refresh_catalog()
                         for mid in new_ids:
-                            process_message(gmail_service, drive_service, mid, client_catalog)
+                            process_message(gmail_service, drive_service, mid, catalog_data)
 
                 except Exception as e:
                     print(f"❌ Error procesando evento Pub/Sub: {e}")
@@ -1730,7 +1727,7 @@ def main():
     print(f"✅ Catálogo cargado: {len(client_catalog)} clientes activos")
 
     ensure_gmail_watch(gmail_service)
-    listen_pubsub(gmail_service, drive_service, client_catalog)
+    listen_pubsub(gmail_service, drive_service, sheets_service, client_catalog)
 
 
 if __name__ == "__main__":
