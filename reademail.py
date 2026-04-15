@@ -27,6 +27,7 @@ Si el PDF es escaneado como imagen sin capa de texto, varias validaciones podrí
 """
 
 import base64
+import html
 import io
 import json
 import os
@@ -204,6 +205,10 @@ class UnifiedFile:
     def is_xml(self) -> bool:
         return self.lower_name.endswith(".xml") or self.mime_type in ("application/xml", "text/xml")
 
+    @property
+    def is_image(self) -> bool:
+        return self.lower_name.endswith((".jpg", ".jpeg", ".png")) or self.mime_type in ("image/jpeg", "image/png")
+
 
 # ============================================================
 # BASIC HELPERS
@@ -256,24 +261,47 @@ def get_header(payload: Dict, name: str) -> str:
     return ""
 
 
+def html_to_text(value: str) -> str:
+    if not value:
+        return ""
+    value = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
+    value = re.sub(r"(?i)<br\s*/?>", "\n", value)
+    value = re.sub(r"(?i)</p\s*>", "\n", value)
+    value = re.sub(r"(?i)</div\s*>", "\n", value)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = html.unescape(value)
+    value = re.sub(r"[ \t\r\f\v]+", " ", value)
+    value = re.sub(r"\n\s+", "\n", value)
+    return value.strip()
+
+
 def extract_plain_text(payload: Dict) -> str:
     if not payload:
         return ""
 
     body = payload.get("body", {}) or {}
-    if body.get("data") and (payload.get("mimeType") == "text/plain" or not payload.get("parts")):
+    mime_type = payload.get("mimeType", "")
+    if body.get("data") and mime_type == "text/html":
+        return html_to_text(decode_body(body.get("data")))
+    if body.get("data") and (mime_type == "text/plain" or not payload.get("parts")):
         return decode_body(body.get("data"))
 
+    html_fallback = ""
     for part in ensure_list(payload.get("parts")):
-        mime_type = part.get("mimeType", "")
-        if mime_type == "text/plain":
+        part_mime_type = part.get("mimeType", "")
+        if part_mime_type == "text/plain":
             txt = decode_body((part.get("body", {}) or {}).get("data"))
             if txt:
                 return txt
+        if part_mime_type == "text/html":
+            txt = html_to_text(decode_body((part.get("body", {}) or {}).get("data")))
+            if txt and not html_fallback:
+                html_fallback = txt
+            continue
         nested = extract_plain_text(part)
         if nested:
             return nested
-    return ""
+    return html_fallback
 
 
 def extract_sender_email(from_header: str) -> Optional[str]:
@@ -281,10 +309,13 @@ def extract_sender_email(from_header: str) -> Optional[str]:
     return email or None
 
 
-def create_raw_email(to_email: str, subject: str, body: str) -> str:
+def create_raw_email(to_email: str, subject: str, body: str, extra_headers: Optional[Dict[str, str]] = None) -> str:
     msg = MIMEText(body, _charset="utf-8")
     msg["To"] = to_email
     msg["Subject"] = subject
+    for name, value in (extra_headers or {}).items():
+        if value:
+            msg[name] = value
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
 
 
@@ -414,7 +445,7 @@ def get_oauth_creds() -> Credentials:
 # ============================================================
 def _header_aliases() -> Dict[str, Set[str]]:
     return {
-        "cliente": {"cliente", "razon social", "razón social", "nombre cliente", "client", "empresa"},
+        "cliente": {"cliente", "razon social", "razón social", "nombre cliente", "client", "empresa", "proveedor", "proverdor"},
         "nit": {"nit", "nit cliente", "tax id"},
         "estado": {"estado", "activo", "status"},
     }
@@ -503,6 +534,31 @@ def find_client_by_nit(nit: str, catalog: List[ClientRecord]) -> Optional[Client
         if record.normalized_nit and record.normalized_nit == normalized:
             return record
     return None
+
+
+def find_client_by_nit_in_text(text: str, catalog: List[ClientRecord]) -> Optional[Tuple[str, ClientRecord]]:
+    if not text or not catalog:
+        return None
+
+    digits = normalize_nit(text)
+    if not digits:
+        return None
+
+    best: Optional[Tuple[int, str, ClientRecord]] = None
+    for record in catalog:
+        if not record.active:
+            continue
+        nit = record.normalized_nit or ""
+        if len(nit) < 6:
+            continue
+        if nit in digits:
+            score = len(nit)
+            if best is None or score > best[0]:
+                best = (score, nit, record)
+
+    if not best:
+        return None
+    return best[1], best[2]
 
 
 def identify_client(candidate_texts: List[str], catalog: List[ClientRecord]) -> Optional[ClientRecord]:
@@ -712,6 +768,7 @@ def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes, depth: int = 1) -> Di
         "files": [],
         "pdf_count": 0,
         "xml_count": 0,
+        "image_count": 0,
         "total_uncompressed": 0,
     }
 
@@ -736,6 +793,7 @@ def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes, depth: int = 1) -> Di
             total = 0
             pdf_count = 0
             xml_count = 0
+            image_count = 0
             files = []
 
             for info in infos:
@@ -761,12 +819,14 @@ def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes, depth: int = 1) -> Di
                 lower = name.lower()
                 is_pdf = lower.endswith(".pdf")
                 is_xml = lower.endswith(".xml")
+                is_image = lower.endswith((".jpg", ".jpeg", ".png"))
                 is_zip = lower.endswith(".zip")
                 entry = {
                     "name": name,
                     "size": size,
                     "is_pdf": is_pdf,
                     "is_xml": is_xml,
+                    "is_image": is_image,
                     "is_zip": is_zip,
                 }
                 files.append(entry)
@@ -785,6 +845,7 @@ def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes, depth: int = 1) -> Di
                     entry["nested"] = nested_analysis
                     pdf_count += int(nested_analysis.get("pdf_count") or 0)
                     xml_count += int(nested_analysis.get("xml_count") or 0)
+                    image_count += int(nested_analysis.get("image_count") or 0)
                     total += int(nested_analysis.get("total_uncompressed") or 0)
                     if total > MAX_ZIP_TOTAL_UNCOMPRESSED:
                         out["ok"] = False
@@ -801,10 +862,13 @@ def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes, depth: int = 1) -> Di
                     pdf_count += 1
                 if is_xml:
                     xml_count += 1
+                if is_image:
+                    image_count += 1
 
             out["files"] = files
             out["pdf_count"] = pdf_count
             out["xml_count"] = xml_count
+            out["image_count"] = image_count
             out["total_uncompressed"] = total
             return out
 
@@ -847,6 +911,10 @@ def extract_zip_files(zip_filename: str, zip_bytes: bytes) -> Dict[str, object]:
                     mime = "application/pdf"
                 elif lower.endswith(".xml"):
                     mime = "application/xml"
+                elif lower.endswith((".jpg", ".jpeg")):
+                    mime = "image/jpeg"
+                elif lower.endswith(".png"):
+                    mime = "image/png"
 
                 output.append(UnifiedFile(name=full_name, mime_type=mime, data=raw, source=f"zip:{zip_filename}"))
 
@@ -898,12 +966,21 @@ def build_unified_files(gmail_service, message_id: str, attachments: List[Dict[s
                 zip_errors.append(f"ZIP inválido {filename}: {extracted.get('error')}")
                 continue
             for item in extracted.get("files") or []:
-                if item.is_pdf or item.is_xml:
+                if item.is_pdf or item.is_xml or item.is_image:
                     unified.append(item)
+            print(
+                f"📦 ZIP leído: {filename} | "
+                f"pdf={analysis.get('pdf_count')} | "
+                f"xml={analysis.get('xml_count')} | "
+                f"img={analysis.get('image_count')}"
+            )
+            for item in extracted.get("files") or []:
+                if item.is_pdf or item.is_xml or item.is_image:
+                    print(f"   ↳ {item.name}")
             continue
 
         file_obj = UnifiedFile(name=filename, mime_type=mime_type, data=content, source="direct")
-        if file_obj.is_pdf or file_obj.is_xml:
+        if file_obj.is_pdf or file_obj.is_xml or file_obj.is_image:
             unified.append(file_obj)
 
     for item in unified:
@@ -926,18 +1003,23 @@ def extract_nit_from_text(text: str) -> Optional[str]:
     return nit or None
 
 
+def contains_note_credit_text(text: str) -> bool:
+    normalized_text = normalize_text(text)
+    if not normalized_text:
+        return False
+    return bool(re.search(r"\bnota\s+(?:de\s+)?credito\b", normalized_text) or re.search(r"\bcredit\s+note\b", normalized_text))
+
+
 def is_note_credit_by_filename(pdfs: List[UnifiedFile]) -> bool:
     for pdf in pdfs:
-        normalized_name = normalize_alnum(pdf.name)
-        if "notadecredito" in normalized_name or "creditnote" in normalized_name:
+        if contains_note_credit_text(pdf.name):
             return True
     return False
 
 
 def is_note_credit_by_text(pdfs: List[UnifiedFile]) -> bool:
     for pdf in pdfs:
-        normalized_text = normalize_alnum(pdf.extracted_text)
-        if "notadecredito" in normalized_text or "creditnote" in normalized_text:
+        if contains_note_credit_text(pdf.extracted_text):
             return True
     return False
 
@@ -960,6 +1042,204 @@ def detect_ok_compras(pdfs: List[UnifiedFile]) -> bool:
     return False
 
 
+CUENTA_COBRO_REQUIRED_DOCS = [
+    "cuenta_cobro",
+    "cedula",
+    "rut",
+    "certificado_bancario",
+    "orden_compra",
+]
+
+DOCUMENT_CLASSIFIERS = {
+    "cuenta_cobro": {
+        "required_any": ("cuenta cobro", "cuenta de cobro", "cuenta_cobro", "cta"),
+        "alternate_all": (("debe a", "la suma de"),),
+        "support": ("debe a", "la suma de", "por concepto de", "por favor consignar"),
+        "min_support": 0,
+        "allow_images": False,
+    },
+    "cedula": {
+        "required_any": ("cedula de ciudadania", "cedula", "identificacion personal", "documento de identidad"),
+        "alternate_all": (("republica de colombia", "identificacion"),),
+        "support": ("republica de colombia", "fecha de nacimiento", "lugar de expedicion", "indice derecho"),
+        "min_support": 0,
+        "allow_images": True,
+    },
+    "rut": {
+        "required_any": ("registro unico tributario", "rut"),
+        "alternate_all": (("dian", "nit", "actividad economica"),),
+        "support": (
+            "dian",
+            "nit",
+            "numero de identificacion tributaria",
+            "responsabilidades calidades y atributos",
+            "tipo de contribuyente",
+            "actividad economica",
+            "regimen simplificado",
+            "formulario del registro",
+            "muisca",
+        ),
+        "min_support": 0,
+        "allow_images": False,
+    },
+    "certificado_bancario": {
+        "required_any": ("certificado bancario", "certificado_bancario", "certificado-bancario", "cert bancario", "c b", "certifica", "firma autorizada"),
+        "alternate_all": (("certifica", "cuenta de ahorros"),),
+        "support": (
+            "c b",
+            "certificado bancario",
+            "cuenta de ahorros",
+            "banco",
+            "saldo o cupo disponible",
+            "tipo de producto",
+            "nro de producto",
+            "davivienda",
+            "bancolombia",
+            "banco de bogota",
+        ),
+        "min_support": 1,
+        "allow_images": False,
+    },
+    "orden_compra": {
+        "required_any": ("orden de internet", "orden de compra", "orden no", "orden nro", "orden numero"),
+        "alternate_all": (("subtotal", "autorizado por"),),
+        "support": (
+            "valor neto",
+            "cpm costo x click",
+            "subtotal",
+            "elaborado por",
+            "autorizado por",
+            "no se recibe factura",
+            "century media",
+        ),
+        "min_support": 0,
+        "allow_images": False,
+    },
+    "aprobado_compras": {
+        "required_any": ("aprobado", "aprobacion", "aprobado por"),
+        "alternate_all": (),
+        "support": ("vo bo", "vobo", "visto bueno", "autorizado", "jefe de compras", "gerente", "firma de aprobacion"),
+        "min_support": 1,
+        "allow_images": False,
+    },
+}
+
+
+def _contains_document_keyword(text: str, keyword: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    normalized_keyword = normalize_text(keyword)
+    if normalized_keyword == "rut":
+        return bool(re.search(r"\brut\b", normalized))
+    if normalized_keyword == "cta":
+        return bool(re.search(r"\bcta\b", normalized))
+    if re.search(rf"\b{re.escape(normalized_keyword)}\b", normalized):
+        return True
+    return normalize_alnum(normalized_keyword) in normalize_alnum(normalized)
+
+
+def _document_classifier_score(sample: str, config: Dict[str, object]) -> int:
+    required = tuple(str(x) for x in config.get("required_any", ()))
+    alternate_groups = tuple(config.get("alternate_all", ()) or ())
+    support = tuple(str(x) for x in config.get("support", ()))
+    min_support = int(config.get("min_support") or 0)
+
+    required_hits = sum(1 for keyword in required if _contains_document_keyword(sample, keyword))
+    alternate_hit = any(
+        all(_contains_document_keyword(sample, str(keyword)) for keyword in group)
+        for group in alternate_groups
+    )
+    if required_hits < 1 and not alternate_hit:
+        return 0
+
+    support_hits = sum(1 for keyword in support if _contains_document_keyword(sample, keyword))
+    if not alternate_hit and support_hits < min_support:
+        return 0
+
+    return (required_hits * 10) + (10 if alternate_hit else 0) + support_hits
+
+
+def _classify_document_sample(sample: str, file_obj: UnifiedFile) -> Optional[str]:
+    matches: List[Tuple[int, str]] = []
+
+    for doc_type, config in DOCUMENT_CLASSIFIERS.items():
+        allow_images = bool(config.get("allow_images"))
+        if not file_obj.is_pdf and not (allow_images and file_obj.is_image):
+            continue
+
+        score = _document_classifier_score(sample, config)
+        if score:
+            matches.append((score, doc_type))
+
+    if not matches:
+        return None
+
+    matches.sort(reverse=True)
+    if len(matches) > 1 and matches[0][0] == matches[1][0]:
+        return None
+    return matches[0][1]
+
+
+def classify_document_type(file_obj: UnifiedFile) -> Optional[str]:
+    by_name = _classify_document_sample(file_obj.name, file_obj)
+    if by_name:
+        return by_name
+    return _classify_document_sample(file_obj.extracted_text, file_obj)
+
+
+def classify_document_type_with_method(file_obj: UnifiedFile) -> Tuple[Optional[str], str]:
+    by_name = _classify_document_sample(file_obj.name, file_obj)
+    if by_name:
+        return by_name, "nombre"
+
+    by_content = _classify_document_sample(file_obj.extracted_text, file_obj)
+    if by_content:
+        return by_content, "contenido"
+
+    return None, "desconocido"
+
+
+def validate_cuenta_cobro_package(files: List[UnifiedFile]) -> Dict[str, object]:
+    identified: Dict[str, List[str]] = {doc_type: [] for doc_type in CUENTA_COBRO_REQUIRED_DOCS}
+    unknown: List[str] = []
+
+    for file_obj in files:
+        if not (file_obj.is_pdf or file_obj.is_image):
+            continue
+
+        doc_type, method = classify_document_type_with_method(file_obj)
+        if not doc_type:
+            unknown.append(file_obj.name)
+            continue
+        identified.setdefault(doc_type, [])
+        identified[doc_type].append(f"{file_obj.name} ({method})")
+
+    faltantes = [doc_type for doc_type in CUENTA_COBRO_REQUIRED_DOCS if not identified[doc_type]]
+    duplicados = {doc_type: names for doc_type, names in identified.items() if len(names) > 1}
+    identificados = {doc_type: names for doc_type, names in identified.items() if names}
+    identified_required_count = sum(1 for doc_type in CUENTA_COBRO_REQUIRED_DOCS if identified[doc_type])
+
+    complete = not faltantes
+    complete_with_unknown = bool(faltantes) and len(unknown) == 1 and identified_required_count >= 4
+    estado = "completo" if complete else "completo_con_desconocido" if complete_with_unknown else "incompleto"
+    mensaje = (
+        "Recibido archivos completos"
+        if complete
+        else "Recibido archivos completos con un documento no identificado"
+        if complete_with_unknown
+        else "Faltan documentos obligatorios"
+    )
+    return {
+        "estado": estado,
+        "mensaje": mensaje,
+        "identificados": identificados,
+        "faltantes": faltantes,
+        "duplicados": duplicados,
+        "desconocidos": unknown,
+    }
+
+
 def classify_invoice_type(xml_count: int) -> str:
     return "FACTURA ELECTRONICA" if xml_count >= 1 else "CUENTA DE COBRO"
 
@@ -976,7 +1256,7 @@ def validate_pdf_minimum(invoice_type: str, pdf_count: int) -> Optional[str]:
 # RESPONSES
 # ============================================================
 def build_rejected_email(radicado: str, invoice_type: str, reasons: List[str], client_name: Optional[str]) -> Tuple[str, str]:
-    subject = f"RECHAZADO – facturación no radicada (ID: {radicado})"
+    subject = f"RECHAZADO - facturacion no radicada (ID: {radicado})"
     body = (
         "Hola,\n\n"
         "Recibimos tu correo, pero no fue posible radicarlo.\n\n"
@@ -993,7 +1273,7 @@ def build_rejected_email(radicado: str, invoice_type: str, reasons: List[str], c
 
 
 def build_approved_email(radicado: str, invoice_type: str, client_name: str, pdf_count: int, xml_count: int) -> Tuple[str, str]:
-    subject = f"APROBADO – facturación recibida correctamente (ID: {radicado})"
+    subject = f"APROBADO - facturacion recibida correctamente (ID: {radicado})"
     body = (
         "Hola,\n\n"
         "Confirmamos que tu correo fue recibido y validado correctamente.\n\n"
@@ -1010,7 +1290,18 @@ def build_approved_email(radicado: str, invoice_type: str, client_name: str, pdf
 
 
 def send_reply_email(gmail_service, original_msg: Dict, to_email: str, subject: str, body: str) -> None:
-    payload = {"raw": create_raw_email(to_email, subject, body)}
+    original_payload = original_msg.get("payload", {}) or {}
+    original_subject = get_header(original_payload, "Subject")
+    original_message_id = get_header(original_payload, "Message-ID")
+    original_references = get_header(original_payload, "References")
+    reply_subject = original_subject if original_subject.lower().startswith("re:") else f"Re: {original_subject or subject}"
+    references = " ".join(x for x in [original_references, original_message_id] if x).strip()
+    extra_headers = {
+        "In-Reply-To": original_message_id,
+        "References": references,
+    }
+
+    payload = {"raw": create_raw_email(to_email, reply_subject, body, extra_headers=extra_headers)}
     thread_id = original_msg.get("threadId")
     if thread_id:
         payload["threadId"] = thread_id
@@ -1074,6 +1365,10 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
     # 1) Ruta administrativa por NIT en lista blanca
     nit = extract_nit_from_text(combined_email_text)
     matched_nit_client = find_client_by_nit(nit, catalog) if nit else None
+    if not matched_nit_client:
+        matched_nit = find_client_by_nit_in_text(combined_email_text, catalog)
+        if matched_nit:
+            nit, matched_nit_client = matched_nit
     if matched_nit_client:
         apply_single_status_label(gmail_service, message_id, LABEL_ADMIN_NAME, archive=ARCHIVE_ADMIN)
         print(f"🟦 ADMINISTRATIVA | {radicado} | NIT={nit} | cliente={matched_nit_client.name}")
@@ -1081,12 +1376,21 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
         save_state(state)
         return
 
-    # 2) Unificar PDF/XML desde adjuntos directos + ZIP
+    # 2) Nota de crédito: texto del correo
+    if contains_note_credit_text(combined_email_text):
+        apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
+        print(f"🟪 NOTA DE CREDITO por correo | {radicado}")
+        state_add_processed(state, message_id)
+        save_state(state)
+        return
+
+    # 3) Unificar PDF/XML desde adjuntos directos + ZIP
     unified_files, zip_errors, zip_analyses = build_unified_files(gmail_service, message_id, attachments)
     pdfs = [f for f in unified_files if f.is_pdf]
     xmls = [f for f in unified_files if f.is_xml]
+    images = [f for f in unified_files if f.is_image]
 
-    # 3) Si no hay al menos 1 PDF -> revisión manual
+    # 4) Si no hay al menos 1 PDF -> revisión manual
     if len(pdfs) < 1:
         apply_single_status_label(gmail_service, message_id, LABEL_REVIEW_NAME, archive=ARCHIVE_REVIEW)
         print(f"🟨 REVISION MANUAL | {radicado} | sin PDF unificado | ZIP errors={zip_errors}")
@@ -1094,7 +1398,7 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
         save_state(state)
         return
 
-    # 4) Nota de crédito: nombre del PDF
+    # 5) Nota de crédito: nombre del PDF
     if is_note_credit_by_filename(pdfs):
         apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
         print(f"🟪 NOTA DE CREDITO por nombre | {radicado}")
@@ -1102,7 +1406,7 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
         save_state(state)
         return
 
-    # 5) Nota de crédito: texto del PDF
+    # 6) Nota de crédito: texto del PDF
     if is_note_credit_by_text(pdfs):
         apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
         print(f"🟪 NOTA DE CREDITO por texto | {radicado}")
@@ -1113,26 +1417,38 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
     invoice_type = classify_invoice_type(len(xmls))
 
     reasons: List[str] = []
-    minimum_error = validate_pdf_minimum(invoice_type, len(pdfs))
-    if minimum_error:
-        reasons.append(minimum_error)
+    cuenta_cobro_validation: Optional[Dict[str, object]] = None
+    if invoice_type == "CUENTA DE COBRO":
+        cuenta_cobro_validation = validate_cuenta_cobro_package(pdfs + images)
+        validation_status = str(cuenta_cobro_validation.get("estado") or "")
+
+        if validation_status == "incompleto":
+            faltantes = cuenta_cobro_validation.get("faltantes") or []
+            reasons.append("Cuenta de cobro incompleta. Faltan: " + ", ".join(str(x) for x in faltantes) + ".")
+        print("📦 Validación cuenta de cobro:", json.dumps(cuenta_cobro_validation, ensure_ascii=False))
+    else:
+        minimum_error = validate_pdf_minimum(invoice_type, len(pdfs))
+        if minimum_error:
+            reasons.append(minimum_error)
 
     if zip_errors:
         reasons.extend(zip_errors)
 
-    has_order = detect_order(pdfs)
-    if not has_order:
+    has_order = bool(cuenta_cobro_validation and "orden_compra" in (cuenta_cobro_validation.get("identificados") or {}))
+    if invoice_type != "CUENTA DE COBRO":
+        has_order = detect_order(pdfs)
+    if invoice_type != "CUENTA DE COBRO" and not has_order:
         reasons.append("No se detectó orden de compra en nombre ni texto de los PDF.")
 
     client_match = identify_client(
         candidate_texts=[subject, body_text, snippet] + [f.name for f in pdfs] + [f.extracted_text for f in pdfs],
         catalog=catalog,
     )
-    if not client_match:
+    if invoice_type != "CUENTA DE COBRO" and not client_match:
         reasons.append("No se logró identificar el cliente con el contenido del correo o los PDF.")
 
     has_ok_compras = detect_ok_compras(pdfs)
-    if not has_ok_compras:
+    if invoice_type != "CUENTA DE COBRO" and not has_ok_compras:
         reasons.append("No se detectó OK de compras dentro de los PDF.")
 
     if reasons:
@@ -1143,7 +1459,9 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
             reasons=reasons,
             client_name=client_match.name if client_match else None,
         )
+        print(f"✉️ Respondiendo rechazo en el mismo hilo | {radicado} | to={sender_email}")
         send_reply_email(gmail_service, msg, sender_email, subject_reply, body_reply)
+        print(f"✅ Respuesta de rechazo enviada | {radicado}")
         state_mark_replied(state, message_id)
         state_add_processed(state, message_id)
         save_state(state)
@@ -1164,11 +1482,13 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
     approved_subject, approved_body = build_approved_email(
         radicado=radicado,
         invoice_type=invoice_type,
-        client_name=client_match.name,
+        client_name=client_match.name if client_match else "No identificado",
         pdf_count=len(pdfs),
         xml_count=len(xmls),
     )
+    print(f"✉️ Respondiendo aprobación en el mismo hilo | {radicado} | to={sender_email}")
     send_reply_email(gmail_service, msg, sender_email, approved_subject, approved_body)
+    print(f"✅ Respuesta de aprobación enviada | {radicado}")
     state_mark_replied(state, message_id)
     state_add_processed(state, message_id)
     save_state(state)
@@ -1177,7 +1497,7 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
     print(f"🟩 APROBADO | {radicado}")
     print(f"From: {from_header}")
     print(f"Subject: {subject}")
-    print(f"Cliente: {client_match.name}")
+    print(f"Cliente: {client_match.name if client_match else 'No identificado'}")
     print(f"Tipo: {invoice_type}")
     print(f"PDF: {len(pdfs)} | XML: {len(xmls)}")
     if zip_analyses:
@@ -1223,6 +1543,7 @@ def listen_pubsub(gmail_service, sheets_service, client_catalog: List[ClientReco
 
             for rm in response.received_messages:
                 ack_id = rm.ack_id
+                should_ack = True
                 try:
                     subscriber.modify_ack_deadline(
                         request={
@@ -1273,8 +1594,12 @@ def listen_pubsub(gmail_service, sheets_service, client_catalog: List[ClientReco
                             process_message(gmail_service, mid, catalog_data)
 
                 except Exception as e:
+                    should_ack = False
                     print(f"❌ Error procesando evento Pub/Sub: {e}")
                 finally:
+                    if not should_ack:
+                        print("↩️ Evento no confirmado; Pub/Sub lo reintentará.")
+                        continue
                     try:
                         subscriber.acknowledge(
                             request={
