@@ -30,6 +30,7 @@ import base64
 import html
 import io
 import json
+import logging
 import os
 import os.path
 import re
@@ -44,6 +45,9 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
@@ -107,6 +111,7 @@ WATCH_LABEL_IDS = [x.strip() for x in env_first("GMAIL_LABEL_IDS", default="INBO
 
 SHEET_ID = env_first("CLIENT_SHEET_ID")
 SHEET_RANGE = env_first("CLIENT_SHEET_RANGE", default="Clientes!A:Z")
+CLIENT_LOOKUP_RANGE = env_first("CLIENT_LOOKUP_RANGE", default="Clientes!A:Z")
 ACTIVE_VALUES = {x.strip().lower() for x in env_first("ACTIVE_VALUES", default="activo,active,si,yes,1,true").split(",") if x.strip()}
 
 # Etiquetas nuevas con fallback al .env viejo
@@ -139,13 +144,24 @@ IDLE_SLEEP_SEC = float(env_first("IDLE_SLEEP_SEC", default="1.0"))
 WATCH_RENEW_WINDOW_MS = env_int("WATCH_RENEW_WINDOW_MS", default=60 * 60 * 1000)
 
 # PDFs mínimos:
-# - Nuevo flujo: electrónica=2, cuenta de cobro=4
+# - Factura electrónica: mínimo 3 PDF + 1 XML.
+# - Cuenta de cobro: validación documental por tipos.
 # - Si existe REQUIRED_PDF_COUNT del .env viejo, lo tomamos como fallback SOLO para cuenta de cobro.
-MIN_PDF_FE = env_int("MIN_PDF_FACTURA_ELECTRONICA", default=2)
+MIN_PDF_FE = env_int("MIN_PDF_FACTURA_ELECTRONICA", default=3)
+MIN_XML_FE = env_int("MIN_XML_FACTURA_ELECTRONICA", default=1)
 MIN_PDF_CC = env_int("MIN_PDF_CUENTA_COBRO", "REQUIRED_PDF_COUNT", default=4)
+INCOMPLETE_FILES_MESSAGE = (
+    "Se identificaron archivos incompletos. Agradecemos revisar y confirmar que la documentación "
+    "esté completa antes de realizar el envío."
+)
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 STATE_FILE = env_first("GMAIL_WATCH_STATE_FILE", default=os.path.join(_BASE_DIR, "gmail_watch_state.json"))
+
+# Multi-cuenta
+GMAIL_ACCOUNTS_RAW = env_first("GMAIL_ACCOUNTS", default="")
+ACCOUNTS_DIR = env_first("ACCOUNTS_DIR", default=os.path.join(_BASE_DIR, "accounts"))
+GMAIL_ACCOUNTS: List[str] = [a.strip() for a in GMAIL_ACCOUNTS_RAW.split(",") if a.strip()]
 
 # ZIP safety
 MAX_ZIP_BYTES = env_int("MAX_ZIP_BYTES", default=25 * 1024 * 1024)
@@ -158,12 +174,18 @@ MAX_ZIP_NESTING = env_int("MAX_ZIP_NESTING", default=2)
 OK_COMPRAS_PATTERNS = [
     x.strip() for x in env_first(
         "OK_COMPRAS_PATTERNS",
-        default="ok compras,aprobado compras,aprobada compras,visto bueno compras,vb compras,vobo compras,aprobacion compras,aprobación compras",
+        default=(
+            "ok compras,aprobado compras,aprobada compras,visto bueno compras,vb compras,vobo compras,"
+            "aprobacion compras,aprobación compras,aprobacion de compras,aprobación de compras,"
+            "visto bueno para radicacion,visto bueno para radicación,aprobado para radicar,"
+            "autorizado para radicar,cuenta con visto bueno,recibida a satisfaccion,recibida a satisfacción"
+        ),
     ).split(",") if x.strip()
 ]
 
 ORDER_REGEXES = [
     re.compile(r"\borden\s+de\s+compra\b", re.IGNORECASE),
+    re.compile(r"\borden\s+n(?:o|ro|umero|úmero)?\.?\s*[a-z0-9\-.]+", re.IGNORECASE),
     re.compile(r"\borden\b", re.IGNORECASE),
     re.compile(r"\boc\b\s*[:#\-]?\s*[a-z0-9\-.]+", re.IGNORECASE),
     re.compile(r"\bop\b\s*[:#\-]?\s*[a-z0-9\-.]+", re.IGNORECASE),
@@ -183,6 +205,13 @@ class ClientRecord:
     normalized_nit: Optional[str] = None
     active: bool = True
     raw_row: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ClientMatchResult:
+    record: Optional[ClientRecord] = None
+    raw: Optional[str] = None
+    source: str = ""
 
 
 @dataclass
@@ -326,20 +355,28 @@ def today_yyyymmdd() -> str:
 # ============================================================
 # STATE
 # ============================================================
-def load_state() -> Dict:
-    if not os.path.exists(STATE_FILE):
+def _state_file_for_account(account_id: Optional[str]) -> str:
+    if not account_id:
+        return STATE_FILE
+    return os.path.join(ACCOUNTS_DIR, account_id, "gmail_watch_state.json")
+
+
+def load_state(account_id: Optional[str] = None) -> Dict:
+    path = _state_file_for_account(account_id)
+    if not os.path.exists(path):
         return {}
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
             return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def save_state(state: Dict) -> None:
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+def save_state(state: Dict, account_id: Optional[str] = None) -> None:
+    path = _state_file_for_account(account_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
@@ -414,10 +451,17 @@ def get_or_create_radicado(message_id: str, state: Dict) -> str:
 # ============================================================
 # OAUTH / SERVICES
 # ============================================================
-def get_oauth_creds() -> Credentials:
+def get_oauth_creds(account_dir: Optional[str] = None) -> Credentials:
+    base = account_dir if account_dir else _BASE_DIR
+    token_path = os.path.join(base, "token.json")
+    # credentials.json: buscar en el directorio de la cuenta; si no existe, usar el del raíz (client secret compartido)
+    creds_path = os.path.join(base, "credentials.json")
+    if not os.path.exists(creds_path):
+        creds_path = os.path.join(_BASE_DIR, "credentials.json")
+
     creds = None
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -425,16 +469,17 @@ def get_oauth_creds() -> Credentials:
                 creds.refresh(Request())
             except RefreshError:
                 try:
-                    os.remove("token.json")
+                    os.remove(token_path)
                 except FileNotFoundError:
                     pass
                 creds = None
 
         if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        with open("token.json", "w", encoding="utf-8") as token:
+        os.makedirs(base, exist_ok=True)
+        with open(token_path, "w", encoding="utf-8") as token:
             token.write(creds.to_json())
 
     return creds
@@ -469,26 +514,25 @@ def _resolve_column_indexes(headers: List[str]) -> Dict[str, Optional[int]]:
     return resolved
 
 
-def load_client_catalog(sheets_service) -> List[ClientRecord]:
-    if not SHEET_ID:
-        print("⚠️ CLIENT_SHEET_ID vacío. Se seguirá sin catálogo/lista blanca.")
-        return []
+def _looks_like_header_row(row: List[str]) -> bool:
+    aliases = _header_aliases()
+    header_tokens = {normalize_text(option) for options in aliases.values() for option in options}
+    normalized = [normalize_text(cell) for cell in row]
+    return any(cell in header_tokens for cell in normalized)
 
-    result = sheets_service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=SHEET_RANGE,
-    ).execute()
 
-    values = result.get("values", []) or []
+def _client_records_from_values(values: List[List[str]], sheet_range: str) -> List[ClientRecord]:
     if not values:
-        print("⚠️ La hoja no tiene datos.")
         return []
 
-    headers = [str(x).strip() for x in values[0]]
+    first_row = [str(x).strip() for x in values[0]]
+    has_header = _looks_like_header_row(first_row)
+    headers = first_row if has_header else ["cliente", "nit", "estado"]
     indexes = _resolve_column_indexes(headers)
+    data_rows = values[1:] if has_header else values
 
     catalog: List[ClientRecord] = []
-    for row in values[1:]:
+    for row in data_rows:
         if not row:
             continue
 
@@ -516,11 +560,60 @@ def load_client_catalog(sheets_service) -> List[ClientRecord]:
             nit=nit or None,
             normalized_nit=normalize_nit(nit) or None,
             active=active,
-            raw_row={headers[i] if i < len(headers) else str(i): str(v) for i, v in enumerate(row)},
+            raw_row={
+                **{headers[i] if i < len(headers) else str(i): str(v) for i, v in enumerate(row)},
+                "__range": sheet_range,
+            },
         )
         catalog.append(record)
 
-    print(f"✅ Catálogo/lista blanca cargado: {len(catalog)} registros")
+    print(
+        f"📄 Catálogo rango {sheet_range}: {len(catalog)} registros | "
+        f"encabezado={'sí' if has_header else 'no'} | "
+        f"muestra={[record.name for record in catalog[:2]]}"
+    )
+    return catalog
+
+
+def _load_client_catalog_range(sheets_service, sheet_range: str) -> List[ClientRecord]:
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=sheet_range,
+    ).execute()
+    values = result.get("values", []) or []
+    if not values:
+        print(f"⚠️ La hoja/rango no tiene datos: {sheet_range}")
+        return []
+
+    return _client_records_from_values(values, sheet_range)
+
+
+def load_client_catalog(sheets_service) -> List[ClientRecord]:
+    if not SHEET_ID:
+        print("⚠️ CLIENT_SHEET_ID vacío. Se seguirá sin catálogo/lista blanca.")
+        return []
+
+    ranges = []
+    for sheet_range in [SHEET_RANGE, CLIENT_LOOKUP_RANGE]:
+        if sheet_range and sheet_range not in ranges:
+            ranges.append(sheet_range)
+
+    catalog: List[ClientRecord] = []
+    seen = set()
+    for sheet_range in ranges:
+        try:
+            records = _load_client_catalog_range(sheets_service, sheet_range)
+        except Exception as e:
+            print(f"⚠️ No pude cargar catálogo desde {sheet_range}: {e}")
+            continue
+        for record in records:
+            key = (record.normalized_name, record.normalized_nit or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            catalog.append(record)
+
+    print(f"✅ Catálogo/lista blanca cargado: {len(catalog)} registros desde {', '.join(ranges)}")
     return catalog
 
 
@@ -561,6 +654,170 @@ def find_client_by_nit_in_text(text: str, catalog: List[ClientRecord]) -> Option
     return best[1], best[2]
 
 
+def find_client_by_name_in_text(text: str, catalog: List[ClientRecord]) -> Optional[ClientRecord]:
+    if not text or not catalog:
+        return None
+
+    return find_client_in_text(text, catalog)
+
+
+def client_lookup_catalog(catalog: List[ClientRecord]) -> List[ClientRecord]:
+    clients = [
+        record for record in catalog
+        if "clientes" in normalize_text(record.raw_row.get("__range", ""))
+    ]
+    return clients or catalog
+
+
+CLIENT_MATCH_STOPWORDS = {
+    "de", "del", "la", "las", "los", "el", "y", "sa", "sas", "s", "a", "esp", "e", "s", "p", "cia", "ltda", "inc",
+}
+
+
+def client_name_tokens(value: str) -> Set[str]:
+    normalized = normalize_text(value)
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    return {token for token in tokens if len(token) >= 3 and token not in CLIENT_MATCH_STOPWORDS}
+
+
+def client_similarity(candidate: str, record: ClientRecord) -> int:
+    candidate_norm = normalize_alnum(candidate)
+    record_norm = record.normalized_name
+    if not candidate_norm or not record_norm:
+        return 0
+
+    if candidate_norm == record_norm:
+        return 1000 + len(record_norm)
+    if record_norm in candidate_norm or candidate_norm in record_norm:
+        return 700 + min(len(candidate_norm), len(record_norm))
+
+    candidate_tokens = client_name_tokens(candidate)
+    record_tokens = client_name_tokens(record.name)
+    if not candidate_tokens or not record_tokens:
+        return 0
+
+    common = candidate_tokens & record_tokens
+    if not common:
+        return 0
+
+    coverage_candidate = len(common) / len(candidate_tokens)
+    coverage_record = len(common) / len(record_tokens)
+
+    if coverage_candidate >= 0.80 or (len(common) >= 2 and coverage_candidate >= 0.60 and coverage_record >= 0.40):
+        return int((coverage_candidate + coverage_record) * 100) + sum(len(token) for token in common)
+
+    return 0
+
+
+def normalize_client_match_value(value: str) -> str:
+    return normalize_alnum(value)
+
+
+def match_client_raw_to_catalog(raw_client: str, catalog: List[ClientRecord]) -> Optional[ClientRecord]:
+    raw_norm = normalize_client_match_value(raw_client)
+    if not raw_norm:
+        return None
+
+    best: Optional[Tuple[int, ClientRecord]] = None
+    for record in catalog:
+        if not record.active:
+            continue
+        client_norm = normalize_client_match_value(record.name)
+        if not client_norm or len(client_norm) < 4:
+            continue
+
+        score = 0
+        if client_norm == raw_norm:
+            score = 1000 + len(client_norm)
+        elif client_norm in raw_norm:
+            score = 800 + len(client_norm)
+        elif raw_norm in client_norm:
+            score = 650 + len(raw_norm)
+
+        if score and (best is None or score > best[0]):
+            best = (score, record)
+
+    return best[1] if best else None
+
+
+def find_client_in_text(text: str, catalog: List[ClientRecord]) -> Optional[ClientRecord]:
+    text_norm = normalize_client_match_value(text)
+    if not text_norm:
+        return None
+
+    best: Optional[Tuple[int, ClientRecord]] = None
+    for record in catalog:
+        if not record.active:
+            continue
+        client_norm = normalize_client_match_value(record.name)
+        if not client_norm or len(client_norm) < 4:
+            continue
+        if client_norm in text_norm:
+            score = len(client_norm)
+            if best is None or score > best[0]:
+                best = (score, record)
+
+    return best[1] if best else None
+
+
+def _clean_order_client_value(value: str) -> str:
+    value = re.sub(r"\s+", " ", value or "").strip(" :-")
+    value = re.split(
+        r"\b(producto|nit|no\s*ppto|fecha|orden|medio|contacto|mail|cel|ciudad|razon\s+social|razón\s+social|proveedor|documento)\b\s*:?",
+        value,
+        flags=re.IGNORECASE,
+    )[0].strip(" :-")
+    return value
+
+
+def _is_useful_order_client_value(value: str) -> bool:
+    normalized = normalize_text(value)
+    alnum = normalize_alnum(value)
+    if len(alnum) < 4:
+        return False
+    if normalized in {"cliente", "nombre del cliente"}:
+        return False
+    if normalize_nit(value) == value:
+        return False
+    return True
+
+
+def extract_order_client_raw(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    for idx, line in enumerate(lines):
+        match = re.search(r"\bcliente\b\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+        if match:
+            value = _clean_order_client_value(match.group(1))
+            if _is_useful_order_client_value(value):
+                return value
+
+        if re.fullmatch(r"cliente\s*[:\-]?", line, re.IGNORECASE):
+            for next_line in lines[idx + 1 : idx + 8]:
+                value = _clean_order_client_value(next_line)
+                normalized = normalize_alnum(value)
+                if any(token in normalized for token in ("producto", "nit", "fecha", "noppto", "orden")):
+                    continue
+                if _is_useful_order_client_value(value):
+                    return value
+
+    for idx, line in enumerate(lines):
+        if "noclienteproductonit" not in normalize_alnum(line):
+            continue
+        for next_line in lines[idx + 1 : idx + 8]:
+            value = _clean_order_client_value(next_line)
+            normalized = normalize_alnum(value)
+            if any(token in normalized for token in ("nopptofecha", "cliente", "producto", "nit", "fecha")):
+                continue
+            if _is_useful_order_client_value(value):
+                return value
+
+    return None
+
+
 def identify_client(candidate_texts: List[str], catalog: List[ClientRecord]) -> Optional[ClientRecord]:
     if not catalog:
         return None
@@ -574,15 +831,89 @@ def identify_client(candidate_texts: List[str], catalog: List[ClientRecord]) -> 
     for record in catalog:
         if not record.active:
             continue
+        score = 0
         token = record.normalized_name
-        if not token or len(token) < 4:
-            continue
-        if token in haystack_norm:
-            score = len(token)
-            if best is None or score > best[0]:
-                best = (score, record)
+        if token and len(token) >= 4 and token in haystack_norm:
+            score = 600 + len(token)
+        else:
+            score = client_similarity(haystack, record)
+        if score and (best is None or score > best[0]):
+            best = (score, record)
 
     return best[1] if best else None
+
+
+def extract_client_field_values(text: str) -> List[str]:
+    if not text:
+        return []
+
+    values = []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    stop_fields = r"(producto|nit|no\s*ppto|fecha|orden|medio|contacto|mail|cel|ciudad|razon\s+social|razón\s+social|proveedor|documento)"
+
+    # PDFs de órdenes pueden extraer la tabla como:
+    # No: CLIENTE: PRODUCTO: NIT:
+    # 33071
+    # TGI TRANSPORTADORA DE GAS
+    # CONTRATO 551008471 2026
+    # 900134459
+    for idx, line in enumerate(lines):
+        normalized_line = normalize_alnum(line)
+        if "noclienteproductonit" not in normalized_line:
+            continue
+        for next_line in lines[idx + 1 : idx + 6]:
+            candidate = re.sub(r"\s+", " ", next_line).strip(" :-")
+            normalized_candidate = normalize_alnum(candidate)
+            if not candidate or normalize_nit(candidate) == candidate:
+                continue
+            if any(token in normalized_candidate for token in ("nopptofecha", "cliente", "producto", "nit", "fecha")):
+                continue
+            if len(normalize_alnum(candidate)) >= 6:
+                values.append(candidate)
+                break
+
+    for idx, line in enumerate(lines):
+        value = ""
+        match = re.search(r"\bcliente\b\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+        if match:
+            value = match.group(1).strip()
+
+        # Algunos extractores de PDF dejan "CLIENTE:" en una línea y el valor en una línea posterior.
+        if not value and re.fullmatch(r"cliente\s*[:\-]?", line, re.IGNORECASE) and idx + 1 < len(lines):
+            for next_line in lines[idx + 1 : idx + 6]:
+                candidate = re.sub(r"\s+", " ", next_line).strip(" :-")
+                normalized_candidate = normalize_alnum(candidate)
+                if not candidate or normalize_nit(candidate) == candidate:
+                    continue
+                if any(token in normalized_candidate for token in ("producto", "nit", "fecha", "noppto", "orden")):
+                    continue
+                value = candidate
+                break
+
+        value = re.split(rf"\b{stop_fields}\b\s*:?", value, flags=re.IGNORECASE)[0].strip()
+        value = re.sub(r"\s+", " ", value).strip(" :-")
+        normalized_value = normalize_text(value)
+        alnum_value = normalize_alnum(value)
+        if len(alnum_value) >= 6 and normalized_value not in {"cliente", "nombre del cliente"}:
+            values.append(value)
+
+    return values
+
+
+def identify_client_from_fields(candidate_texts: List[str], catalog: List[ClientRecord]) -> Optional[ClientRecord]:
+    field_values: List[str] = []
+    for text in candidate_texts:
+        field_values.extend(extract_client_field_values(text))
+
+    return identify_client(field_values, catalog) if field_values else None
+
+
+def first_client_field_value(candidate_texts: List[str]) -> Optional[str]:
+    for text in candidate_texts:
+        values = extract_client_field_values(text)
+        if values:
+            return values[0]
+    return None
 
 
 # ============================================================
@@ -635,11 +966,11 @@ def apply_single_status_label(gmail_service, message_id: str, label_name: str, a
 # ============================================================
 # GMAIL WATCH / HISTORY
 # ============================================================
-def ensure_gmail_watch(gmail_service) -> Dict:
+def ensure_gmail_watch(gmail_service, account_id: Optional[str] = None) -> Dict:
     if not GCP_PROJECT_ID or not PUBSUB_TOPIC_FULL or not PUBSUB_SUBSCRIPTION_ID:
         raise RuntimeError("Faltan env vars: GCP_PROJECT_ID, PUBSUB_TOPIC_FULL, PUBSUB_SUBSCRIPTION.")
 
-    state = load_state()
+    state = load_state(account_id)
     now_ms = int(time.time() * 1000)
     expiration = int(state.get("watch_expiration_ms", 0))
 
@@ -661,8 +992,9 @@ def ensure_gmail_watch(gmail_service) -> Dict:
             "last_history_id": str(last_history) if last_history else None,
         }
     )
-    save_state(state)
-    print(f"✅ Watch activo. last_history_id={state.get('last_history_id')}")
+    save_state(state, account_id)
+    label = f" ({account_id})" if account_id else ""
+    print(f"✅ Watch activo{label}. last_history_id={state.get('last_history_id')}")
     return state
 
 
@@ -695,12 +1027,12 @@ def fetch_new_message_ids(gmail_service, start_history_id: str) -> Tuple[Set[str
     return message_ids, latest_history_id
 
 
-def update_last_history_id(latest_history_id: Optional[str]) -> None:
+def update_last_history_id(latest_history_id: Optional[str], account_id: Optional[str] = None) -> None:
     if not latest_history_id:
         return
-    state = load_state()
+    state = load_state(account_id)
     state["last_history_id"] = str(latest_history_id)
-    save_state(state)
+    save_state(state, account_id)
 
 
 # ============================================================
@@ -760,6 +1092,14 @@ def _is_safe_zip_member(name: str) -> bool:
     return True
 
 
+def _is_ignored_zip_member(name: str) -> bool:
+    normalized = (name or "").replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    if not parts:
+        return True
+    return "__MACOSX" in parts or any(part.startswith("._") for part in parts) or parts[-1] == ".DS_Store"
+
+
 def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes, depth: int = 1) -> Dict[str, object]:
     out = {
         "zip_filename": zip_filename,
@@ -798,6 +1138,8 @@ def analyze_zip_bytes(zip_filename: str, zip_bytes: bytes, depth: int = 1) -> Di
 
             for info in infos:
                 if info.is_dir():
+                    continue
+                if _is_ignored_zip_member(info.filename):
                     continue
                 if info.flag_bits & 0x1:
                     out["ok"] = False
@@ -894,6 +1236,8 @@ def extract_zip_files(zip_filename: str, zip_bytes: bytes) -> Dict[str, object]:
             for file_info in ensure_list(node.get("files")):
                 name = (file_info.get("name") or "").strip()
                 if not name or not _is_safe_zip_member(name):
+                    continue
+                if _is_ignored_zip_member(name):
                     continue
                 raw = zf.read(name)
                 normalized = name.replace("\\", "/")
@@ -1033,6 +1377,57 @@ def detect_order(pdfs: List[UnifiedFile]) -> bool:
     return False
 
 
+def is_order_file(file_obj: UnifiedFile) -> bool:
+    if classify_document_type(file_obj) == "orden_compra":
+        return True
+    sample = f"{file_obj.name}\n{file_obj.extracted_text}"
+    return any(pattern.search(sample) for pattern in ORDER_REGEXES)
+
+
+def identify_client_in_order_pdfs(pdfs: List[UnifiedFile], catalog: List[ClientRecord]) -> ClientMatchResult:
+    order_files = []
+    for pdf in pdfs:
+        if is_order_file(pdf):
+            order_files.append(pdf)
+
+    logger.info(f"🔎 Clientes en orden: catálogo={len(catalog)} | ordenes_detectadas={len(order_files)}")
+    if not order_files:
+        logger.info("🔎 Clientes en orden: no se detectó PDF de orden de compra.")
+        return ClientMatchResult(source="ORDER_BLOCK")
+
+    for pdf in order_files:
+        order_text = f"{pdf.name}\n{pdf.extracted_text}"
+        logger.info(f"🔎 Orden evaluada: {pdf.name}")
+
+        raw_client = extract_order_client_raw(order_text)
+        logger.info(f"🔎 Cliente crudo extraído desde orden: {raw_client or 'No encontrado'}")
+        if not raw_client:
+            continue
+
+        record = match_client_raw_to_catalog(raw_client, catalog)
+        if record:
+            logger.info(f"✅ Cliente final del catálogo: {record.name} | fuente=ORDER_BLOCK | archivo={pdf.name}")
+            return ClientMatchResult(record=record, raw=raw_client, source="ORDER_BLOCK")
+
+        record = find_client_in_text(order_text, catalog)
+        if record:
+            logger.info(f"✅ Cliente encontrado dentro de orden: {record.name} | fuente=ORDER_BLOCK | archivo={pdf.name}")
+            return ClientMatchResult(record=record, raw=raw_client, source="ORDER_BLOCK")
+
+        logger.info(f"⚠️ Cliente crudo sin match en catálogo: {raw_client} | archivo={pdf.name}")
+        return ClientMatchResult(raw=raw_client, source="ORDER_BLOCK")
+
+    for pdf in order_files:
+        order_text = f"{pdf.name}\n{pdf.extracted_text}"
+        record = find_client_in_text(order_text, catalog)
+        if record:
+            logger.info(f"✅ Cliente encontrado dentro de orden: {record.name} | fuente=ORDER_BLOCK | archivo={pdf.name}")
+            return ClientMatchResult(record=record, source="ORDER_BLOCK")
+
+    logger.info("⚠️ No se encontró ningún cliente estructurado en la orden.")
+    return ClientMatchResult(source="ORDER_BLOCK")
+
+
 def detect_ok_compras(pdfs: List[UnifiedFile]) -> bool:
     normalized_patterns = [normalize_alnum(x) for x in OK_COMPRAS_PATTERNS if x.strip()]
     for pdf in pdfs:
@@ -1122,6 +1517,15 @@ DOCUMENT_CLASSIFIERS = {
         "min_support": 1,
         "allow_images": False,
     },
+}
+
+DOCUMENT_LABELS = {
+    "cuenta_cobro": "cuenta de cobro",
+    "cedula": "cédula",
+    "rut": "RUT",
+    "certificado_bancario": "certificado bancario",
+    "orden_compra": "orden de compra",
+    "aprobado_compras": "aprobado de compras",
 }
 
 
@@ -1244,12 +1648,28 @@ def classify_invoice_type(xml_count: int) -> str:
     return "FACTURA ELECTRONICA" if xml_count >= 1 else "CUENTA DE COBRO"
 
 
+def validate_electronic_invoice_minimum(pdf_count: int, xml_count: int) -> List[str]:
+    errors = []
+    if pdf_count < MIN_PDF_FE:
+        errors.append(
+            "Factura electrónica: archivos incompletos, revisa tus documentos y que estén completos."
+        )
+    if xml_count < MIN_XML_FE:
+        missing_xml = MIN_XML_FE - xml_count
+        errors.append(
+            f"Factura electrónica: falta {missing_xml} XML para completar el mínimo requerido de {MIN_XML_FE}."
+        )
+    return errors
+
+
 def validate_pdf_minimum(invoice_type: str, pdf_count: int) -> Optional[str]:
-    if invoice_type == "FACTURA ELECTRONICA" and pdf_count < MIN_PDF_FE:
-        return f"Factura electrónica incompleta: requiere mínimo {MIN_PDF_FE} PDF y llegaron {pdf_count}."
     if invoice_type == "CUENTA DE COBRO" and pdf_count < MIN_PDF_CC:
-        return f"Cuenta de cobro incompleta: requiere mínimo {MIN_PDF_CC} PDF y llegaron {pdf_count}."
+        return "Cuenta de cobro: archivos incompletos, revisa tus documentos y que estén completos."
     return None
+
+
+def format_missing_documents(doc_types: List[str]) -> List[str]:
+    return [DOCUMENT_LABELS.get(doc_type, str(doc_type).replace("_", " ")) for doc_type in doc_types]
 
 
 # ============================================================
@@ -1263,9 +1683,8 @@ def build_rejected_email(radicado: str, invoice_type: str, reasons: List[str], c
         f"ID interno: {radicado}\n"
         f"Cliente identificado: {client_name or 'No identificado'}\n"
         f"Clasificación detectada: {invoice_type}\n\n"
-        "Motivos del rechazo:\n"
-        + "".join(f"- {reason}\n" for reason in reasons)
-        + "\nCorrige y reenvía el correo con los soportes completos.\n\n"
+        "Se identificaron archivos incompletos. "
+        "Agradecemos revisar y confirmar que la documentación esté completa antes de realizar el envío.\n\n"
         "Gracias,\n"
         "Equipo de Facturación\n"
     )
@@ -1321,24 +1740,24 @@ def safe_get_message_full(gmail_service, message_id: str) -> Optional[Dict]:
         raise
 
 
-def process_message(gmail_service, message_id: str, catalog: List[ClientRecord]) -> None:
-    state = load_state()
+def process_message(gmail_service, sheets_service, message_id: str, catalog: List[ClientRecord], account_id: Optional[str] = None) -> None:
+    state = load_state(account_id)
 
     if state_has_replied(state, message_id):
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
         return
 
     if message_id in state_get_processed_set(state):
         return
 
     radicado = get_or_create_radicado(message_id, state)
-    save_state(state)
+    save_state(state, account_id)
 
     msg = safe_get_message_full(gmail_service, message_id)
     if not msg:
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
         return
 
     payload = msg.get("payload", {}) or {}
@@ -1351,18 +1770,24 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
     if not sender_email:
         print(f"⚠️ No pude extraer email del remitente. From: {from_header}")
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
         return
 
     attachments = collect_attachments(payload)
     if ONLY_WITH_ATTACHMENTS and not attachments:
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
         return
 
     combined_email_text = f"{subject}\n{body_text}\n{snippet}"
 
-    # 1) Ruta administrativa por NIT en lista blanca
+    # 1) Descargar adjuntos y abrir ZIP/ZIP anidados desde el inicio.
+    unified_files, zip_errors, zip_analyses = build_unified_files(gmail_service, message_id, attachments)
+    pdfs = [f for f in unified_files if f.is_pdf]
+    xmls = [f for f in unified_files if f.is_xml]
+    images = [f for f in unified_files if f.is_image]
+
+    # 2) Ruta administrativa por NIT o nombre en lista blanca
     nit = extract_nit_from_text(combined_email_text)
     matched_nit_client = find_client_by_nit(nit, catalog) if nit else None
     if not matched_nit_client:
@@ -1373,29 +1798,31 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
         apply_single_status_label(gmail_service, message_id, LABEL_ADMIN_NAME, archive=ARCHIVE_ADMIN)
         print(f"🟦 ADMINISTRATIVA | {radicado} | NIT={nit} | cliente={matched_nit_client.name}")
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
         return
 
-    # 2) Nota de crédito: texto del correo
+    matched_name_client = find_client_by_name_in_text(combined_email_text, catalog)
+    if matched_name_client:
+        apply_single_status_label(gmail_service, message_id, LABEL_ADMIN_NAME, archive=ARCHIVE_ADMIN)
+        print(f"🟦 ADMINISTRATIVA | {radicado} | nombre={matched_name_client.name}")
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
+    # 3) Nota de crédito: texto del correo
     if contains_note_credit_text(combined_email_text):
         apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
         print(f"🟪 NOTA DE CREDITO por correo | {radicado}")
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
         return
-
-    # 3) Unificar PDF/XML desde adjuntos directos + ZIP
-    unified_files, zip_errors, zip_analyses = build_unified_files(gmail_service, message_id, attachments)
-    pdfs = [f for f in unified_files if f.is_pdf]
-    xmls = [f for f in unified_files if f.is_xml]
-    images = [f for f in unified_files if f.is_image]
 
     # 4) Si no hay al menos 1 PDF -> revisión manual
     if len(pdfs) < 1:
         apply_single_status_label(gmail_service, message_id, LABEL_REVIEW_NAME, archive=ARCHIVE_REVIEW)
         print(f"🟨 REVISION MANUAL | {radicado} | sin PDF unificado | ZIP errors={zip_errors}")
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
         return
 
     # 5) Nota de crédito: nombre del PDF
@@ -1403,7 +1830,7 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
         apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
         print(f"🟪 NOTA DE CREDITO por nombre | {radicado}")
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
         return
 
     # 6) Nota de crédito: texto del PDF
@@ -1411,7 +1838,7 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
         apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
         print(f"🟪 NOTA DE CREDITO por texto | {radicado}")
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
         return
 
     invoice_type = classify_invoice_type(len(xmls))
@@ -1427,9 +1854,7 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
             reasons.append("Cuenta de cobro incompleta. Faltan: " + ", ".join(str(x) for x in faltantes) + ".")
         print("📦 Validación cuenta de cobro:", json.dumps(cuenta_cobro_validation, ensure_ascii=False))
     else:
-        minimum_error = validate_pdf_minimum(invoice_type, len(pdfs))
-        if minimum_error:
-            reasons.append(minimum_error)
+        reasons.extend(validate_electronic_invoice_minimum(len(pdfs), len(xmls)))
 
     if zip_errors:
         reasons.extend(zip_errors)
@@ -1440,10 +1865,24 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
     if invoice_type != "CUENTA DE COBRO" and not has_order:
         reasons.append("No se detectó orden de compra en nombre ni texto de los PDF.")
 
-    client_match = identify_client(
-        candidate_texts=[subject, body_text, snippet] + [f.name for f in pdfs] + [f.extracted_text for f in pdfs],
-        catalog=catalog,
-    )
+    client_catalog_only = client_lookup_catalog(catalog)
+    client_candidate_texts = [subject, body_text, snippet] + [f.name for f in pdfs] + [f.extracted_text for f in pdfs]
+    order_client_result = identify_client_in_order_pdfs(pdfs, client_catalog_only) if invoice_type != "CUENTA DE COBRO" else ClientMatchResult()
+    if order_client_result.record:
+        client_match = order_client_result.record
+        logger.info("✅ Fuente final cliente: ORDER_BLOCK")
+    elif order_client_result.raw:
+        client_match = None
+        logger.info("⚠️ Fuente final cliente: ORDER_BLOCK sin match de catálogo")
+    elif invoice_type != "CUENTA DE COBRO" and has_order:
+        client_match = None
+        logger.info("⚠️ Fuente final cliente: ORDER_BLOCK sin cliente detectado")
+    else:
+        client_match = identify_client_from_fields(client_candidate_texts, client_catalog_only) or identify_client(
+            candidate_texts=client_candidate_texts,
+            catalog=client_catalog_only,
+        )
+        logger.info(f"🔎 Fuente final cliente: {'FALLBACK' if client_match else 'SIN_CLIENTE'}")
     if invoice_type != "CUENTA DE COBRO" and not client_match:
         reasons.append("No se logró identificar el cliente con el contenido del correo o los PDF.")
 
@@ -1464,7 +1903,7 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
         print(f"✅ Respuesta de rechazo enviada | {radicado}")
         state_mark_replied(state, message_id)
         state_add_processed(state, message_id)
-        save_state(state)
+        save_state(state, account_id)
 
         print("\n" + "=" * 80)
         print(f"🟥 RECHAZADO | {radicado}")
@@ -1491,7 +1930,7 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
     print(f"✅ Respuesta de aprobación enviada | {radicado}")
     state_mark_replied(state, message_id)
     state_add_processed(state, message_id)
-    save_state(state)
+    save_state(state, account_id)
 
     print("\n" + "=" * 80)
     print(f"🟩 APROBADO | {radicado}")
@@ -1509,25 +1948,31 @@ def process_message(gmail_service, message_id: str, catalog: List[ClientRecord])
 # ============================================================
 # PUBSUB LOOP
 # ============================================================
-def listen_pubsub(gmail_service, sheets_service, client_catalog: List[ClientRecord]) -> None:
+def listen_pubsub(accounts: Dict[str, Dict]) -> None:
+    """
+    accounts: dict con clave = email en minúsculas, valor = {
+        "gmail_service", "sheets_service", "catalog_data", "account_id"
+    }
+    """
     subscriber = pubsub_v1.SubscriberClient(transport="rest")
     subscription_path = f"projects/{GCP_PROJECT_ID}/subscriptions/{PUBSUB_SUBSCRIPTION_ID}"
+    account_list = ", ".join(accounts.keys()) or "(cuenta única)"
     print(f"👂 Escuchando Pub/Sub (PULL/REST): {subscription_path}")
+    print(f"   Cuentas activas: {account_list}")
 
-    catalog_data = client_catalog or []
     backoff = 1
 
-    def refresh_catalog() -> None:
-        nonlocal catalog_data
+    def refresh_catalog_for(acc: Dict) -> None:
         try:
-            catalog_data = load_client_catalog(sheets_service)
-            print(f"🔄 Catálogo actualizado: {len(catalog_data)} registros")
+            acc["catalog_data"] = load_client_catalog(acc["sheets_service"])
+            print(f"🔄 Catálogo actualizado ({acc['account_id'] or 'cuenta única'}): {len(acc['catalog_data'])} registros")
         except Exception as e:
             print(f"⚠️ No pude refrescar el catálogo: {e}")
 
     while True:
         try:
-            ensure_gmail_watch(gmail_service)
+            for acc in accounts.values():
+                ensure_gmail_watch(acc["gmail_service"], account_id=acc["account_id"])
 
             response = subscriber.pull(
                 request={
@@ -1559,39 +2004,48 @@ def listen_pubsub(gmail_service, sheets_service, client_catalog: List[ClientReco
                     raw = rm.message.data.decode("utf-8")
                     event_payload = json.loads(raw)
                     history_id = str(event_payload.get("historyId", "")).strip()
-                    email_address = event_payload.get("emailAddress", "")
+                    email_address = (event_payload.get("emailAddress", "") or "").lower()
 
                     if not history_id:
                         print("⚠️ Evento sin historyId. Lo ignoro.")
                         continue
 
-                    state = load_state()
+                    acc = accounts.get(email_address)
+                    if acc is None:
+                        print(f"⚠️ Evento para cuenta no configurada: {email_address}. Ignorando.")
+                        continue
+
+                    account_id = acc["account_id"]
+                    acc_gmail = acc["gmail_service"]
+                    acc_sheets = acc["sheets_service"]
+
+                    state = load_state(account_id)
                     last_history = str(state.get("last_history_id") or "").strip()
 
                     if not last_history:
-                        update_last_history_id(history_id)
-                        print(f"🔧 Inicialicé last_history_id={history_id} (primer evento)")
+                        update_last_history_id(history_id, account_id)
+                        print(f"🔧 Inicialicé last_history_id={history_id} ({email_address})")
                         continue
 
                     try:
-                        new_ids, latest_history = fetch_new_message_ids(gmail_service, last_history)
+                        new_ids, latest_history = fetch_new_message_ids(acc_gmail, last_history)
                     except HttpError as he:
                         if getattr(he, "resp", None) is not None and he.resp.status in (400, 404):
-                            update_last_history_id(history_id)
-                            print(f"⚠️ HistoryId viejo/inválido. Reseteado a {history_id}")
+                            update_last_history_id(history_id, account_id)
+                            print(f"⚠️ HistoryId viejo/inválido. Reseteado a {history_id} ({email_address})")
                             continue
                         raise
 
                     if latest_history:
-                        update_last_history_id(latest_history)
+                        update_last_history_id(latest_history, account_id)
 
                     if not new_ids:
                         print(f"🔔 Evento ({email_address}) historyId={history_id} sin mensajes nuevos")
                     else:
                         print(f"🔔 Evento ({email_address}) historyId={history_id} -> {len(new_ids)} mensaje(s)")
-                        refresh_catalog()
+                        refresh_catalog_for(acc)
                         for mid in new_ids:
-                            process_message(gmail_service, mid, catalog_data)
+                            process_message(acc_gmail, acc_sheets, mid, acc["catalog_data"], account_id)
 
                 except Exception as e:
                     should_ack = False
@@ -1622,23 +2076,91 @@ def listen_pubsub(gmail_service, sheets_service, client_catalog: List[ClientReco
 
 
 # ============================================================
+# AUTHORIZE ACCOUNT
+# ============================================================
+def authorize_account(email: str) -> None:
+    account_dir = os.path.join(ACCOUNTS_DIR, email)
+    os.makedirs(account_dir, exist_ok=True)
+    print(f"🔐 Iniciando flujo OAuth para: {email}")
+    print(f"📁 Directorio: {account_dir}")
+    creds = get_oauth_creds(account_dir)
+    svc = build("gmail", "v1", credentials=creds)
+    profile = svc.users().getProfile(userId="me").execute()
+    actual_email = profile.get("emailAddress", "")
+    if actual_email.lower() != email.lower():
+        print(f"⚠️  ADVERTENCIA: autenticaste como {actual_email}, no como {email}.")
+        print("   El token se guardó de todas formas. Usa el email real al configurar GMAIL_ACCOUNTS.")
+    else:
+        print(f"✅ Cuenta autorizada correctamente: {actual_email}")
+    print()
+    print("Para añadir esta cuenta al sistema, edita el archivo .env:")
+    print(f"  GMAIL_ACCOUNTS=...,{email}")
+    print("  ACCOUNTS_DIR=accounts")
+    print("Luego reinicia el proceso.")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Sistema de facturación BTL")
+    parser.add_argument(
+        "--authorize-account",
+        metavar="EMAIL",
+        help="Autoriza una cuenta Gmail nueva via OAuth interactivo y genera su token.json",
+    )
+    args = parser.parse_args()
+
+    if args.authorize_account:
+        authorize_account(args.authorize_account)
+        return
+
     if not GCP_PROJECT_ID or not PUBSUB_SUBSCRIPTION_ID or not PUBSUB_TOPIC_FULL:
         raise RuntimeError("Faltan env vars: GCP_PROJECT_ID, PUBSUB_SUBSCRIPTION, PUBSUB_TOPIC_FULL.")
 
-    creds = get_oauth_creds()
-    gmail_service = build("gmail", "v1", credentials=creds)
-    sheets_service = build("sheets", "v4", credentials=creds)
-
-    profile = gmail_service.users().getProfile(userId="me").execute()
-    print("✅ Autenticado como:", profile.get("emailAddress"))
-    print("🗂️ STATE_FILE:", STATE_FILE)
-
-    client_catalog = load_client_catalog(sheets_service)
-    ensure_gmail_watch(gmail_service)
-    listen_pubsub(gmail_service, sheets_service, client_catalog)
+    if GMAIL_ACCOUNTS:
+        # --- Modo multi-cuenta ---
+        accounts: Dict[str, Dict] = {}
+        for email in GMAIL_ACCOUNTS:
+            email_lc = email.lower()
+            account_dir = os.path.join(ACCOUNTS_DIR, email)
+            print(f"🔑 Cargando cuenta: {email}")
+            creds = get_oauth_creds(account_dir)
+            gmail_svc = build("gmail", "v1", credentials=creds)
+            sheets_svc = build("sheets", "v4", credentials=creds)
+            profile = gmail_svc.users().getProfile(userId="me").execute()
+            print(f"   ✅ Autenticado como: {profile.get('emailAddress')}")
+            print(f"   📁 State: {_state_file_for_account(email_lc)}")
+            catalog = load_client_catalog(sheets_svc)
+            ensure_gmail_watch(gmail_svc, account_id=email_lc)
+            accounts[email_lc] = {
+                "gmail_service": gmail_svc,
+                "sheets_service": sheets_svc,
+                "catalog_data": catalog,
+                "account_id": email_lc,
+            }
+        listen_pubsub(accounts)
+    else:
+        # --- Modo cuenta única (retrocompatibilidad) ---
+        creds = get_oauth_creds()
+        gmail_service = build("gmail", "v1", credentials=creds)
+        sheets_service = build("sheets", "v4", credentials=creds)
+        profile = gmail_service.users().getProfile(userId="me").execute()
+        email_lc = (profile.get("emailAddress") or "").lower()
+        print("✅ Autenticado como:", profile.get("emailAddress"))
+        print("🗂️ STATE_FILE:", STATE_FILE)
+        client_catalog = load_client_catalog(sheets_service)
+        ensure_gmail_watch(gmail_service)
+        accounts = {
+            email_lc: {
+                "gmail_service": gmail_service,
+                "sheets_service": sheets_service,
+                "catalog_data": client_catalog,
+                "account_id": None,
+            }
+        }
+        listen_pubsub(accounts)
 
 
 if __name__ == "__main__":
