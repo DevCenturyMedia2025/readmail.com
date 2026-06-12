@@ -10,6 +10,7 @@ Uso:
 import argparse
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unicodedata
@@ -30,6 +31,11 @@ try:
     import pytesseract
 except Exception:  # pragma: no cover
     pytesseract = None
+
+if pytesseract is not None and not shutil.which("tesseract"):
+    local_tesseract = Path.home() / "AppData" / "Local" / "Programs" / "Tesseract-OCR" / "tesseract.exe"
+    if local_tesseract.exists():
+        pytesseract.pytesseract.tesseract_cmd = str(local_tesseract)
 
 
 SUPPORTED_EXTS = {".pdf", ".jpg", ".jpeg", ".png"}

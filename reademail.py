@@ -943,10 +943,15 @@ def ensure_label_exists(gmail_service, label_name: str) -> Optional[str]:
     return created.get("id")
 
 
-def apply_single_status_label(gmail_service, message_id: str, label_name: str, archive: bool = False) -> None:
+def ensure_status_labels(gmail_service) -> Dict[str, Optional[str]]:
     label_ids = {}
     for name in [LABEL_ADMIN_NAME, LABEL_REVIEW_NAME, LABEL_NOTE_CREDIT_NAME, LABEL_APPROVED_NAME, LABEL_REJECTED_NAME]:
         label_ids[name] = ensure_label_exists(gmail_service, name)
+    return label_ids
+
+
+def apply_single_status_label(gmail_service, message_id: str, label_name: str, archive: bool = False) -> None:
+    label_ids = ensure_status_labels(gmail_service)
 
     add_ids = [label_ids[label_name]] if label_ids.get(label_name) else []
     remove_ids = [lid for name, lid in label_ids.items() if lid and name != label_name]
@@ -2133,6 +2138,8 @@ def main() -> None:
             print(f"   ✅ Autenticado como: {profile.get('emailAddress')}")
             print(f"   📁 State: {_state_file_for_account(email_lc)}")
             catalog = load_client_catalog(sheets_svc)
+            ensure_status_labels(gmail_svc)
+            print("   Etiquetas verificadas/creadas")
             ensure_gmail_watch(gmail_svc, account_id=email_lc)
             accounts[email_lc] = {
                 "gmail_service": gmail_svc,
@@ -2151,6 +2158,8 @@ def main() -> None:
         print("✅ Autenticado como:", profile.get("emailAddress"))
         print("🗂️ STATE_FILE:", STATE_FILE)
         client_catalog = load_client_catalog(sheets_service)
+        ensure_status_labels(gmail_service)
+        print("Etiquetas verificadas/creadas")
         ensure_gmail_watch(gmail_service)
         accounts = {
             email_lc: {

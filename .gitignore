@@ -1,15 +1,15 @@
-
 # Secrets
 credentials.json
 token.json
 .env
 
-# Secrets
-credentials.json
-token.json
-.env
-
-# Secrets
-credentials.json
-token.json
-.env
+# Local runtime/state
+.venv/
+.venv-*/
+.tmp/
+__pycache__/
+*.py[cod]
+.DS_Store
+gmail_watch_state.json
+accounts/
+logs/

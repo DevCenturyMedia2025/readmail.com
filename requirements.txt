@@ -1,0 +1,9 @@
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-cloud-pubsub
+pypdf
+python-dotenv
+PyMuPDF
+Pillow
+pytesseract

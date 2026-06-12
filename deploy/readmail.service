@@ -1,0 +1,19 @@
+[Unit]
+Description=Readmail Gmail invoice processor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admincentury
+Group=admincentury
+WorkingDirectory=/opt/readmail.com
+EnvironmentFile=/opt/readmail.com/.env
+ExecStart=/opt/readmail.com/.venv/bin/python /opt/readmail.com/reademail.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
