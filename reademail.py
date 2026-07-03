@@ -108,6 +108,7 @@ GCP_PROJECT_ID = env_first("GCP_PROJECT_ID")
 PUBSUB_SUBSCRIPTION_ID = env_first("PUBSUB_SUBSCRIPTION", "PUBSUB_SUBSCRIPTION_ID")
 PUBSUB_TOPIC_FULL = env_first("PUBSUB_TOPIC_FULL")
 WATCH_LABEL_IDS = [x.strip() for x in env_first("GMAIL_LABEL_IDS", default="INBOX").split(",") if x.strip()]
+GMAIL_SYSTEM_LABEL_IDS = {"INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED", "IMPORTANT", "UNREAD"}
 
 SHEET_ID = env_first("CLIENT_SHEET_ID")
 SHEET_RANGE = env_first("CLIENT_SHEET_RANGE", default="Clientes!A:Z")
@@ -336,6 +337,15 @@ def extract_plain_text(payload: Dict) -> str:
 def extract_sender_email(from_header: str) -> Optional[str]:
     _, email = parseaddr(from_header or "")
     return email or None
+
+
+_NO_REPLY_RE = re.compile(
+    r"(no.?reply|noreply|bounce|mailer-daemon|postmaster|notifications?@|donotreply|do-not-reply)",
+    re.IGNORECASE,
+)
+
+def is_no_reply_sender(email: str) -> bool:
+    return bool(_NO_REPLY_RE.search(email or ""))
 
 
 def create_raw_email(to_email: str, subject: str, body: str, extra_headers: Optional[Dict[str, str]] = None) -> str:
@@ -971,6 +981,26 @@ def apply_single_status_label(gmail_service, message_id: str, label_name: str, a
 # ============================================================
 # GMAIL WATCH / HISTORY
 # ============================================================
+def resolve_watch_label_ids(gmail_service, label_names: List[str]) -> List[str]:
+    """Convierte nombres de etiquetas a IDs. Las etiquetas del sistema (INBOX, etc.) se usan tal cual."""
+    if all(name.upper() in GMAIL_SYSTEM_LABEL_IDS for name in label_names):
+        return label_names
+    resp = gmail_service.users().labels().list(userId="me").execute()
+    label_map = {lb.get("name", "").lower(): lb.get("id") for lb in ensure_list(resp.get("labels"))}
+    resolved = []
+    for name in label_names:
+        if name.upper() in GMAIL_SYSTEM_LABEL_IDS:
+            resolved.append(name)
+        else:
+            lid = label_map.get(name.lower())
+            if lid:
+                resolved.append(lid)
+                print(f"🏷️ Etiqueta watch '{name}' → ID={lid}")
+            else:
+                print(f"⚠️ Etiqueta de watch no encontrada en Gmail: '{name}'. Se ignorará.")
+    return resolved
+
+
 def ensure_gmail_watch(gmail_service, account_id: Optional[str] = None) -> Dict:
     if not GCP_PROJECT_ID or not PUBSUB_TOPIC_FULL or not PUBSUB_SUBSCRIPTION_ID:
         raise RuntimeError("Faltan env vars: GCP_PROJECT_ID, PUBSUB_TOPIC_FULL, PUBSUB_SUBSCRIPTION.")
@@ -982,9 +1012,10 @@ def ensure_gmail_watch(gmail_service, account_id: Optional[str] = None) -> Dict:
     if expiration and (expiration - now_ms) > WATCH_RENEW_WINDOW_MS:
         return state
 
+    watch_label_ids = resolve_watch_label_ids(gmail_service, WATCH_LABEL_IDS)
     body = {
         "topicName": PUBSUB_TOPIC_FULL,
-        "labelIds": WATCH_LABEL_IDS,
+        "labelIds": watch_label_ids if watch_label_ids else ["INBOX"],
         "labelFilterBehavior": "INCLUDE",
     }
     resp = gmail_service.users().watch(userId="me", body=body).execute()
@@ -1682,14 +1713,16 @@ def format_missing_documents(doc_types: List[str]) -> List[str]:
 # ============================================================
 def build_rejected_email(radicado: str, invoice_type: str, reasons: List[str], client_name: Optional[str]) -> Tuple[str, str]:
     subject = f"RECHAZADO - facturacion no radicada (ID: {radicado})"
+    reasons_lines = "\n".join(f"  - {r}" for r in reasons) if reasons else "  - Documentación incompleta o no identificada."
     body = (
         "Hola,\n\n"
         "Recibimos tu correo, pero no fue posible radicarlo.\n\n"
         f"ID interno: {radicado}\n"
         f"Cliente identificado: {client_name or 'No identificado'}\n"
         f"Clasificación detectada: {invoice_type}\n\n"
-        "Se identificaron archivos incompletos. "
-        "Agradecemos revisar y confirmar que la documentación esté completa antes de realizar el envío.\n\n"
+        "Motivos del rechazo:\n"
+        f"{reasons_lines}\n\n"
+        "Por favor revisa que la documentación esté completa y vuelve a enviar.\n\n"
         "Gracias,\n"
         "Equipo de Facturación\n"
     )
@@ -1806,13 +1839,9 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
         save_state(state, account_id)
         return
 
-    matched_name_client = find_client_by_name_in_text(combined_email_text, catalog)
-    if matched_name_client:
-        apply_single_status_label(gmail_service, message_id, LABEL_ADMIN_NAME, archive=ARCHIVE_ADMIN)
-        print(f"🟦 ADMINISTRATIVA | {radicado} | nombre={matched_name_client.name}")
-        state_add_processed(state, message_id)
-        save_state(state, account_id)
-        return
+    # La búsqueda por nombre en texto del correo se eliminó porque generaba falsos positivos:
+    # proveedores que mencionan el nombre del cliente en el asunto/cuerpo eran marcados como
+    # ADMINISTRATIVA en lugar de pasar por el flujo de validación de facturas.
 
     # 3) Nota de crédito: texto del correo
     if contains_note_credit_text(combined_email_text):
@@ -1903,9 +1932,12 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
             reasons=reasons,
             client_name=client_match.name if client_match else None,
         )
-        print(f"✉️ Respondiendo rechazo en el mismo hilo | {radicado} | to={sender_email}")
-        send_reply_email(gmail_service, msg, sender_email, subject_reply, body_reply)
-        print(f"✅ Respuesta de rechazo enviada | {radicado}")
+        if is_no_reply_sender(sender_email):
+            print(f"⏭️ Remitente es no-reply, se omite respuesta | {radicado} | {sender_email}")
+        else:
+            print(f"✉️ Respondiendo rechazo en el mismo hilo | {radicado} | to={sender_email}")
+            send_reply_email(gmail_service, msg, sender_email, subject_reply, body_reply)
+            print(f"✅ Respuesta de rechazo enviada | {radicado}")
         state_mark_replied(state, message_id)
         state_add_processed(state, message_id)
         save_state(state, account_id)
@@ -1930,9 +1962,12 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
         pdf_count=len(pdfs),
         xml_count=len(xmls),
     )
-    print(f"✉️ Respondiendo aprobación en el mismo hilo | {radicado} | to={sender_email}")
-    send_reply_email(gmail_service, msg, sender_email, approved_subject, approved_body)
-    print(f"✅ Respuesta de aprobación enviada | {radicado}")
+    if is_no_reply_sender(sender_email):
+        print(f"⏭️ Remitente es no-reply, se omite respuesta | {radicado} | {sender_email}")
+    else:
+        print(f"✉️ Respondiendo aprobación en el mismo hilo | {radicado} | to={sender_email}")
+        send_reply_email(gmail_service, msg, sender_email, approved_subject, approved_body)
+        print(f"✅ Respuesta de aprobación enviada | {radicado}")
     state_mark_replied(state, message_id)
     state_add_processed(state, message_id)
     save_state(state, account_id)
