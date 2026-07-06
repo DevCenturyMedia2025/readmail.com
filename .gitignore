@@ -13,3 +13,8 @@ __pycache__/
 gmail_watch_state.json
 accounts/
 logs/
+
+# Extra: credenciales
+*service-account*.json
+credentials/
+*.pem
