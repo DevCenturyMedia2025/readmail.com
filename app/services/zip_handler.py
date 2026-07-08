@@ -6,7 +6,6 @@ extract_zip_files y helpers). Diferencias deliberadas:
 
 - Los limites se reciben por parametro (con los mismos defaults del original),
   lo que permite pruebas con valores pequenos.
-- UnifiedFile se define localmente para no importar reademail.py.
 
 El comportamiento, mensajes de error y defaults se preservan EXACTOS.
 Todavia no esta conectado a reademail.py.
@@ -14,9 +13,9 @@ Todavia no esta conectado a reademail.py.
 
 import io
 import zipfile
-from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from app.models import UnifiedFile
 from app.utils.text import ensure_list
 
 
@@ -25,19 +24,6 @@ DEFAULT_MAX_ZIP_FILES = 250
 DEFAULT_MAX_ZIP_TOTAL_UNCOMPRESSED = 150 * 1024 * 1024
 DEFAULT_MAX_ZIP_SINGLE_FILE = 25 * 1024 * 1024
 DEFAULT_MAX_ZIP_NESTING = 2
-
-
-@dataclass
-class UnifiedFile:
-    name: str
-    mime_type: str
-    data: bytes
-    source: str
-    extracted_text: str = ""
-
-    @property
-    def lower_name(self) -> str:
-        return self.name.lower()
 
 
 def is_zip_attachment(att: Dict[str, Optional[str]]) -> bool:

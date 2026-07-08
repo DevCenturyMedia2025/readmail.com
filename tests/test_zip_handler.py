@@ -9,8 +9,8 @@ import io
 import zipfile
 from unittest.mock import patch
 
+from app.models import UnifiedFile
 from app.services.zip_handler import (
-    UnifiedFile,
     analyze_zip_bytes,
     extract_zip_files,
     is_ignored_zip_member,
