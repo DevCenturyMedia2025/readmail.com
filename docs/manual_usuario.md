@@ -1,4 +1,4 @@
-# Manual de Usuario – Sistema de Facturación 
+# Manual de Usuario – Sistema de Facturación
 
 ## 1. Propósito del sistema
 

@@ -1,7 +1,17 @@
 # Secrets
-credentials.json
-token.json
 .env
+.env.*
+!.env.example
+credentials.json
+credentials*.json
+token.json
+token*.json
+client_secret*.json
+service_account*.json
+*service-account*.json
+*.pem
+*.key
+*.pickle
 
 # Local runtime/state
 .venv/
@@ -10,11 +20,12 @@ token.json
 __pycache__/
 *.py[cod]
 .DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
 gmail_watch_state.json
 accounts/
 logs/
 
 # Extra: credenciales
-*service-account*.json
 credentials/
-*.pem
