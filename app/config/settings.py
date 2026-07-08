@@ -37,7 +37,12 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
 
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "si", "sí"}:
+        return True
+    if normalized in {"0", "false", "no", "n"}:
+        return False
+    return default
 
 
 def env_int(name: str, default: int = 0) -> int:
