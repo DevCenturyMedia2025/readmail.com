@@ -1,12 +1,31 @@
 """
 Modelos de datos compartidos de ReadMail.
 
-UnifiedFile espeja EXACTAMENTE la clase homonima de reademail.py
-(incluyendo sus properties is_pdf, is_xml, is_image). Es el modelo que
-fluye entre zip_handler, document_classifier y modulos futuros.
+UnifiedFile, ClientRecord y ClientMatchResult espejan EXACTAMENTE las
+clases homonimas de reademail.py (incluyendo properties y defaults).
+Son los modelos que fluyen entre zip_handler, document_classifier,
+client_matching y modulos futuros.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+
+@dataclass
+class ClientRecord:
+    name: str
+    normalized_name: str
+    nit: Optional[str] = None
+    normalized_nit: Optional[str] = None
+    active: bool = True
+    raw_row: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ClientMatchResult:
+    record: Optional[ClientRecord] = None
+    raw: Optional[str] = None
+    source: str = ""
 
 
 @dataclass
