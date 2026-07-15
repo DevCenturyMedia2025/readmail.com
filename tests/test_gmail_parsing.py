@@ -88,7 +88,11 @@ def test_extract_sender_email_empty_returns_none():
 def test_is_no_reply_sender_true_cases():
     assert is_no_reply_sender("no-reply@example.com") is True
     assert is_no_reply_sender("notifications@example.com") is True
+    assert is_no_reply_sender("notificaciones@int.lafactura.co") is True
+    assert is_no_reply_sender("avisos@example.com") is True
+    assert is_no_reply_sender("alertas@example.com") is True
 
 
 def test_is_no_reply_sender_false_case():
     assert is_no_reply_sender("juan@example.com") is False
+    assert is_no_reply_sender("juan@empresa.com") is False
