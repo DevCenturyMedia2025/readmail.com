@@ -7,9 +7,11 @@ facturacion electronica DIAN y extraer el correo real del emisor desde XML.
 
 import re
 import xml.etree.ElementTree as ET
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from app.gmail.parsing import is_no_reply_sender
+from app.models import ClientRecord
+from app.services.client_matching import find_contact_email_by_nit
 from app.utils.text import EMAIL_RE
 
 
@@ -41,12 +43,41 @@ def extract_supplier_email(xml_bytes: bytes) -> Optional[str]:
         email = (electronic_mail.text or "").strip()
         if not EMAIL_RE.fullmatch(email):
             continue
-        domain = email.rsplit("@", 1)[1].lower()
-        if domain in BLOCKED_SUPPLIER_DOMAINS:
+        if _is_blocked_supplier_domain(email):
             return None
         return email
 
     return None
+
+
+def resolve_alternate_recipient(
+    xml_bytes: Optional[bytes],
+    subject: str,
+    catalog: List[ClientRecord],
+    fallback_email: str,
+) -> Tuple[Optional[str], str]:
+    """
+    Resuelve destinatario alterno por cascada: XML, catalogo, fallback.
+
+    Los correos obtenidos desde XML y catalogo se bloquean si pertenecen al
+    dominio interno para evitar loops. El fallback es la excepcion: puede ser
+    un buzon @century-media.net porque representa gestion manual interna.
+    """
+    if xml_bytes:
+        supplier_email = extract_supplier_email(xml_bytes)
+        if supplier_email:
+            return supplier_email, "xml"
+
+    nit = extract_nit_from_dian_subject(subject)
+    if nit:
+        contact_email = find_contact_email_by_nit(nit, catalog)
+        if contact_email and not _is_blocked_supplier_domain(contact_email):
+            return contact_email, "sheet"
+
+    if fallback_email:
+        return fallback_email, "fallback"
+
+    return None, "sin_destinatario"
 
 
 def extract_nit_from_dian_subject(subject: str) -> Optional[str]:
@@ -54,6 +85,13 @@ def extract_nit_from_dian_subject(subject: str) -> Optional[str]:
     if not match:
         return None
     return match.group(1)
+
+
+def _is_blocked_supplier_domain(email: str) -> bool:
+    if not EMAIL_RE.fullmatch(email or ""):
+        return False
+    domain = email.rsplit("@", 1)[1].lower()
+    return domain in BLOCKED_SUPPLIER_DOMAINS
 
 
 def _extract_embedded_xml(xml_bytes: bytes) -> bytes:

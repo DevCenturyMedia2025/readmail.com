@@ -1,14 +1,49 @@
 from pathlib import Path
 
+from app.models import ClientRecord
 from app.services.alternate_recipient import (
     extract_nit_from_dian_subject,
     extract_supplier_email,
     is_tech_provider,
+    resolve_alternate_recipient,
 )
+from app.utils.text import normalize_alnum, normalize_nit
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 DIAN_SUBJECT = "123456789;ACME S.A.S.;PRUE0001;01;ACME S.A.S."
+
+
+def _record(name, nit, contact_email=None, active=True):
+    return ClientRecord(
+        name=name,
+        normalized_name=normalize_alnum(name),
+        nit=nit,
+        normalized_nit=normalize_nit(nit),
+        contact_email=contact_email,
+        active=active,
+    )
+
+
+def _invoice_with_supplier_email(email):
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Invoice xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+             xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+      <cac:AccountingSupplierParty>
+        <cac:Party><cac:Contact><cbc:ElectronicMail>{email}</cbc:ElectronicMail></cac:Contact></cac:Party>
+      </cac:AccountingSupplierParty>
+    </Invoice>
+    """.encode("utf-8")
+
+
+XML_WITHOUT_SUPPLIER_EMAIL = b"""<?xml version="1.0" encoding="UTF-8"?>
+<Invoice xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+  <cac:AccountingSupplierParty>
+    <cac:Party><cac:Contact /></cac:Party>
+  </cac:AccountingSupplierParty>
+</Invoice>
+"""
 
 
 def test_is_tech_provider_true_for_real_dian_subject_and_extracts_nit():
@@ -61,3 +96,50 @@ def test_extract_supplier_email_blocks_own_domain_to_avoid_loops():
 
 def test_extract_supplier_email_returns_none_for_malformed_xml():
     assert extract_supplier_email(b"<Invoice><broken></Invoice>") is None
+
+
+def test_resolve_alternate_recipient_xml_gana_sobre_sheet():
+    catalog = [_record("ACME", "123456789", "sheet@acme.test")]
+
+    result = resolve_alternate_recipient(
+        _invoice_with_supplier_email("xml@proveedor.test"),
+        DIAN_SUBJECT,
+        catalog,
+        "fallback@century-media.net",
+    )
+
+    assert result == ("xml@proveedor.test", "xml")
+
+
+def test_resolve_alternate_recipient_xml_sin_email_cae_a_sheet():
+    catalog = [_record("ACME", "123456789", "sheet@acme.test")]
+
+    result = resolve_alternate_recipient(XML_WITHOUT_SUPPLIER_EMAIL, DIAN_SUBJECT, catalog, "")
+
+    assert result == ("sheet@acme.test", "sheet")
+
+
+def test_resolve_alternate_recipient_sheet_sin_xml():
+    catalog = [_record("ACME", "123456789", "sheet@acme.test")]
+
+    result = resolve_alternate_recipient(None, DIAN_SUBJECT, catalog, "")
+
+    assert result == ("sheet@acme.test", "sheet")
+
+
+def test_resolve_alternate_recipient_sin_xml_ni_sheet_cae_a_fallback():
+    result = resolve_alternate_recipient(None, DIAN_SUBJECT, [], "fallback@century-media.net")
+
+    assert result == ("fallback@century-media.net", "fallback")
+
+
+def test_resolve_alternate_recipient_sheet_dominio_interno_cae_a_fallback():
+    catalog = [_record("ACME", "123456789", "gestion@century-media.net")]
+
+    result = resolve_alternate_recipient(None, DIAN_SUBJECT, catalog, "fallback@century-media.net")
+
+    assert result == ("fallback@century-media.net", "fallback")
+
+
+def test_resolve_alternate_recipient_todo_vacio():
+    assert resolve_alternate_recipient(None, "Factura marzo", [], "") == (None, "sin_destinatario")
