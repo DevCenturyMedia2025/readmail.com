@@ -10,11 +10,11 @@ import xml.etree.ElementTree as ET
 from typing import Optional
 
 from app.gmail.parsing import is_no_reply_sender
+from app.utils.text import EMAIL_RE
 
 
 DIAN_SUBJECT_RE = re.compile(r"^\s*(\d{9,10});.+;.+;\d{2};")
 CDATA_RE = re.compile(rb"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
-EMAIL_RE = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
 BLOCKED_SUPPLIER_DOMAINS = {"century-media.net"}
 
 

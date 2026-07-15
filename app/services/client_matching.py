@@ -18,12 +18,109 @@ import re
 from typing import List, Optional, Set, Tuple
 
 from app.models import ClientRecord
-from app.utils.text import normalize_alnum, normalize_nit, normalize_text
+from app.utils.text import EMAIL_RE, normalize_alnum, normalize_nit, normalize_text
 
 
 CLIENT_MATCH_STOPWORDS = {
     "de", "del", "la", "las", "los", "el", "y", "sa", "sas", "s", "a", "esp", "e", "s", "p", "cia", "ltda", "inc",
 }
+
+ACTIVE_VALUES_DEFAULT = {"activo", "active", "si", "yes", "1", "true"}
+
+
+def _header_aliases() -> dict[str, Set[str]]:
+    return {
+        "cliente": {"cliente", "razon social", "razón social", "nombre cliente", "client", "empresa", "proveedor", "proverdor"},
+        "nit": {"nit", "nit cliente", "tax id"},
+        "estado": {"estado", "activo", "status"},
+        "email": {"email", "correo", "email contacto", "correo contacto", "correo electronico", "correo electrónico", "email de contacto"},
+    }
+
+
+def _resolve_column_indexes(headers: List[str]) -> dict[str, Optional[int]]:
+    aliases = _header_aliases()
+    normalized_headers = [normalize_text(header) for header in headers]
+    resolved: dict[str, Optional[int]] = {"cliente": None, "nit": None, "estado": None, "email": None}
+
+    for logical_name, options in aliases.items():
+        normalized_options = {normalize_text(option) for option in options}
+        for idx, header in enumerate(normalized_headers):
+            if header in normalized_options:
+                resolved[logical_name] = idx
+                break
+
+    if resolved["cliente"] is None and headers:
+        resolved["cliente"] = 0
+    if resolved["nit"] is None and len(headers) > 1:
+        resolved["nit"] = 1
+    return resolved
+
+
+def _looks_like_header_row(row: List[str]) -> bool:
+    header_tokens = {
+        normalize_text(option)
+        for options in _header_aliases().values()
+        for option in options
+    }
+    normalized = [normalize_text(cell) for cell in row]
+    return any(cell in header_tokens for cell in normalized)
+
+
+def client_records_from_values(
+    values: List[List[str]],
+    sheet_range: str = "",
+    active_values: Optional[Set[str]] = None,
+) -> List[ClientRecord]:
+    if not values:
+        return []
+
+    first_row = [str(value).strip() for value in values[0]]
+    has_header = _looks_like_header_row(first_row)
+    headers = first_row if has_header else ["cliente", "nit", "estado"]
+    indexes = _resolve_column_indexes(headers)
+    data_rows = values[1:] if has_header else values
+    active_values = active_values if active_values is not None else ACTIVE_VALUES_DEFAULT
+
+    catalog: List[ClientRecord] = []
+    for row in data_rows:
+        if not row:
+            continue
+
+        cliente = _cell(row, indexes.get("cliente"))
+        nit = _cell(row, indexes.get("nit"))
+        estado = _cell(row, indexes.get("estado"))
+        candidate_email = _cell(row, indexes.get("email"))
+        contact_email = candidate_email if EMAIL_RE.fullmatch(candidate_email) else ""
+
+        if not cliente and not nit:
+            continue
+
+        active = True
+        if estado:
+            active = normalize_text(estado) in active_values
+
+        catalog.append(
+            ClientRecord(
+                name=cliente or nit,
+                normalized_name=normalize_alnum(cliente or nit),
+                nit=nit or None,
+                normalized_nit=normalize_nit(nit) or None,
+                contact_email=contact_email or None,
+                active=active,
+                raw_row={
+                    **{headers[i] if i < len(headers) else str(i): str(value) for i, value in enumerate(row)},
+                    "__range": sheet_range,
+                },
+            )
+        )
+
+    return catalog
+
+
+def _cell(row: List[str], index: Optional[int]) -> str:
+    if index is None or index >= len(row):
+        return ""
+    return str(row[index]).strip()
 
 
 def client_name_tokens(value: str) -> Set[str]:
@@ -129,6 +226,13 @@ def find_client_by_nit(nit: str, catalog: List[ClientRecord]) -> Optional[Client
         if record.normalized_nit and record.normalized_nit == normalized:
             return record
     return None
+
+
+def find_contact_email_by_nit(nit: str, catalog: List[ClientRecord]) -> Optional[str]:
+    record = find_client_by_nit(nit, catalog)
+    if record is None:
+        return None
+    return record.contact_email
 
 
 def find_client_by_nit_in_text(text: str, catalog: List[ClientRecord]) -> Optional[Tuple[str, ClientRecord]]:

@@ -17,6 +17,7 @@ class ClientRecord:
     normalized_name: str
     nit: Optional[str] = None
     normalized_nit: Optional[str] = None
+    contact_email: Optional[str] = None
     active: bool = True
     raw_row: Dict[str, str] = field(default_factory=dict)
 

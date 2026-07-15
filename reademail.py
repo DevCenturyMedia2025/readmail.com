@@ -204,6 +204,7 @@ class ClientRecord:
     normalized_name: str
     nit: Optional[str] = None
     normalized_nit: Optional[str] = None
+    contact_email: Optional[str] = None
     active: bool = True
     raw_row: Dict[str, str] = field(default_factory=dict)
 
@@ -264,6 +265,9 @@ def normalize_alnum(value: str) -> str:
 
 def normalize_nit(value: str) -> str:
     return re.sub(r"\D", "", value or "")
+
+
+EMAIL_RE = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
 
 
 def ensure_list(value) -> List:
@@ -503,13 +507,14 @@ def _header_aliases() -> Dict[str, Set[str]]:
         "cliente": {"cliente", "razon social", "razón social", "nombre cliente", "client", "empresa", "proveedor", "proverdor"},
         "nit": {"nit", "nit cliente", "tax id"},
         "estado": {"estado", "activo", "status"},
+        "email": {"email", "correo", "email contacto", "correo contacto", "correo electronico", "correo electrónico", "email de contacto"},
     }
 
 
 def _resolve_column_indexes(headers: List[str]) -> Dict[str, Optional[int]]:
     aliases = _header_aliases()
     normalized_headers = [normalize_text(h) for h in headers]
-    resolved: Dict[str, Optional[int]] = {"cliente": None, "nit": None, "estado": None}
+    resolved: Dict[str, Optional[int]] = {"cliente": None, "nit": None, "estado": None, "email": None}
 
     for logical_name, options in aliases.items():
         for idx, header in enumerate(normalized_headers):
@@ -549,6 +554,7 @@ def _client_records_from_values(values: List[List[str]], sheet_range: str) -> Li
         cliente = ""
         nit = ""
         estado = ""
+        contact_email = ""
 
         if indexes.get("cliente") is not None and indexes["cliente"] < len(row):
             cliente = str(row[indexes["cliente"]]).strip()
@@ -556,6 +562,10 @@ def _client_records_from_values(values: List[List[str]], sheet_range: str) -> Li
             nit = str(row[indexes["nit"]]).strip()
         if indexes.get("estado") is not None and indexes["estado"] < len(row):
             estado = str(row[indexes["estado"]]).strip()
+        if indexes.get("email") is not None and indexes["email"] < len(row):
+            candidate_email = str(row[indexes["email"]]).strip()
+            if EMAIL_RE.fullmatch(candidate_email):
+                contact_email = candidate_email
 
         if not cliente and not nit:
             continue
@@ -569,6 +579,7 @@ def _client_records_from_values(values: List[List[str]], sheet_range: str) -> Li
             normalized_name=normalize_alnum(cliente or nit),
             nit=nit or None,
             normalized_nit=normalize_nit(nit) or None,
+            contact_email=contact_email or None,
             active=active,
             raw_row={
                 **{headers[i] if i < len(headers) else str(i): str(v) for i, v in enumerate(row)},

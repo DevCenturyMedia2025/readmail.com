@@ -10,6 +10,9 @@ import unicodedata
 from typing import List
 
 
+EMAIL_RE = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
+
+
 def strip_accents(value: str) -> str:
     if not value:
         return ""

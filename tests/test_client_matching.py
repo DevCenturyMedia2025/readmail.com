@@ -11,9 +11,11 @@ from app.services.client_matching import (
     CLIENT_MATCH_STOPWORDS,
     client_lookup_catalog,
     client_name_tokens,
+    client_records_from_values,
     client_similarity,
     extract_client_field_values,
     extract_order_client_raw,
+    find_contact_email_by_nit,
     find_client_by_name_in_text,
     find_client_by_nit,
     find_client_by_nit_in_text,
@@ -27,12 +29,13 @@ from app.services.client_matching import (
 from app.utils.text import normalize_alnum, normalize_nit
 
 
-def record(name, nit=None, active=True, raw_row=None):
+def record(name, nit=None, active=True, raw_row=None, contact_email=None):
     return ClientRecord(
         name=name,
         normalized_name=normalize_alnum(name),
         nit=nit,
         normalized_nit=normalize_nit(nit) if nit else None,
+        contact_email=contact_email,
         active=active,
         raw_row=raw_row or {},
     )
@@ -150,6 +153,21 @@ def test_nit_vacio():
     assert find_client_by_nit("", CATALOGO) is None
 
 
+def test_find_contact_email_by_nit_existente():
+    catalogo = [record("ACME Corp", nit="900.123.456-7", contact_email="contacto@acme.test")]
+    assert find_contact_email_by_nit("9001234567", catalogo) == "contacto@acme.test"
+
+
+def test_find_contact_email_by_nit_inexistente():
+    catalogo = [record("ACME Corp", nit="900123456")]
+    assert find_contact_email_by_nit("111222333", catalogo) is None
+
+
+def test_find_contact_email_by_nit_inactivo():
+    catalogo = [record("ACME Corp", nit="900123456", active=False, contact_email="contacto@acme.test")]
+    assert find_contact_email_by_nit("900123456", catalogo) is None
+
+
 def test_nit_dentro_de_texto():
     resultado = find_client_by_nit_in_text("Factura NIT: 900.134.459 valor $1.000", CATALOGO)
     assert resultado is not None
@@ -183,6 +201,33 @@ def test_lookup_filtra_por_rango_clientes():
 def test_lookup_sin_rango_clientes_devuelve_todo():
     catalogo = [record("Uno"), record("Dos")]
     assert client_lookup_catalog(catalogo) == catalogo
+
+
+def test_client_records_from_values_pobla_email_contacto():
+    catalogo = client_records_from_values(
+        [
+            ["cliente", "nit", "estado", "email contacto"],
+            ["ACME Corp", "900.123.456-7", "activo", "contacto@acme.test"],
+        ],
+        sheet_range="Clientes!A:D",
+    )
+
+    assert len(catalogo) == 1
+    assert catalogo[0].contact_email == "contacto@acme.test"
+    assert find_contact_email_by_nit("9001234567", catalogo) == "contacto@acme.test"
+
+
+def test_client_records_from_values_email_malformado_es_none():
+    catalogo = client_records_from_values(
+        [
+            ["cliente", "nit", "estado", "email contacto"],
+            ["ACME Corp", "900.123.456-7", "activo", "no-es-email"],
+        ],
+        sheet_range="Clientes!A:D",
+    )
+
+    assert catalogo[0].contact_email is None
+    assert find_contact_email_by_nit("9001234567", catalogo) is None
 
 
 # ------------------------------------------------------------
@@ -279,6 +324,7 @@ def test_client_record_defaults():
     rec = ClientRecord(name="X", normalized_name="x")
     assert rec.nit is None
     assert rec.normalized_nit is None
+    assert rec.contact_email is None
     assert rec.active is True
     assert rec.raw_row == {}
 
