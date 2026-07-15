@@ -57,6 +57,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.cloud import pubsub_v1
 
+from app.services.alternate_recipient import resolve_alternate_recipient
+
 try:
     from pypdf import PdfReader
 except Exception:  # pragma: no cover
@@ -121,6 +123,9 @@ LABEL_REVIEW_NAME = env_first("LABEL_REVIEW_NAME", default="REVISIÓN MANUAL")
 LABEL_NOTE_CREDIT_NAME = env_first("LABEL_NOTE_CREDIT_NAME", default="NOTA DE CRÉDITO")
 LABEL_APPROVED_NAME = env_first("LABEL_APPROVED_NAME", "LABEL_ACCEPTED_NAME", default="APROBADOS")
 LABEL_REJECTED_NAME = env_first("LABEL_REJECTED_NAME", default="RECHAZADOS")
+
+ALT_RECIPIENT_ENABLED = env_bool("ALT_RECIPIENT_ENABLED", default=False)
+ALT_FALLBACK_EMAIL = env_first("ALT_FALLBACK_EMAIL", default="")
 
 # Archivo / mover de inbox
 # Si existe ARCHIVE_ON_STATUS del .env viejo, lo reutilizamos para aprobado y rechazado.
@@ -989,6 +994,17 @@ def apply_single_status_label(gmail_service, message_id: str, label_name: str, a
     ).execute()
 
 
+def add_status_label(gmail_service, message_id: str, label_name: str) -> None:
+    label_id = ensure_label_exists(gmail_service, label_name)
+    if not label_id:
+        return
+    gmail_service.users().messages().modify(
+        userId="me",
+        id=message_id,
+        body={"addLabelIds": [label_id], "removeLabelIds": []},
+    ).execute()
+
+
 # ============================================================
 # GMAIL WATCH / HISTORY
 # ============================================================
@@ -1776,6 +1792,28 @@ def send_reply_email(gmail_service, original_msg: Dict, to_email: str, subject: 
     gmail_service.users().messages().send(userId="me", body=payload).execute()
 
 
+def send_new_email(gmail_service, to_email: str, subject: str, body: str) -> None:
+    payload = {"raw": create_raw_email(to_email, subject, body)}
+    gmail_service.users().messages().send(userId="me", body=payload).execute()
+
+
+def decide_rejection_recipient(
+    sender_email: str,
+    enabled: bool,
+    xml_bytes: Optional[bytes],
+    subject: str,
+    catalog: List[ClientRecord],
+    fallback_email: str,
+) -> Tuple[Optional[str], str, bool]:
+    if not enabled:
+        return None, "deshabilitado", False
+    if not is_no_reply_sender(sender_email):
+        return None, "remitente_normal", False
+
+    email, source = resolve_alternate_recipient(xml_bytes, subject, catalog, fallback_email)
+    return email, source, bool(email)
+
+
 # ============================================================
 # MESSAGE PROCESSING
 # ============================================================
@@ -1943,8 +1981,26 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
             reasons=reasons,
             client_name=client_match.name if client_match else None,
         )
-        if is_no_reply_sender(sender_email):
+        if is_no_reply_sender(sender_email) and not ALT_RECIPIENT_ENABLED:
             print(f"⏭️ Remitente es no-reply, se omite respuesta | {radicado} | {sender_email}")
+        elif is_no_reply_sender(sender_email):
+            xml_bytes = xmls[0].data if xmls else None
+            alt_email, alt_source, should_redirect = decide_rejection_recipient(
+                sender_email=sender_email,
+                enabled=ALT_RECIPIENT_ENABLED,
+                xml_bytes=xml_bytes,
+                subject=subject,
+                catalog=catalog,
+                fallback_email=ALT_FALLBACK_EMAIL,
+            )
+            if should_redirect and alt_email:
+                body_new = f"{body_reply}\nCorreo original: {subject}\n"
+                send_new_email(gmail_service, alt_email, subject_reply, body_new)
+                if alt_source == "fallback":
+                    add_status_label(gmail_service, message_id, LABEL_REVIEW_NAME)
+                print(f"✉️ Rechazo desviado a {alt_email} (fuente={alt_source}) | {radicado}")
+            else:
+                print(f"⏭️ Remitente es no-reply, se omite respuesta | {radicado} | {sender_email}")
         else:
             print(f"✉️ Respondiendo rechazo en el mismo hilo | {radicado} | to={sender_email}")
             send_reply_email(gmail_service, msg, sender_email, subject_reply, body_reply)
