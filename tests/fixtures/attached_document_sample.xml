@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<AttachedDocument xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+                  xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+  <cac:Attachment>
+    <cac:ExternalReference>
+      <cbc:Description><![CDATA[
+        <?xml version="1.0" encoding="UTF-8"?>
+        <Invoice xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+                 xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2"
+                 xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+          <cac:AccountingSupplierParty>
+            <cac:Party>
+              <cac:Contact>
+                <cbc:ElectronicMail>proveedor@example.com</cbc:ElectronicMail>
+              </cac:Contact>
+            </cac:Party>
+          </cac:AccountingSupplierParty>
+          <cac:AccountingCustomerParty>
+            <cac:Party>
+              <cac:Contact>
+                <cbc:ElectronicMail>cliente@century-media.net</cbc:ElectronicMail>
+              </cac:Contact>
+            </cac:Party>
+          </cac:AccountingCustomerParty>
+          <ds:Signature>
+            <ds:Object>
+              <cbc:ElectronicMail>certificador@andesscd.com.co</cbc:ElectronicMail>
+            </ds:Object>
+          </ds:Signature>
+        </Invoice>
+      ]]></cbc:Description>
+    </cac:ExternalReference>
+  </cac:Attachment>
+</AttachedDocument>

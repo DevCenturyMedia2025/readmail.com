@@ -84,6 +84,9 @@ class Settings:
     archive_note_credit: bool
     archive_review: bool
 
+    alt_recipient_enabled: bool
+    alt_fallback_email: str
+
 
 def load_settings() -> Settings:
     """
@@ -135,4 +138,7 @@ def load_settings() -> Settings:
         archive_admin=env_bool("ARCHIVE_ADMIN", default=True),
         archive_note_credit=env_bool("ARCHIVE_NOTE_CREDIT", default=True),
         archive_review=env_bool("ARCHIVE_REVIEW", default=False),
+
+        alt_recipient_enabled=env_bool("ALT_RECIPIENT_ENABLED", default=False),
+        alt_fallback_email=env_first("ALT_FALLBACK_EMAIL", default=""),
     )

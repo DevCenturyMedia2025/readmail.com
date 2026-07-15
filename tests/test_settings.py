@@ -22,6 +22,20 @@ def test_load_settings_from_environment(monkeypatch):
     assert settings.pubsub_topic_full == "projects/test-project/topics/test-topic"
     assert settings.gmail_accounts == ["one@example.com", "two@example.com"]
     assert settings.gmail_label_ids == ["INBOX", "IMPORTANT"]
+    assert settings.alt_recipient_enabled is False
+    assert settings.alt_fallback_email == ""
+
+
+def test_load_settings_alternate_recipient_from_environment(monkeypatch):
+    monkeypatch.setattr(settings_module, "load_dotenv", lambda: None)
+
+    monkeypatch.setenv("ALT_RECIPIENT_ENABLED", "true")
+    monkeypatch.setenv("ALT_FALLBACK_EMAIL", "fallback@example.com")
+
+    settings = settings_module.load_settings()
+
+    assert settings.alt_recipient_enabled is True
+    assert settings.alt_fallback_email == "fallback@example.com"
 
 
 def test_dry_run_defaults_to_true_outside_production(monkeypatch):
