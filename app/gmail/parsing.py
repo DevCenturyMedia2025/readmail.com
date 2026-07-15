@@ -89,7 +89,7 @@ def extract_sender_email(from_header: str) -> Optional[str]:
 
 
 _NO_REPLY_RE = re.compile(
-    r"(no.?reply|noreply|bounce|mailer-daemon|postmaster|notifications?@|notificaciones?@|avisos?@|alertas?@|donotreply|do-not-reply)",
+    r"(no.?reply|noreply|bounce|mailer-daemon|postmaster|notifications?@|notificacion(?:es)?@|avisos?@|alertas?@|donotreply|do-not-reply)",
     re.IGNORECASE,
 )
 
