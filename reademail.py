@@ -111,6 +111,8 @@ PUBSUB_SUBSCRIPTION_ID = env_first("PUBSUB_SUBSCRIPTION", "PUBSUB_SUBSCRIPTION_I
 PUBSUB_TOPIC_FULL = env_first("PUBSUB_TOPIC_FULL")
 WATCH_LABEL_IDS = [x.strip() for x in env_first("GMAIL_LABEL_IDS", default="INBOX").split(",") if x.strip()]
 GMAIL_SYSTEM_LABEL_IDS = {"INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED", "IMPORTANT", "UNREAD"}
+MODO_PRUEBAS = env_bool("MODO_PRUEBAS", default=False)
+ETIQUETA_PRUEBAS = env_first("ETIQUETA_PRUEBAS", default="pruebas")
 
 SHEET_ID = env_first("CLIENT_SHEET_ID")
 SHEET_RANGE = env_first("CLIENT_SHEET_RANGE", default="Clientes!A:Z")
@@ -1008,6 +1010,16 @@ def add_status_label(gmail_service, message_id: str, label_name: str) -> None:
 # ============================================================
 # GMAIL WATCH / HISTORY
 # ============================================================
+def resolve_effective_watch_labels(
+    modo_pruebas: bool,
+    etiqueta_pruebas: str,
+    gmail_label_ids: List[str],
+) -> List[str]:
+    if modo_pruebas:
+        return [etiqueta_pruebas]
+    return gmail_label_ids
+
+
 def resolve_watch_label_ids(gmail_service, label_names: List[str]) -> List[str]:
     """Convierte nombres de etiquetas a IDs. Las etiquetas del sistema (INBOX, etc.) se usan tal cual."""
     if all(name.upper() in GMAIL_SYSTEM_LABEL_IDS for name in label_names):
@@ -1028,6 +1040,16 @@ def resolve_watch_label_ids(gmail_service, label_names: List[str]) -> List[str]:
     return resolved
 
 
+def resolve_modo_pruebas_label_id(gmail_service, account_id: Optional[str] = None) -> str:
+    resolved = resolve_watch_label_ids(gmail_service, [ETIQUETA_PRUEBAS])
+    if not resolved:
+        account = account_id or "cuenta unica"
+        raise RuntimeError(
+            f"MODO_PRUEBAS activo pero la etiqueta '{ETIQUETA_PRUEBAS}' no existe en la cuenta {account}"
+        )
+    return resolved[0]
+
+
 def ensure_gmail_watch(gmail_service, account_id: Optional[str] = None) -> Dict:
     if not GCP_PROJECT_ID or not PUBSUB_TOPIC_FULL or not PUBSUB_SUBSCRIPTION_ID:
         raise RuntimeError("Faltan env vars: GCP_PROJECT_ID, PUBSUB_TOPIC_FULL, PUBSUB_SUBSCRIPTION.")
@@ -1039,7 +1061,13 @@ def ensure_gmail_watch(gmail_service, account_id: Optional[str] = None) -> Dict:
     if expiration and (expiration - now_ms) > WATCH_RENEW_WINDOW_MS:
         return state
 
-    watch_label_ids = resolve_watch_label_ids(gmail_service, WATCH_LABEL_IDS)
+    effective_label_names = resolve_effective_watch_labels(MODO_PRUEBAS, ETIQUETA_PRUEBAS, WATCH_LABEL_IDS)
+    watch_label_ids = resolve_watch_label_ids(gmail_service, effective_label_names)
+    if MODO_PRUEBAS and not watch_label_ids:
+        account = account_id or "cuenta unica"
+        raise RuntimeError(
+            f"MODO_PRUEBAS activo pero la etiqueta '{ETIQUETA_PRUEBAS}' no existe en la cuenta {account}"
+        )
     body = {
         "topicName": PUBSUB_TOPIC_FULL,
         "labelIds": watch_label_ids if watch_label_ids else ["INBOX"],
@@ -1061,18 +1089,25 @@ def ensure_gmail_watch(gmail_service, account_id: Optional[str] = None) -> Dict:
     return state
 
 
-def fetch_new_message_ids(gmail_service, start_history_id: str) -> Tuple[Set[str], Optional[str]]:
+def fetch_new_message_ids(
+    gmail_service,
+    start_history_id: str,
+    label_id: Optional[str] = None,
+) -> Tuple[Set[str], Optional[str]]:
     message_ids: Set[str] = set()
     page_token = None
     latest_history_id: Optional[str] = None
 
     while True:
-        resp = gmail_service.users().history().list(
-            userId="me",
-            startHistoryId=start_history_id,
-            historyTypes=["messageAdded"],
-            pageToken=page_token,
-        ).execute()
+        request = {
+            "userId": "me",
+            "startHistoryId": start_history_id,
+            "historyTypes": ["messageAdded"],
+            "pageToken": page_token,
+        }
+        if label_id:
+            request["labelId"] = label_id
+        resp = gmail_service.users().history().list(**request).execute()
 
         for history in ensure_list(resp.get("history")):
             for added in ensure_list(history.get("messagesAdded")):
@@ -2135,7 +2170,12 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
                         continue
 
                     try:
-                        new_ids, latest_history = fetch_new_message_ids(acc_gmail, last_history)
+                        history_label_id = resolve_modo_pruebas_label_id(acc_gmail, account_id) if MODO_PRUEBAS else None
+                        new_ids, latest_history = fetch_new_message_ids(
+                            acc_gmail,
+                            last_history,
+                            label_id=history_label_id,
+                        )
                     except HttpError as he:
                         if getattr(he, "resp", None) is not None and he.resp.status in (400, 404):
                             update_last_history_id(history_id, account_id)
@@ -2225,6 +2265,12 @@ def main() -> None:
 
     if not GCP_PROJECT_ID or not PUBSUB_SUBSCRIPTION_ID or not PUBSUB_TOPIC_FULL:
         raise RuntimeError("Faltan env vars: GCP_PROJECT_ID, PUBSUB_SUBSCRIPTION, PUBSUB_TOPIC_FULL.")
+
+    if MODO_PRUEBAS:
+        print(
+            f"🧪 MODO PRUEBAS ACTIVO: solo se procesan correos con etiqueta '{ETIQUETA_PRUEBAS}'. "
+            "Bandeja de entrada IGNORADA."
+        )
 
     if GMAIL_ACCOUNTS:
         # --- Modo multi-cuenta ---
