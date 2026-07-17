@@ -155,6 +155,9 @@ PUBSUB_PULL_MAX = env_int("PUBSUB_PULL_MAX", default=10)
 PUBSUB_ACK_DEADLINE_SECONDS = env_int("PUBSUB_ACK_DEADLINE_SECONDS", default=600)
 IDLE_SLEEP_SEC = float(env_first("IDLE_SLEEP_SEC", default="1.0"))
 WATCH_RENEW_WINDOW_MS = env_int("WATCH_RENEW_WINDOW_MS", default=60 * 60 * 1000)
+TOKEN_ALERT_EMAIL = env_first("TOKEN_ALERT_EMAIL", default="")
+INTERACTIVE_AUTH = env_bool("INTERACTIVE_AUTH", default=False)
+TOKEN_ALERT_COOLDOWN_HOURS = env_int("TOKEN_ALERT_COOLDOWN_HOURS", default=12)
 
 # PDFs mínimos:
 # - Factura electrónica: mínimo 3 PDF + 1 XML.
@@ -485,8 +488,20 @@ def get_or_create_radicado(message_id: str, state: Dict) -> str:
 # ============================================================
 # OAUTH / SERVICES
 # ============================================================
-def get_oauth_creds(account_dir: Optional[str] = None) -> Credentials:
+class TokenAuthError(RuntimeError):
+    def __init__(self, account_email: str):
+        self.account_email = account_email
+        super().__init__(f"Token OAuth inválido para {account_email}")
+
+
+def get_oauth_creds(
+    account_dir: Optional[str] = None,
+    account_email: Optional[str] = None,
+    interactive_auth: Optional[bool] = None,
+) -> Credentials:
     base = account_dir if account_dir else _BASE_DIR
+    failed_account = account_email or os.path.basename(os.path.normpath(base)) or "cuenta unica"
+    allow_interactive = INTERACTIVE_AUTH if interactive_auth is None else interactive_auth
     token_path = os.path.join(base, "token.json")
     # credentials.json: buscar en el directorio de la cuenta; si no existe, usar el del raíz (client secret compartido)
     creds_path = os.path.join(base, "credentials.json")
@@ -509,6 +524,8 @@ def get_oauth_creds(account_dir: Optional[str] = None) -> Credentials:
                 creds = None
 
         if not creds or not creds.valid:
+            if not allow_interactive:
+                raise TokenAuthError(failed_account)
             flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
             creds = flow.run_local_server(port=0)
 
@@ -1857,6 +1874,41 @@ def send_new_email(gmail_service, to_email: str, subject: str, body: str) -> Non
     gmail_service.users().messages().send(userId="me", body=payload).execute()
 
 
+def build_token_alert_email(failed_account: str) -> Tuple[str, str]:
+    subject = f"⚠️ Token vencido: {failed_account} — requiere reactivación"
+    body = (
+        "Hola,\n\n"
+        f"El token OAuth de la cuenta {failed_account} se venció o dejó de ser válido.\n"
+        "Esa cuenta ya no está procesando correos hasta que se reactive el acceso.\n\n"
+        "Para reactivarla:\n"
+        "En el equipo autorizado, con el entorno del proyecto:\n"
+        f"1) Ejecutar: python reademail.py --authorize-account {failed_account}\n"
+        f"2) Iniciar sesión con {failed_account} en el navegador y aceptar permisos\n"
+        f"3) Copiar el token.json generado al servidor (accounts/{failed_account}/token.json) y reiniciar el servicio\n\n"
+        "Este aviso se genera automáticamente para evitar que el servicio quede bloqueado esperando autorización interactiva.\n"
+    )
+    return subject, body
+
+
+def should_send_token_alert(last_sent_ts: Optional[float], now: float, cooldown_hours: int) -> bool:
+    if not last_sent_ts:
+        return True
+    try:
+        last_sent = float(last_sent_ts)
+    except (TypeError, ValueError):
+        return True
+    return (now - last_sent) >= cooldown_hours * 60 * 60
+
+
+def send_token_alert(gmail_service, to_email: str, failed_account: str) -> None:
+    if not to_email:
+        print(f"⚠️ TOKEN_ALERT_EMAIL vacío; no se envía alerta de token para {failed_account}")
+        return
+    subject, body = build_token_alert_email(failed_account)
+    payload = {"raw": create_raw_email(to_email, subject, body)}
+    gmail_service.users().messages().send(userId="me", body=payload).execute()
+
+
 def decide_rejection_recipient(
     sender_email: str,
     enabled: bool,
@@ -2261,7 +2313,7 @@ def authorize_account(email: str) -> None:
     os.makedirs(account_dir, exist_ok=True)
     print(f"🔐 Iniciando flujo OAuth para: {email}")
     print(f"📁 Directorio: {account_dir}")
-    creds = get_oauth_creds(account_dir)
+    creds = get_oauth_creds(account_dir, account_email=email, interactive_auth=True)
     svc = build("gmail", "v1", credentials=creds)
     profile = svc.users().getProfile(userId="me").execute()
     actual_email = profile.get("emailAddress", "")
@@ -2282,6 +2334,33 @@ def authorize_account(email: str) -> None:
 # ============================================================
 # MAIN
 # ============================================================
+def alert_failed_token_accounts(failed_accounts: List[Tuple[str, Optional[str]]], accounts: Dict[str, Dict]) -> None:
+    if not failed_accounts:
+        return
+    if not accounts:
+        for failed_account, _ in failed_accounts:
+            print(f"⚠️ Token inválido para {failed_account}; no hay cuenta cargada para enviar alerta.")
+        return
+
+    notifier = next(iter(accounts.values()))["gmail_service"]
+    now = time.time()
+    for failed_account, account_id in failed_accounts:
+        state = load_state(account_id)
+        last_sent = state.get("token_alert_sent_at")
+        if not should_send_token_alert(last_sent, now, TOKEN_ALERT_COOLDOWN_HOURS):
+            print(f"⏳ Alerta de token omitida por cooldown para {failed_account}")
+            continue
+        try:
+            send_token_alert(notifier, TOKEN_ALERT_EMAIL, failed_account)
+        except Exception as e:
+            print(f"⚠️ No se pudo enviar alerta de token para {failed_account}: {e}")
+            continue
+        if TOKEN_ALERT_EMAIL:
+            state["token_alert_sent_at"] = now
+            save_state(state, account_id)
+            print(f"📧 Alerta de token enviada para {failed_account} a {TOKEN_ALERT_EMAIL}")
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="Sistema de facturación BTL")
@@ -2308,11 +2387,17 @@ def main() -> None:
     if GMAIL_ACCOUNTS:
         # --- Modo multi-cuenta ---
         accounts: Dict[str, Dict] = {}
+        failed_token_accounts: List[Tuple[str, Optional[str]]] = []
         for email in GMAIL_ACCOUNTS:
             email_lc = email.lower()
             account_dir = os.path.join(ACCOUNTS_DIR, email)
             print(f"🔑 Cargando cuenta: {email}")
-            creds = get_oauth_creds(account_dir)
+            try:
+                creds = get_oauth_creds(account_dir, account_email=email_lc)
+            except TokenAuthError as e:
+                print(f"⚠️ {e}. Se continúa con las demás cuentas.")
+                failed_token_accounts.append((e.account_email, email_lc))
+                continue
             gmail_svc = build("gmail", "v1", credentials=creds)
             sheets_svc = build("sheets", "v4", credentials=creds)
             profile = gmail_svc.users().getProfile(userId="me").execute()
@@ -2328,10 +2413,22 @@ def main() -> None:
                 "catalog_data": catalog,
                 "account_id": email_lc,
             }
+        alert_failed_token_accounts(failed_token_accounts, accounts)
+        if not accounts:
+            print("⚠️ No hay cuentas Gmail cargadas; no se inicia el listener.")
+            return
         listen_pubsub(accounts)
     else:
         # --- Modo cuenta única (retrocompatibilidad) ---
-        creds = get_oauth_creds()
+        failed_token_accounts: List[Tuple[str, Optional[str]]] = []
+        accounts: Dict[str, Dict] = {}
+        try:
+            creds = get_oauth_creds(account_email="cuenta unica")
+        except TokenAuthError as e:
+            print(f"⚠️ {e}. No se inicia el listener de cuenta única.")
+            failed_token_accounts.append((e.account_email, None))
+            alert_failed_token_accounts(failed_token_accounts, accounts)
+            return
         gmail_service = build("gmail", "v1", credentials=creds)
         sheets_service = build("sheets", "v4", credentials=creds)
         profile = gmail_service.users().getProfile(userId="me").execute()
