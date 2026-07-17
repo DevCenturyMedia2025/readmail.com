@@ -1,4 +1,19 @@
-﻿import app.config.settings as settings_module
+﻿import pytest
+
+import app.config.settings as settings_module
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    for var in [
+        "ALT_RECIPIENT_ENABLED",
+        "ALT_FALLBACK_EMAIL",
+        "MODO_PRUEBAS",
+        "ETIQUETA_PRUEBAS",
+        "TOKEN_ALERT_EMAIL",
+        "INTERACTIVE_AUTH",
+    ]:
+        monkeypatch.delenv(var, raising=False)
 
 
 def test_load_settings_from_environment(monkeypatch):
