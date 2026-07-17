@@ -26,6 +26,7 @@ No usa OCR. Lee texto digital del PDF.
 Si el PDF es escaneado como imagen sin capa de texto, varias validaciones podrían no detectar contenido.
 """
 
+# region 📦 Imports y dependencias
 import base64
 import html
 import io
@@ -65,6 +66,8 @@ except Exception:  # pragma: no cover
     from PyPDF2 import PdfReader  # type: ignore
 
 
+# endregion
+# region 🔐 Scopes de Google
 # ============================================================
 # SCOPES
 # ============================================================
@@ -76,6 +79,8 @@ SCOPES = [
 ]
 
 
+# endregion
+# region ⚙️ Configuración y variables de entorno
 # ============================================================
 # ENV / CONFIG
 # Compatibilidad: este bloque admite tanto las variables NUEVAS
@@ -202,6 +207,8 @@ ORDER_REGEXES = [
 
 NIT_REGEX = re.compile(r"\bnit\b\s*[:#\-]?\s*([0-9][0-9.\-]{5,20})", re.IGNORECASE)
 
+# endregion
+# region 🗂️ Modelos de datos
 # ============================================================
 # DATA MODELS
 # ============================================================
@@ -248,6 +255,8 @@ class UnifiedFile:
         return self.lower_name.endswith((".jpg", ".jpeg", ".png")) or self.mime_type in ("image/jpeg", "image/png")
 
 
+# endregion
+# region 🔧 Utilidades básicas de texto
 # ============================================================
 # BASIC HELPERS
 # ============================================================
@@ -373,6 +382,8 @@ def today_yyyymmdd() -> str:
     return datetime.now().strftime("%Y%m%d")
 
 
+# endregion
+# region 💾 Estado y persistencia (JSON)
 # ============================================================
 # STATE
 # ============================================================
@@ -469,6 +480,8 @@ def get_or_create_radicado(message_id: str, state: Dict) -> str:
     return radicado
 
 
+# endregion
+# region 🔑 OAuth y servicios de Google
 # ============================================================
 # OAUTH / SERVICES
 # ============================================================
@@ -506,6 +519,8 @@ def get_oauth_creds(account_dir: Optional[str] = None) -> Credentials:
     return creds
 
 
+# endregion
+# region 📊 Google Sheets: catálogo de clientes y lista blanca
 # ============================================================
 # SHEETS: CLIENTS + NIT WHITELIST
 # ============================================================
@@ -944,6 +959,8 @@ def first_client_field_value(candidate_texts: List[str]) -> Optional[str]:
     return None
 
 
+# endregion
+# region 🏷️ Etiquetas de Gmail
 # ============================================================
 # LABELS
 # ============================================================
@@ -1007,6 +1024,8 @@ def add_status_label(gmail_service, message_id: str, label_name: str) -> None:
     ).execute()
 
 
+# endregion
+# region 👀 Gmail Watch e historial
 # ============================================================
 # GMAIL WATCH / HISTORY
 # ============================================================
@@ -1133,6 +1152,8 @@ def update_last_history_id(latest_history_id: Optional[str], account_id: Optiona
     save_state(state, account_id)
 
 
+# endregion
+# region 📎 Adjuntos, ZIP y extracción de PDF
 # ============================================================
 # ATTACHMENTS / ZIP / PDF TEXT
 # ============================================================
@@ -1432,6 +1453,8 @@ def build_unified_files(gmail_service, message_id: str, attachments: List[Dict[s
     return unified, zip_errors, zip_analyses
 
 
+# endregion
+# region 📋 Reglas de negocio (clasificación y validación)
 # ============================================================
 # BUSINESS RULES
 # ============================================================
@@ -1770,6 +1793,8 @@ def format_missing_documents(doc_types: List[str]) -> List[str]:
     return [DOCUMENT_LABELS.get(doc_type, str(doc_type).replace("_", " ")) for doc_type in doc_types]
 
 
+# endregion
+# region ✉️ Construcción de respuestas
 # ============================================================
 # RESPONSES
 # ============================================================
@@ -1849,6 +1874,8 @@ def decide_rejection_recipient(
     return email, source, bool(email)
 
 
+# endregion
+# region 🔄 Procesamiento de mensajes
 # ============================================================
 # MESSAGE PROCESSING
 # ============================================================
@@ -2087,6 +2114,8 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
     print("=" * 80)
 
 
+# endregion
+# region 👂 Loop de Pub/Sub
 # ============================================================
 # PUBSUB LOOP
 # ============================================================
@@ -2222,6 +2251,8 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
             backoff = min(backoff * 2, 30)
 
 
+# endregion
+# region 🔓 Autorización de cuentas
 # ============================================================
 # AUTHORIZE ACCOUNT
 # ============================================================
@@ -2246,6 +2277,8 @@ def authorize_account(email: str) -> None:
     print("Luego reinicia el proceso.")
 
 
+# endregion
+# region 🚀 Main
 # ============================================================
 # MAIN
 # ============================================================
@@ -2322,3 +2355,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+# endregion
