@@ -58,7 +58,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.cloud import pubsub_v1
 
-from app.services.alternate_recipient import resolve_alternate_recipient
+from app.services.alternate_recipient import is_tech_provider, resolve_alternate_recipient
 
 try:
     from pypdf import PdfReader
@@ -1919,7 +1919,8 @@ def decide_rejection_recipient(
 ) -> Tuple[Optional[str], str, bool]:
     if not enabled:
         return None, "deshabilitado", False
-    if not is_no_reply_sender(sender_email):
+    has_xml = bool(xml_bytes)
+    if not is_tech_provider(subject, sender_email, has_xml):
         return None, "remitente_normal", False
 
     email, source = resolve_alternate_recipient(xml_bytes, subject, catalog, fallback_email)
@@ -2095,9 +2096,10 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
             reasons=reasons,
             client_name=client_match.name if client_match else None,
         )
-        if is_no_reply_sender(sender_email) and not ALT_RECIPIENT_ENABLED:
+        tech_provider = is_tech_provider(subject, sender_email, bool(xmls))
+        if tech_provider and not ALT_RECIPIENT_ENABLED:
             print(f"⏭️ Remitente es no-reply, se omite respuesta | {radicado} | {sender_email}")
-        elif is_no_reply_sender(sender_email):
+        elif tech_provider:
             xml_bytes = xmls[0].data if xmls else None
             alt_email, alt_source, should_redirect = decide_rejection_recipient(
                 sender_email=sender_email,

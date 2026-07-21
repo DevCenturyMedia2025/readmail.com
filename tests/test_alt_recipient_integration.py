@@ -53,7 +53,7 @@ def test_decide_rejection_recipient_flag_on_no_reply_xml():
     assert result == ("proveedor@example.com", "xml", True)
 
 
-def test_decide_rejection_recipient_flag_on_remitente_normal_sin_desvio():
+def test_decide_rejection_recipient_flag_on_remitente_normal_asunto_dian_desvia():
     result = decide_rejection_recipient(
         sender_email="juan@empresa.com",
         enabled=True,
@@ -63,7 +63,33 @@ def test_decide_rejection_recipient_flag_on_remitente_normal_sin_desvio():
         fallback_email="fallback@century-media.net",
     )
 
+    assert result == ("proveedor@example.com", "xml", True)
+
+
+def test_decide_rejection_recipient_flag_on_remitente_normal_asunto_normal_sin_desvio():
+    result = decide_rejection_recipient(
+        sender_email="juan@empresa.com",
+        enabled=True,
+        xml_bytes=_invoice_with_supplier_email("proveedor@example.com"),
+        subject="Factura marzo",
+        catalog=[],
+        fallback_email="fallback@century-media.net",
+    )
+
     assert result == (None, "remitente_normal", False)
+
+
+def test_decide_rejection_recipient_flag_on_no_reply_asunto_normal_desvia():
+    result = decide_rejection_recipient(
+        sender_email="notificacion@dian.gov.co",
+        enabled=True,
+        xml_bytes=_invoice_with_supplier_email("proveedor@example.com"),
+        subject="Factura marzo",
+        catalog=[],
+        fallback_email="fallback@century-media.net",
+    )
+
+    assert result == ("proveedor@example.com", "xml", True)
 
 
 def test_decide_rejection_recipient_flag_on_sin_datos():
@@ -76,4 +102,4 @@ def test_decide_rejection_recipient_flag_on_sin_datos():
         fallback_email="",
     )
 
-    assert result == (None, "sin_destinatario", False)
+    assert result == (None, "remitente_normal", False)
