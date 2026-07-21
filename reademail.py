@@ -40,6 +40,9 @@ import zipfile
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import parseaddr
 from typing import Dict, List, Optional, Set, Tuple
@@ -378,6 +381,30 @@ def create_raw_email(to_email: str, subject: str, body: str, extra_headers: Opti
     for name, value in (extra_headers or {}).items():
         if value:
             msg[name] = value
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+
+def create_forward_email(to_email: str, subject: str, body: str, attachments: List[Dict[str, object]]) -> str:
+    msg = MIMEMultipart("mixed")
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, _charset="utf-8"))
+
+    for attachment in attachments:
+        filename = str(attachment.get("filename") or "adjunto")
+        mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+        if "/" not in mime_type:
+            mime_type = "application/octet-stream"
+        maintype, subtype = mime_type.split("/", 1)
+        if not maintype or not subtype:
+            maintype, subtype = "application", "octet-stream"
+
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(attachment.get("data") or b"")
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(part)
+
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
 
 
@@ -1874,6 +1901,17 @@ def send_new_email(gmail_service, to_email: str, subject: str, body: str) -> Non
     gmail_service.users().messages().send(userId="me", body=payload).execute()
 
 
+def send_forward_with_attachments(
+    gmail_service,
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: List[Dict[str, object]],
+) -> None:
+    payload = {"raw": create_forward_email(to_email, subject, body, attachments)}
+    gmail_service.users().messages().send(userId="me", body=payload).execute()
+
+
 def build_token_alert_email(failed_account: str) -> Tuple[str, str]:
     subject = f"⚠️ Token vencido: {failed_account} — requiere reactivación"
     body = (
@@ -2111,7 +2149,40 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
             )
             if should_redirect and alt_email:
                 body_new = f"{body_reply}\nCorreo original: {subject}\n"
-                send_new_email(gmail_service, alt_email, subject_reply, body_new)
+                original_attachments: List[Dict[str, object]] = []
+                for attachment in attachments:
+                    attachment_id = attachment.get("attachmentId")
+                    if not attachment_id:
+                        continue
+                    filename = str(attachment.get("filename") or "adjunto")
+                    try:
+                        attachment_data = gmail_download_attachment_bytes(
+                            gmail_service,
+                            message_id,
+                            attachment_id,
+                        )
+                    except Exception as e:
+                        logger.warning("No pude descargar adjunto original %s para reenviarlo: %s", filename, e)
+                        continue
+                    original_attachments.append(
+                        {
+                            "filename": filename,
+                            "mime_type": attachment.get("mimeType") or "application/octet-stream",
+                            "data": attachment_data,
+                        }
+                    )
+
+                forward_subject = f"Rechazo de facturación - {subject} (ID: {radicado})"
+                if original_attachments:
+                    send_forward_with_attachments(
+                        gmail_service,
+                        alt_email,
+                        forward_subject,
+                        body_new,
+                        original_attachments,
+                    )
+                else:
+                    send_new_email(gmail_service, alt_email, forward_subject, body_new)
                 if alt_source == "fallback":
                     add_status_label(gmail_service, message_id, LABEL_REVIEW_NAME)
                 print(f"✉️ Rechazo desviado a {alt_email} (fuente={alt_source}) | {radicado}")
