@@ -1909,6 +1909,26 @@ def build_approved_email(radicado: str, invoice_type: str, client_name: str, pdf
     return subject, body
 
 
+def build_forward_body(
+    rejection_text: str,
+    from_header: str,
+    fecha: str,
+    asunto: str,
+    para: str,
+    body_text: str,
+) -> str:
+    original_text = body_text if body_text else "(el correo original no tenía texto)"
+    return (
+        f"{rejection_text}\n\n"
+        "---------- Mensaje original ----------\n"
+        f"De: {from_header}\n"
+        f"Fecha: {fecha}\n"
+        f"Asunto: {asunto}\n"
+        f"Para: {para}\n\n"
+        f"{original_text}\n"
+    )
+
+
 def send_reply_email(gmail_service, original_msg: Dict, to_email: str, subject: str, body: str) -> None:
     original_payload = original_msg.get("payload", {}) or {}
     original_subject = get_header(original_payload, "Subject")
@@ -2268,7 +2288,14 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
                     fallback_email=ALT_FALLBACK_EMAIL,
                 )
                 if should_redirect and alt_email:
-                    body_new = f"{body_reply}\nCorreo original: {subject}\n"
+                    body_new = build_forward_body(
+                        rejection_text=body_reply,
+                        from_header=from_header,
+                        fecha=get_header(payload, "Date"),
+                        asunto=subject,
+                        para=get_header(payload, "To"),
+                        body_text=body_text,
+                    )
                     original_attachments: List[Dict[str, object]] = []
                     for attachment in attachments:
                         attachment_id = attachment.get("attachmentId")
