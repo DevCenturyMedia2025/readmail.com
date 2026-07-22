@@ -1166,16 +1166,18 @@ def fetch_new_message_ids(
     gmail_service,
     start_history_id: str,
     label_id: Optional[str] = None,
+    include_label_added: bool = False,
 ) -> Tuple[Set[str], Optional[str]]:
     message_ids: Set[str] = set()
     page_token = None
     latest_history_id: Optional[str] = None
 
     while True:
+        history_types = ["messageAdded", "labelAdded"] if include_label_added else ["messageAdded"]
         request = {
             "userId": "me",
             "startHistoryId": start_history_id,
-            "historyTypes": ["messageAdded"],
+            "historyTypes": history_types,
             "pageToken": page_token,
         }
         if label_id:
@@ -1187,6 +1189,13 @@ def fetch_new_message_ids(
                 mid = (added.get("message") or {}).get("id")
                 if mid:
                     message_ids.add(mid)
+            if include_label_added and label_id:
+                for added in ensure_list(history.get("labelsAdded")):
+                    if label_id not in ensure_list(added.get("labelIds")):
+                        continue
+                    mid = (added.get("message") or {}).get("id")
+                    if mid:
+                        message_ids.add(mid)
 
         page_token = resp.get("nextPageToken")
         if resp.get("historyId"):
@@ -2456,6 +2465,7 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
                             acc_gmail,
                             last_history,
                             label_id=history_label_id,
+                            include_label_added=MODO_PRUEBAS,
                         )
                     except HttpError as he:
                         if getattr(he, "resp", None) is not None and he.resp.status in (400, 404):
