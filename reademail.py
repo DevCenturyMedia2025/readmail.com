@@ -1998,14 +1998,14 @@ def should_send_whatsapp(cache: Dict[str, float], mensaje_key: str, ahora: float
     return True
 
 
-def send_whatsapp_alert(mensaje: str) -> None:
+def send_whatsapp_alert(mensaje: str, cooldown_key: Optional[str] = None) -> None:
     try:
         if not WHATSAPP_ALERT_ENABLED or not WHATSAPP_PHONE or not WHATSAPP_APIKEY:
             logger.debug("Alerta WhatsApp deshabilitada o sin configuración completa")
             return
 
         area = mensaje.partition("]")[0].lstrip("[")
-        mensaje_key = {
+        mensaje_key = cooldown_key or {
             "Loop Pub/Sub": "loop",
             "Procesar correo": "procesar",
             "Token": "token",
@@ -2088,6 +2088,7 @@ def is_bounce_message(payload: Dict, from_header: str, subject: str) -> bool:
         "returned to sender",
         "failure notice",
         "no such user",
+        "delivery incomplete",
     )
     if any(pattern in sender_text for pattern in sender_patterns):
         return True
@@ -2181,18 +2182,27 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
         bounce_radicado = bounce_info["radicado"]
         failed_recipient = bounce_info["failed_recipient"]
         original_message_id = find_message_id_by_radicado(state, bounce_radicado)
-        review_message_id = original_message_id or message_id
+        if original_message_id:
+            try:
+                apply_single_status_label(gmail_service, original_message_id, LABEL_REVIEW_NAME)
+            except Exception as error:
+                logger.error("❌ Falló re-etiquetado del original: %s", error)
         try:
-            add_status_label(gmail_service, review_message_id, LABEL_REVIEW_NAME)
+            add_status_label(gmail_service, message_id, LABEL_REVIEW_NAME)
         except Exception as error:
-            logger.error("❌ Falló etiquetado de rebote para Revisión Manual: %s", error)
+            logger.error("❌ Falló etiquetado del rebote para Revisión Manual: %s", error)
+        cuenta_afectada = account_id or "cuenta única"
         send_whatsapp_alert(
             f"[Rebote] El rechazo {bounce_radicado or 'desconocido'} rebotó — "
             f"el correo {failed_recipient or 'destino'} no recibió el mensaje. "
-            "Enviado a Revisión Manual."
+            f"Cuenta: {cuenta_afectada}. "
+            "Factura movida a Revisión Manual.",
+            cooldown_key=(
+                f"rebote:{account_id or 'cuenta_unica'}:{bounce_radicado or message_id}"
+            ),
         )
         print(
-            f"↩️ REBOTE detectado | radicado={bounce_radicado} | "
+            f"↩️ REBOTE | cuenta={account_id} | radicado={bounce_radicado} | "
             f"destino_fallido={failed_recipient} -> Revisión Manual"
         )
         state_add_processed(state, message_id)

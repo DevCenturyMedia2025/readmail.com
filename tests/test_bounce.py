@@ -24,6 +24,7 @@ def _payload(from_header="proveedor@example.com", subject="Factura FV-123", body
         ("MAILER-DAEMON@example.com", "Delivery report"),
         ("postmaster@example.com", "Delivery report"),
         ("mailer@example.com", "Undelivered Mail Returned to Sender"),
+        ("mailer@example.com", "Delivery incomplete"),
     ],
 )
 def test_is_bounce_message_detecta_remitente_o_asunto(from_header, subject):
@@ -88,7 +89,8 @@ def test_process_message_rebote_etiqueta_original_antes_del_filtro_de_adjuntos(m
     )
     payload = _payload("MAILER-DAEMON@example.com", "Undelivered Mail", bounce_body)
     state = {"message_radicados": {"msg-original": "RAD-20260722-000003"}}
-    labels = []
+    status_labels = []
+    added_labels = []
     whatsapp = []
 
     monkeypatch.setattr(reademail, "load_state", lambda account_id=None: state)
@@ -98,11 +100,48 @@ def test_process_message_rebote_etiqueta_original_antes_del_filtro_de_adjuntos(m
         "safe_get_message_full",
         lambda service, message_id: {"payload": payload, "snippet": bounce_body},
     )
-    monkeypatch.setattr(reademail, "add_status_label", lambda service, message_id, label: labels.append((message_id, label)))
-    monkeypatch.setattr(reademail, "send_whatsapp_alert", lambda message: whatsapp.append(message))
+    monkeypatch.setattr(
+        reademail,
+        "apply_single_status_label",
+        lambda service, message_id, label: status_labels.append((message_id, label)),
+    )
+    monkeypatch.setattr(
+        reademail,
+        "add_status_label",
+        lambda service, message_id, label: added_labels.append((message_id, label)),
+    )
+    monkeypatch.setattr(
+        reademail,
+        "send_whatsapp_alert",
+        lambda message, cooldown_key=None: whatsapp.append((message, cooldown_key)),
+    )
 
-    reademail.process_message(object(), object(), "msg-rebote", [])
+    reademail.process_message(object(), object(), "msg-rebote", [], account_id="cuenta@example.com")
 
-    assert labels == [("msg-original", reademail.LABEL_REVIEW_NAME)]
+    assert status_labels == [("msg-original", reademail.LABEL_REVIEW_NAME)]
+    assert added_labels == [("msg-rebote", reademail.LABEL_REVIEW_NAME)]
     assert state["processed_message_ids"] == ["msg-rebote"]
-    assert whatsapp and whatsapp[0].startswith("[Rebote] El rechazo RAD-20260722-000003 rebotó")
+    assert whatsapp[0][0].startswith("[Rebote] El rechazo RAD-20260722-000003 rebotó")
+    assert "Cuenta: cuenta@example.com. Factura movida a Revisión Manual." in whatsapp[0][0]
+    assert whatsapp[0][1] == "rebote:cuenta@example.com:RAD-20260722-000003"
+
+
+def test_cooldown_key_separa_rebotes_y_silencia_repetido(monkeypatch):
+    calls = []
+    monkeypatch.setattr(reademail, "WHATSAPP_ALERT_ENABLED", True)
+    monkeypatch.setattr(reademail, "WHATSAPP_PHONE", "000")
+    monkeypatch.setattr(reademail, "WHATSAPP_APIKEY", "test")
+    monkeypatch.setattr(reademail, "WHATSAPP_COOLDOWN_MIN", 15)
+    monkeypatch.setattr(reademail, "_WHATSAPP_ALERT_CACHE", {})
+    monkeypatch.setattr(reademail.time, "time", lambda: 1_000)
+    monkeypatch.setattr(
+        reademail.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    reademail.send_whatsapp_alert("[Rebote] Primer rebote", cooldown_key="rebote:cuenta:rad-1")
+    reademail.send_whatsapp_alert("[Rebote] Segundo rebote", cooldown_key="rebote:cuenta:rad-2")
+    reademail.send_whatsapp_alert("[Rebote] Primer rebote repetido", cooldown_key="rebote:cuenta:rad-1")
+
+    assert len(calls) == 2
