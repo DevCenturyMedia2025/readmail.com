@@ -1,6 +1,9 @@
+import pytest
+
 from app.models import ClientRecord
 from app.utils.text import normalize_alnum, normalize_nit
-from reademail import decide_rejection_recipient
+import reademail
+from reademail import UnifiedFile, decide_rejection_recipient
 
 
 DIAN_SUBJECT = "123456789;ACME S.A.S.;PRUE0001;01;ACME S.A.S."
@@ -102,4 +105,135 @@ def test_decide_rejection_recipient_flag_on_sin_datos():
         fallback_email="",
     )
 
-    assert result == (None, "remitente_normal", False)
+    assert result == (None, "sin_destinatario", False)
+
+
+def _run_rejected_message(
+    monkeypatch,
+    sender,
+    subject,
+    enabled,
+    with_xml=False,
+    send_error=None,
+    attachment_size=0,
+):
+    payload = {
+        "headers": [
+            {"name": "From", "value": sender},
+            {"name": "Subject", "value": subject},
+        ]
+    }
+    files = [UnifiedFile("factura.pdf", "application/pdf", b"", "test")]
+    if with_xml:
+        files.append(UnifiedFile("factura.xml", "application/xml", _invoice_with_supplier_email("proveedor@example.com"), "test"))
+
+    attachment = {"attachmentId": "attachment-1", "filename": "factura.pdf"} if attachment_size else {}
+    state = {}
+    saved_states = []
+    calls = {"reply": [], "new": [], "forward": [], "state": state, "saved_states": saved_states}
+
+    def record_reply(*args):
+        calls["reply"].append(args)
+        if send_error:
+            raise send_error
+
+    monkeypatch.setattr(reademail, "ALT_RECIPIENT_ENABLED", enabled)
+    monkeypatch.setattr(reademail, "ALT_FALLBACK_EMAIL", "fallback@example.com")
+    monkeypatch.setattr(reademail, "load_state", lambda account_id=None: state)
+    monkeypatch.setattr(reademail, "save_state", lambda current, account_id=None: saved_states.append(current.copy()))
+    monkeypatch.setattr(reademail, "safe_get_message_full", lambda service, message_id: {"payload": payload, "snippet": ""})
+    monkeypatch.setattr(reademail, "collect_attachments", lambda payload: [attachment])
+    monkeypatch.setattr(reademail, "build_unified_files", lambda service, message_id, attachments: (files, [], []))
+    monkeypatch.setattr(reademail, "gmail_download_attachment_bytes", lambda *args: b"x" * attachment_size)
+    monkeypatch.setattr(reademail, "apply_single_status_label", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reademail, "add_status_label", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reademail, "send_reply_email", record_reply)
+    monkeypatch.setattr(reademail, "send_new_email", lambda *args: calls["new"].append(args))
+    monkeypatch.setattr(reademail, "send_forward_with_attachments", lambda *args: calls["forward"].append(args))
+
+    reademail.process_message(object(), object(), "message-1", [])
+    return calls
+
+
+def test_no_reply_sin_xml_asunto_normal_flag_off_omite_respuesta(monkeypatch):
+    calls = _run_rejected_message(monkeypatch, "noreply@example.com", "Factura marzo", enabled=False)
+
+    assert calls["reply"] == []
+    assert calls["new"] == []
+    assert calls["forward"] == []
+
+
+def test_humano_asunto_dian_flag_off_responde_al_hilo(monkeypatch):
+    calls = _run_rejected_message(monkeypatch, "juan@empresa.com", DIAN_SUBJECT, enabled=False)
+
+    assert len(calls["reply"]) == 1
+    assert calls["new"] == []
+    assert calls["forward"] == []
+
+
+def test_humano_asunto_dian_flag_on_desvia(monkeypatch):
+    calls = _run_rejected_message(monkeypatch, "juan@empresa.com", DIAN_SUBJECT, enabled=True, with_xml=True)
+
+    assert calls["reply"] == []
+    assert len(calls["new"]) == 1
+
+
+def test_no_reply_sin_xml_flag_on_usa_flujo_de_desvio(monkeypatch):
+    calls = _run_rejected_message(monkeypatch, "noreply@example.com", "Factura marzo", enabled=True)
+
+    assert calls["reply"] == []
+    assert len(calls["new"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("sender", "subject", "with_xml", "expected_replies"),
+    [
+        ("noreply@example.com", DIAN_SUBJECT, True, 0),
+        ("noreply@example.com", "Factura marzo", False, 0),
+        ("juan@empresa.com", DIAN_SUBJECT, True, 1),
+        ("juan@empresa.com", DIAN_SUBJECT, False, 1),
+        ("juan@empresa.com", "Factura marzo", True, 1),
+    ],
+)
+def test_flag_off_conserva_los_cinco_escenarios_historicos(
+    monkeypatch, sender, subject, with_xml, expected_replies
+):
+    calls = _run_rejected_message(monkeypatch, sender, subject, enabled=False, with_xml=with_xml)
+
+    assert len(calls["reply"]) == expected_replies
+    assert calls["new"] == []
+    assert calls["forward"] == []
+
+
+def test_fallo_de_envio_marca_replied_y_no_deja_reintento(monkeypatch, caplog):
+    calls = _run_rejected_message(
+        monkeypatch,
+        "juan@empresa.com",
+        "Factura marzo",
+        enabled=False,
+        send_error=RuntimeError("SMTP caído"),
+    )
+
+    assert calls["state"]["replied_message_ids"] == ["message-1"]
+    assert calls["state"]["processed_message_ids"] == ["message-1"]
+    assert calls["saved_states"][-1]["replied_message_ids"] == ["message-1"]
+    assert "❌ Falló envío de rechazo a juan@empresa.com: SMTP caído" in caplog.text
+
+    reademail.process_message(object(), object(), "message-1", [])
+    assert len(calls["reply"]) == 1
+
+
+def test_adjuntos_mayores_a_20_mb_envian_solo_texto_con_nota(monkeypatch, caplog):
+    calls = _run_rejected_message(
+        monkeypatch,
+        "juan@empresa.com",
+        DIAN_SUBJECT,
+        enabled=True,
+        with_xml=True,
+        attachment_size=20 * 1024 * 1024 + 1,
+    )
+
+    assert calls["forward"] == []
+    assert len(calls["new"]) == 1
+    assert "La factura no se reenvió por superar el tamaño permitido." in calls["new"][0][3]
+    assert "Adjuntos de rechazo superan 20 MB" in caplog.text

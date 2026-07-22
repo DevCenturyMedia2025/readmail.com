@@ -1958,7 +1958,7 @@ def decide_rejection_recipient(
     if not enabled:
         return None, "deshabilitado", False
     has_xml = bool(xml_bytes)
-    if not is_tech_provider(subject, sender_email, has_xml):
+    if not (is_tech_provider(subject, sender_email, has_xml) or is_no_reply_sender(sender_email)):
         return None, "remitente_normal", False
 
     email, source = resolve_alternate_recipient(xml_bytes, subject, catalog, fallback_email)
@@ -2134,64 +2134,106 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
             reasons=reasons,
             client_name=client_match.name if client_match else None,
         )
-        tech_provider = is_tech_provider(subject, sender_email, bool(xmls))
-        if tech_provider and not ALT_RECIPIENT_ENABLED:
-            print(f"⏭️ Remitente es no-reply, se omite respuesta | {radicado} | {sender_email}")
-        elif tech_provider:
-            xml_bytes = xmls[0].data if xmls else None
-            alt_email, alt_source, should_redirect = decide_rejection_recipient(
-                sender_email=sender_email,
-                enabled=ALT_RECIPIENT_ENABLED,
-                xml_bytes=xml_bytes,
-                subject=subject,
-                catalog=catalog,
-                fallback_email=ALT_FALLBACK_EMAIL,
-            )
-            if should_redirect and alt_email:
-                body_new = f"{body_reply}\nCorreo original: {subject}\n"
-                original_attachments: List[Dict[str, object]] = []
-                for attachment in attachments:
-                    attachment_id = attachment.get("attachmentId")
-                    if not attachment_id:
-                        continue
-                    filename = str(attachment.get("filename") or "adjunto")
-                    try:
-                        attachment_data = gmail_download_attachment_bytes(
-                            gmail_service,
-                            message_id,
-                            attachment_id,
-                        )
-                    except Exception as e:
-                        logger.warning("No pude descargar adjunto original %s para reenviarlo: %s", filename, e)
-                        continue
-                    original_attachments.append(
-                        {
-                            "filename": filename,
-                            "mime_type": attachment.get("mimeType") or "application/octet-stream",
-                            "data": attachment_data,
-                        }
-                    )
 
-                forward_subject = f"Rechazo de facturación - {subject} (ID: {radicado})"
-                if original_attachments:
-                    send_forward_with_attachments(
-                        gmail_service,
-                        alt_email,
-                        forward_subject,
-                        body_new,
-                        original_attachments,
-                    )
-                else:
-                    send_new_email(gmail_service, alt_email, forward_subject, body_new)
-                if alt_source == "fallback":
-                    add_status_label(gmail_service, message_id, LABEL_REVIEW_NAME)
-                print(f"✉️ Rechazo desviado a {alt_email} (fuente={alt_source}) | {radicado}")
-            else:
+        def attempt_rejection_send(destination: str, send_operation) -> bool:
+            try:
+                send_operation()
+                return True
+            except Exception as error:
+                logger.error("❌ Falló envío de rechazo a %s: %s", destination, error)
+                return False
+
+        if not ALT_RECIPIENT_ENABLED:
+            if is_no_reply_sender(sender_email):
                 print(f"⏭️ Remitente es no-reply, se omite respuesta | {radicado} | {sender_email}")
+            else:
+                print(f"✉️ Respondiendo rechazo en el mismo hilo | {radicado} | to={sender_email}")
+                sent = attempt_rejection_send(
+                    sender_email,
+                    lambda: send_reply_email(gmail_service, msg, sender_email, subject_reply, body_reply),
+                )
+                if sent:
+                    print(f"✅ Respuesta de rechazo enviada | {radicado}")
         else:
-            print(f"✉️ Respondiendo rechazo en el mismo hilo | {radicado} | to={sender_email}")
-            send_reply_email(gmail_service, msg, sender_email, subject_reply, body_reply)
-            print(f"✅ Respuesta de rechazo enviada | {radicado}")
+            tech_provider = is_tech_provider(subject, sender_email, bool(xmls)) or is_no_reply_sender(sender_email)
+            if tech_provider:
+                xml_bytes = xmls[0].data if xmls else None
+                alt_email, alt_source, should_redirect = decide_rejection_recipient(
+                    sender_email=sender_email,
+                    enabled=ALT_RECIPIENT_ENABLED,
+                    xml_bytes=xml_bytes,
+                    subject=subject,
+                    catalog=catalog,
+                    fallback_email=ALT_FALLBACK_EMAIL,
+                )
+                if should_redirect and alt_email:
+                    body_new = f"{body_reply}\nCorreo original: {subject}\n"
+                    original_attachments: List[Dict[str, object]] = []
+                    for attachment in attachments:
+                        attachment_id = attachment.get("attachmentId")
+                        if not attachment_id:
+                            continue
+                        filename = str(attachment.get("filename") or "adjunto")
+                        try:
+                            attachment_data = gmail_download_attachment_bytes(
+                                gmail_service,
+                                message_id,
+                                attachment_id,
+                            )
+                        except Exception as e:
+                            logger.warning("No pude descargar adjunto original %s para reenviarlo: %s", filename, e)
+                            continue
+                        original_attachments.append(
+                            {
+                                "filename": filename,
+                                "mime_type": attachment.get("mimeType") or "application/octet-stream",
+                                "data": attachment_data,
+                            }
+                        )
+
+                    forward_subject = f"Rechazo de facturación - {subject} (ID: {radicado})"
+                    attachments_size = sum(len(item["data"]) for item in original_attachments)
+                    if attachments_size > 20 * 1024 * 1024:
+                        body_new += "\nLa factura no se reenvió por superar el tamaño permitido.\n"
+                        logger.warning(
+                            "Adjuntos de rechazo superan 20 MB; se envía solo texto a %s | %s",
+                            alt_email,
+                            radicado,
+                        )
+                        sent = attempt_rejection_send(
+                            alt_email,
+                            lambda: send_new_email(gmail_service, alt_email, forward_subject, body_new),
+                        )
+                    elif original_attachments:
+                        sent = attempt_rejection_send(
+                            alt_email,
+                            lambda: send_forward_with_attachments(
+                                gmail_service,
+                                alt_email,
+                                forward_subject,
+                                body_new,
+                                original_attachments,
+                            ),
+                        )
+                    else:
+                        sent = attempt_rejection_send(
+                            alt_email,
+                            lambda: send_new_email(gmail_service, alt_email, forward_subject, body_new),
+                        )
+                    if alt_source == "fallback":
+                        add_status_label(gmail_service, message_id, LABEL_REVIEW_NAME)
+                    if sent:
+                        print(f"✉️ Rechazo desviado a {alt_email} (fuente={alt_source}) | {radicado}")
+                else:
+                    print(f"⏭️ Remitente es no-reply, se omite respuesta | {radicado} | {sender_email}")
+            else:
+                print(f"✉️ Respondiendo rechazo en el mismo hilo | {radicado} | to={sender_email}")
+                sent = attempt_rejection_send(
+                    sender_email,
+                    lambda: send_reply_email(gmail_service, msg, sender_email, subject_reply, body_reply),
+                )
+                if sent:
+                    print(f"✅ Respuesta de rechazo enviada | {radicado}")
         state_mark_replied(state, message_id)
         state_add_processed(state, message_id)
         save_state(state, account_id)
