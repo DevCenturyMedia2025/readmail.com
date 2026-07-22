@@ -2010,6 +2010,7 @@ def send_whatsapp_alert(mensaje: str) -> None:
             "Procesar correo": "procesar",
             "Token": "token",
             "Configuración": "config",
+            "Rebote": "rebote",
         }.get(area, area.lower() or "general")
         if not should_send_whatsapp(
             _WHATSAPP_ALERT_CACHE,
@@ -2076,6 +2077,69 @@ def es_correo_antiguo(internal_date_ms, ahora_ms, max_dias) -> bool:
     return antiguedad_ms > limite_ms
 
 
+def is_bounce_message(payload: Dict, from_header: str, subject: str) -> bool:
+    sender_text = normalize_text(from_header)
+    subject_text = normalize_text(subject)
+    sender_patterns = ("mailer-daemon", "postmaster", "mail delivery")
+    subject_patterns = (
+        "delivery status notification",
+        "undelivered mail",
+        "mail delivery failed",
+        "returned to sender",
+        "failure notice",
+        "no such user",
+    )
+    if any(pattern in sender_text for pattern in sender_patterns):
+        return True
+    if any(pattern in subject_text for pattern in subject_patterns):
+        return True
+
+    mime_type = normalize_text(str((payload or {}).get("mimeType") or ""))
+    content_type = normalize_text(get_header(payload or {}, "Content-Type"))
+    return mime_type.startswith("multipart/report") or (
+        "multipart/report" in content_type and "report-type=delivery-status" in content_type
+    )
+
+
+def _extract_bounce_parts_text(part: Dict) -> str:
+    texts = [decode_body(((part or {}).get("body") or {}).get("data"))]
+    texts.extend(str(header.get("value") or "") for header in ensure_list((part or {}).get("headers")))
+    texts.extend(_extract_bounce_parts_text(child) for child in ensure_list((part or {}).get("parts")))
+    return "\n".join(text for text in texts if text)
+
+
+def extract_bounce_info(msg: Dict, payload: Dict, body_text: str) -> Dict[str, Optional[str]]:
+    bounce_text = "\n".join(
+        text
+        for text in (
+            get_header(payload, "Subject"),
+            body_text,
+            str((msg or {}).get("snippet") or ""),
+            _extract_bounce_parts_text(payload),
+        )
+        if text
+    )
+    radicado_match = re.search(r"RAD-\d{8}-\d{6}", bounce_text, re.IGNORECASE)
+    recipient_match = re.search(
+        r"(?:Final-Recipient|Original-Recipient|To)\s*:\s*(?:rfc822;\s*)?<?([^\s<>;]+@[^\s<>;]+)>?",
+        bounce_text,
+        re.IGNORECASE,
+    )
+    return {
+        "radicado": radicado_match.group(0).upper() if radicado_match else None,
+        "failed_recipient": recipient_match.group(1).rstrip(".,") if recipient_match else None,
+    }
+
+
+def find_message_id_by_radicado(state: Dict, radicado: Optional[str]) -> Optional[str]:
+    if not radicado:
+        return None
+    mappings = state.get("message_radicados") or {}
+    if not isinstance(mappings, dict):
+        return None
+    return next((str(message_id) for message_id, value in mappings.items() if value == radicado), None)
+
+
 def safe_get_message_full(gmail_service, message_id: str) -> Optional[Dict]:
     try:
         return gmail_service.users().messages().get(userId="me", id=message_id, format="full").execute()
@@ -2106,6 +2170,35 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
         save_state(state, account_id)
         return
 
+    payload = msg.get("payload", {}) or {}
+    subject = get_header(payload, "Subject")
+    from_header = get_header(payload, "From")
+    body_text = extract_plain_text(payload)
+    snippet = msg.get("snippet", "") or ""
+
+    if is_bounce_message(payload, from_header, subject):
+        bounce_info = extract_bounce_info(msg, payload, body_text)
+        bounce_radicado = bounce_info["radicado"]
+        failed_recipient = bounce_info["failed_recipient"]
+        original_message_id = find_message_id_by_radicado(state, bounce_radicado)
+        review_message_id = original_message_id or message_id
+        try:
+            add_status_label(gmail_service, review_message_id, LABEL_REVIEW_NAME)
+        except Exception as error:
+            logger.error("❌ Falló etiquetado de rebote para Revisión Manual: %s", error)
+        send_whatsapp_alert(
+            f"[Rebote] El rechazo {bounce_radicado or 'desconocido'} rebotó — "
+            f"el correo {failed_recipient or 'destino'} no recibió el mensaje. "
+            "Enviado a Revisión Manual."
+        )
+        print(
+            f"↩️ REBOTE detectado | radicado={bounce_radicado} | "
+            f"destino_fallido={failed_recipient} -> Revisión Manual"
+        )
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
     ahora_ms = int(time.time() * 1000)
     if (
         LIMITE_ANTIGUEDAD_ENABLED
@@ -2121,11 +2214,6 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
         save_state(state, account_id)
         return
 
-    payload = msg.get("payload", {}) or {}
-    subject = get_header(payload, "Subject")
-    from_header = get_header(payload, "From")
-    body_text = extract_plain_text(payload)
-    snippet = msg.get("snippet", "") or ""
     sender_email = extract_sender_email(from_header)
 
     if not sender_email:
