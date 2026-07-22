@@ -1207,6 +1207,19 @@ def fetch_new_message_ids(
     return message_ids, latest_history_id
 
 
+def fetch_labeled_message_ids(gmail_service, label_id: str, max_results: int = 25) -> List[str]:
+    try:
+        resp = gmail_service.users().messages().list(
+            userId="me",
+            labelIds=[label_id],
+            maxResults=max_results,
+        ).execute()
+        return [item["id"] for item in ensure_list(resp.get("messages")) if item.get("id")]
+    except Exception as error:
+        logger.warning("No se pudieron buscar correos con la etiqueta %s: %s", label_id, error)
+        return []
+
+
 def update_last_history_id(latest_history_id: Optional[str], account_id: Optional[str] = None) -> None:
     if not latest_history_id:
         return
@@ -2460,13 +2473,27 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
                         continue
 
                     try:
-                        history_label_id = resolve_modo_pruebas_label_id(acc_gmail, account_id) if MODO_PRUEBAS else None
-                        new_ids, latest_history = fetch_new_message_ids(
-                            acc_gmail,
-                            last_history,
-                            label_id=history_label_id,
-                            include_label_added=MODO_PRUEBAS,
-                        )
+                        if MODO_PRUEBAS:
+                            history_label_id = resolve_modo_pruebas_label_id(acc_gmail, account_id)
+                            _, latest_history = fetch_new_message_ids(
+                                acc_gmail,
+                                last_history,
+                                label_id=history_label_id,
+                                include_label_added=True,
+                            )
+                            labeled_ids = fetch_labeled_message_ids(acc_gmail, history_label_id)
+                            processed_ids = state_get_processed_set(state)
+                            new_ids = [mid for mid in labeled_ids if mid not in processed_ids]
+                            print(
+                                f"🧪 MODO PRUEBAS: {len(new_ids)} correo(s) con etiqueta pruebas por procesar"
+                            )
+                        else:
+                            new_ids, latest_history = fetch_new_message_ids(
+                                acc_gmail,
+                                last_history,
+                                label_id=None,
+                                include_label_added=False,
+                            )
                     except HttpError as he:
                         if getattr(he, "resp", None) is not None and he.resp.status in (400, 404):
                             update_last_history_id(history_id, account_id)
