@@ -121,6 +121,8 @@ WATCH_LABEL_IDS = [x.strip() for x in env_first("GMAIL_LABEL_IDS", default="INBO
 GMAIL_SYSTEM_LABEL_IDS = {"INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED", "IMPORTANT", "UNREAD"}
 MODO_PRUEBAS = env_bool("MODO_PRUEBAS", default=False)
 ETIQUETA_PRUEBAS = env_first("ETIQUETA_PRUEBAS", default="pruebas")
+LIMITE_ANTIGUEDAD_ENABLED = env_bool("LIMITE_ANTIGUEDAD_ENABLED", default=True)
+MAX_DIAS_ANTIGUEDAD = env_int("MAX_DIAS_ANTIGUEDAD", default=5)
 
 SHEET_ID = env_first("CLIENT_SHEET_ID")
 SHEET_RANGE = env_first("CLIENT_SHEET_RANGE", default="Clientes!A:Z")
@@ -1970,6 +1972,17 @@ def decide_rejection_recipient(
 # ============================================================
 # MESSAGE PROCESSING
 # ============================================================
+def es_correo_antiguo(internal_date_ms, ahora_ms, max_dias) -> bool:
+    if internal_date_ms is None or internal_date_ms == "":
+        return False
+    try:
+        antiguedad_ms = float(ahora_ms) - float(internal_date_ms)
+        limite_ms = float(max_dias) * 24 * 60 * 60 * 1000
+    except (TypeError, ValueError):
+        return False
+    return antiguedad_ms > limite_ms
+
+
 def safe_get_message_full(gmail_service, message_id: str) -> Optional[Dict]:
     try:
         return gmail_service.users().messages().get(userId="me", id=message_id, format="full").execute()
@@ -1996,6 +2009,21 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
 
     msg = safe_get_message_full(gmail_service, message_id)
     if not msg:
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
+    ahora_ms = int(time.time() * 1000)
+    if (
+        LIMITE_ANTIGUEDAD_ENABLED
+        and not MODO_PRUEBAS
+        and es_correo_antiguo(msg.get("internalDate"), ahora_ms, MAX_DIAS_ANTIGUEDAD)
+    ):
+        apply_single_status_label(gmail_service, message_id, LABEL_REVIEW_NAME, archive=ARCHIVE_REVIEW)
+        print(
+            f"🕒 Correo con más de {MAX_DIAS_ANTIGUEDAD} días -> "
+            f"REVISIÓN MANUAL, no se responde | {radicado}"
+        )
         state_add_processed(state, message_id)
         save_state(state, account_id)
         return
