@@ -36,6 +36,8 @@ import os
 import os.path
 import re
 import time
+import urllib.parse
+import urllib.request
 import zipfile
 import unicodedata
 from dataclasses import dataclass, field
@@ -123,6 +125,12 @@ MODO_PRUEBAS = env_bool("MODO_PRUEBAS", default=False)
 ETIQUETA_PRUEBAS = env_first("ETIQUETA_PRUEBAS", default="pruebas")
 LIMITE_ANTIGUEDAD_ENABLED = env_bool("LIMITE_ANTIGUEDAD_ENABLED", default=True)
 MAX_DIAS_ANTIGUEDAD = env_int("MAX_DIAS_ANTIGUEDAD", default=5)
+WHATSAPP_ALERT_ENABLED = env_bool("WHATSAPP_ALERT_ENABLED", default=False)
+WHATSAPP_PHONE = env_first("WHATSAPP_PHONE", default="")
+WHATSAPP_APIKEY = env_first("WHATSAPP_APIKEY", default="")
+WHATSAPP_COOLDOWN_MIN = env_int("WHATSAPP_COOLDOWN_MIN", default=15)
+
+_WHATSAPP_ALERT_CACHE: Dict[str, float] = {}
 
 SHEET_ID = env_first("CLIENT_SHEET_ID")
 SHEET_RANGE = env_first("CLIENT_SHEET_RANGE", default="Clientes!A:Z")
@@ -1940,7 +1948,50 @@ def should_send_token_alert(last_sent_ts: Optional[float], now: float, cooldown_
     return (now - last_sent) >= cooldown_hours * 60 * 60
 
 
+def should_send_whatsapp(cache: Dict[str, float], mensaje_key: str, ahora: float, cooldown_min: int) -> bool:
+    last_sent = cache.get(mensaje_key)
+    if last_sent is not None and (ahora - last_sent) < cooldown_min * 60:
+        return False
+    cache[mensaje_key] = ahora
+    return True
+
+
+def send_whatsapp_alert(mensaje: str) -> None:
+    try:
+        if not WHATSAPP_ALERT_ENABLED or not WHATSAPP_PHONE or not WHATSAPP_APIKEY:
+            logger.debug("Alerta WhatsApp deshabilitada o sin configuración completa")
+            return
+
+        area = mensaje.partition("]")[0].lstrip("[")
+        mensaje_key = {
+            "Loop Pub/Sub": "loop",
+            "Procesar correo": "procesar",
+            "Token": "token",
+            "Configuración": "config",
+        }.get(area, area.lower() or "general")
+        if not should_send_whatsapp(
+            _WHATSAPP_ALERT_CACHE,
+            mensaje_key,
+            time.time(),
+            WHATSAPP_COOLDOWN_MIN,
+        ):
+            logger.debug("Alerta WhatsApp omitida por cooldown: %s", mensaje_key)
+            return
+
+        texto = f"🚨 ReadMail: {mensaje}"[:250]
+        url = (
+            "https://api.callmebot.com/whatsapp.php"
+            f"?phone={urllib.parse.quote(WHATSAPP_PHONE)}"
+            f"&text={urllib.parse.quote(texto)}"
+            f"&apikey={urllib.parse.quote(WHATSAPP_APIKEY)}"
+        )
+        urllib.request.urlopen(url, timeout=10)
+    except Exception as error:
+        logger.warning("⚠️ No se pudo enviar alerta WhatsApp: %s", error)
+
+
 def send_token_alert(gmail_service, to_email: str, failed_account: str) -> None:
+    send_whatsapp_alert(f"[Token] El token de {failed_account} se venció, requiere reactivación")
     if not to_email:
         print(f"⚠️ TOKEN_ALERT_EMAIL vacío; no se envía alerta de token para {failed_account}")
         return
@@ -2427,6 +2478,7 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
                 except Exception as e:
                     should_ack = False
                     print(f"❌ Error procesando evento Pub/Sub: {e}")
+                    send_whatsapp_alert(f"[Procesar correo] Falló el procesamiento de un correo: {e}")
                 finally:
                     if not should_ack:
                         print("↩️ Evento no confirmado; Pub/Sub lo reintentará.")
@@ -2448,6 +2500,7 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
             break
         except Exception as e:
             print(f"❌ Error en loop Pub/Sub: {e}")
+            send_whatsapp_alert(f"[Loop Pub/Sub] El programa tuvo un error y reintentará: {e}")
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
@@ -2524,7 +2577,20 @@ def main() -> None:
         authorize_account(args.authorize_account)
         return
 
-    if not GCP_PROJECT_ID or not PUBSUB_SUBSCRIPTION_ID or not PUBSUB_TOPIC_FULL:
+    missing_config = [
+        name
+        for name, value in (
+            ("GCP_PROJECT_ID", GCP_PROJECT_ID),
+            ("PUBSUB_SUBSCRIPTION", PUBSUB_SUBSCRIPTION_ID),
+            ("PUBSUB_TOPIC_FULL", PUBSUB_TOPIC_FULL),
+        )
+        if not value
+    ]
+    if missing_config:
+        missing_names = ", ".join(missing_config)
+        send_whatsapp_alert(
+            f"[Configuración] Falta {missing_names} en el .env, el programa no puede iniciar"
+        )
         raise RuntimeError("Faltan env vars: GCP_PROJECT_ID, PUBSUB_SUBSCRIPTION, PUBSUB_TOPIC_FULL.")
 
     if MODO_PRUEBAS:
