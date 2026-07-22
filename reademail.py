@@ -2221,7 +2221,10 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
                             lambda: send_new_email(gmail_service, alt_email, forward_subject, body_new),
                         )
                     if alt_source == "fallback":
-                        add_status_label(gmail_service, message_id, LABEL_REVIEW_NAME)
+                        try:
+                            add_status_label(gmail_service, message_id, LABEL_REVIEW_NAME)
+                        except Exception as error:
+                            logger.error("❌ Falló etiquetado: %s", error)
                     if sent:
                         print(f"✉️ Rechazo desviado a {alt_email} (fuente={alt_source}) | {radicado}")
                 else:
@@ -2262,8 +2265,11 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
         print(f"⏭️ Remitente es no-reply, se omite respuesta | {radicado} | {sender_email}")
     else:
         print(f"✉️ Respondiendo aprobación en el mismo hilo | {radicado} | to={sender_email}")
-        send_reply_email(gmail_service, msg, sender_email, approved_subject, approved_body)
-        print(f"✅ Respuesta de aprobación enviada | {radicado}")
+        try:
+            send_reply_email(gmail_service, msg, sender_email, approved_subject, approved_body)
+            print(f"✅ Respuesta de aprobación enviada | {radicado}")
+        except Exception as error:
+            logger.error("❌ Falló envío de aprobación a %s: %s", sender_email, error)
     state_mark_replied(state, message_id)
     state_add_processed(state, message_id)
     save_state(state, account_id)

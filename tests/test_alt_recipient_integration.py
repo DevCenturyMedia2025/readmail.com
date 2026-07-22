@@ -1,6 +1,6 @@
 import pytest
 
-from app.models import ClientRecord
+from app.models import ClientMatchResult, ClientRecord
 from app.utils.text import normalize_alnum, normalize_nit
 import reademail
 from reademail import UnifiedFile, decide_rejection_recipient
@@ -116,6 +116,8 @@ def _run_rejected_message(
     with_xml=False,
     send_error=None,
     attachment_size=0,
+    label_error=None,
+    approved=False,
 ):
     payload = {
         "headers": [
@@ -137,6 +139,10 @@ def _run_rejected_message(
         if send_error:
             raise send_error
 
+    def record_label(*args, **kwargs):
+        if label_error:
+            raise label_error
+
     monkeypatch.setattr(reademail, "ALT_RECIPIENT_ENABLED", enabled)
     monkeypatch.setattr(reademail, "ALT_FALLBACK_EMAIL", "fallback@example.com")
     monkeypatch.setattr(reademail, "load_state", lambda account_id=None: state)
@@ -146,10 +152,16 @@ def _run_rejected_message(
     monkeypatch.setattr(reademail, "build_unified_files", lambda service, message_id, attachments: (files, [], []))
     monkeypatch.setattr(reademail, "gmail_download_attachment_bytes", lambda *args: b"x" * attachment_size)
     monkeypatch.setattr(reademail, "apply_single_status_label", lambda *args, **kwargs: None)
-    monkeypatch.setattr(reademail, "add_status_label", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reademail, "add_status_label", record_label)
     monkeypatch.setattr(reademail, "send_reply_email", record_reply)
     monkeypatch.setattr(reademail, "send_new_email", lambda *args: calls["new"].append(args))
     monkeypatch.setattr(reademail, "send_forward_with_attachments", lambda *args: calls["forward"].append(args))
+    if approved:
+        client = _record("ACME", "123456789", "contacto@acme.test")
+        monkeypatch.setattr(reademail, "validate_electronic_invoice_minimum", lambda *args: [])
+        monkeypatch.setattr(reademail, "detect_order", lambda pdfs: True)
+        monkeypatch.setattr(reademail, "identify_client_in_order_pdfs", lambda pdfs, catalog: ClientMatchResult(record=client))
+        monkeypatch.setattr(reademail, "detect_ok_compras", lambda pdfs: True)
 
     reademail.process_message(object(), object(), "message-1", [])
     return calls
@@ -237,3 +249,40 @@ def test_adjuntos_mayores_a_20_mb_envian_solo_texto_con_nota(monkeypatch, caplog
     assert len(calls["new"]) == 1
     assert "La factura no se reenvió por superar el tamaño permitido." in calls["new"][0][3]
     assert "Adjuntos de rechazo superan 20 MB" in caplog.text
+
+
+def test_fallo_de_etiquetado_fallback_no_reenvia_en_segundo_ciclo(monkeypatch, caplog):
+    calls = _run_rejected_message(
+        monkeypatch,
+        "noreply@example.com",
+        "Factura marzo",
+        enabled=True,
+        label_error=RuntimeError("Gmail labels caído"),
+    )
+
+    assert len(calls["new"]) == 1
+    assert calls["state"]["replied_message_ids"] == ["message-1"]
+    assert "❌ Falló etiquetado: Gmail labels caído" in caplog.text
+
+    reademail.process_message(object(), object(), "message-1", [])
+    assert len(calls["new"]) == 1
+
+
+def test_fallo_de_envio_de_aprobacion_no_responde_en_segundo_ciclo(monkeypatch, caplog):
+    calls = _run_rejected_message(
+        monkeypatch,
+        "juan@empresa.com",
+        "Factura marzo",
+        enabled=False,
+        with_xml=True,
+        send_error=RuntimeError("SMTP caído"),
+        approved=True,
+    )
+
+    assert len(calls["reply"]) == 1
+    assert calls["state"]["replied_message_ids"] == ["message-1"]
+    assert calls["state"]["processed_message_ids"] == ["message-1"]
+    assert "❌ Falló envío de aprobación a juan@empresa.com: SMTP caído" in caplog.text
+
+    reademail.process_message(object(), object(), "message-1", [])
+    assert len(calls["reply"]) == 1
