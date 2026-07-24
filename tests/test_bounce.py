@@ -90,7 +90,6 @@ def test_process_message_rebote_etiqueta_original_antes_del_filtro_de_adjuntos(m
     payload = _payload("MAILER-DAEMON@example.com", "Undelivered Mail", bounce_body)
     state = {"message_radicados": {"msg-original": "RAD-20260722-000003"}}
     status_labels = []
-    added_labels = []
     whatsapp = []
 
     monkeypatch.setattr(reademail, "load_state", lambda account_id=None: state)
@@ -103,12 +102,9 @@ def test_process_message_rebote_etiqueta_original_antes_del_filtro_de_adjuntos(m
     monkeypatch.setattr(
         reademail,
         "apply_single_status_label",
-        lambda service, message_id, label: status_labels.append((message_id, label)),
-    )
-    monkeypatch.setattr(
-        reademail,
-        "add_status_label",
-        lambda service, message_id, label: added_labels.append((message_id, label)),
+        lambda service, message_id, label, archive=False: status_labels.append(
+            (message_id, label, archive)
+        ),
     )
     monkeypatch.setattr(
         reademail,
@@ -118,8 +114,10 @@ def test_process_message_rebote_etiqueta_original_antes_del_filtro_de_adjuntos(m
 
     reademail.process_message(object(), object(), "msg-rebote", [], account_id="cuenta@example.com")
 
-    assert status_labels == [("msg-original", reademail.LABEL_REVIEW_NAME)]
-    assert added_labels == [("msg-rebote", reademail.LABEL_REVIEW_NAME)]
+    assert status_labels == [
+        ("msg-original", reademail.LABEL_REVIEW_NAME, False),
+        ("msg-rebote", reademail.LABEL_REVIEW_NAME, reademail.ARCHIVE_REVIEW),
+    ]
     assert state["processed_message_ids"] == ["msg-rebote"]
     assert whatsapp[0][0].startswith("[Rebote] El rechazo RAD-20260722-000003 rebotó")
     assert "Cuenta: cuenta@example.com. Factura movida a Revisión Manual." in whatsapp[0][0]

@@ -1067,17 +1067,6 @@ def apply_single_status_label(gmail_service, message_id: str, label_name: str, a
     ).execute()
 
 
-def add_status_label(gmail_service, message_id: str, label_name: str) -> None:
-    label_id = ensure_label_exists(gmail_service, label_name)
-    if not label_id:
-        return
-    gmail_service.users().messages().modify(
-        userId="me",
-        id=message_id,
-        body={"addLabelIds": [label_id], "removeLabelIds": []},
-    ).execute()
-
-
 # endregion
 # region 👀 Gmail Watch e historial
 # ============================================================
@@ -2188,7 +2177,12 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
             except Exception as error:
                 logger.error("❌ Falló re-etiquetado del original: %s", error)
         try:
-            add_status_label(gmail_service, message_id, LABEL_REVIEW_NAME)
+            apply_single_status_label(
+                gmail_service,
+                message_id,
+                LABEL_REVIEW_NAME,
+                archive=ARCHIVE_REVIEW,
+            )
         except Exception as error:
             logger.error("❌ Falló etiquetado del rebote para Revisión Manual: %s", error)
         cuenta_afectada = account_id or "cuenta única"
@@ -2448,7 +2442,12 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
                         )
                     if alt_source == "fallback":
                         try:
-                            add_status_label(gmail_service, message_id, LABEL_REVIEW_NAME)
+                            apply_single_status_label(
+                                gmail_service,
+                                message_id,
+                                LABEL_REVIEW_NAME,
+                                archive=ARCHIVE_REVIEW,
+                            )
                         except Exception as error:
                             logger.error("❌ Falló etiquetado: %s", error)
                     if sent:

@@ -132,15 +132,23 @@ def _run_rejected_message(
     attachment = {"attachmentId": "attachment-1", "filename": "factura.pdf"} if attachment_size else {}
     state = {}
     saved_states = []
-    calls = {"reply": [], "new": [], "forward": [], "state": state, "saved_states": saved_states}
+    calls = {
+        "reply": [],
+        "new": [],
+        "forward": [],
+        "status_labels": [],
+        "state": state,
+        "saved_states": saved_states,
+    }
 
     def record_reply(*args):
         calls["reply"].append(args)
         if send_error:
             raise send_error
 
-    def record_label(*args, **kwargs):
-        if label_error:
+    def record_label(service, message_id, label_name, archive=False):
+        calls["status_labels"].append((message_id, label_name, archive))
+        if label_error and label_name == reademail.LABEL_REVIEW_NAME:
             raise label_error
 
     monkeypatch.setattr(reademail, "ALT_RECIPIENT_ENABLED", enabled)
@@ -151,8 +159,7 @@ def _run_rejected_message(
     monkeypatch.setattr(reademail, "collect_attachments", lambda payload: [attachment])
     monkeypatch.setattr(reademail, "build_unified_files", lambda service, message_id, attachments: (files, [], []))
     monkeypatch.setattr(reademail, "gmail_download_attachment_bytes", lambda *args: b"x" * attachment_size)
-    monkeypatch.setattr(reademail, "apply_single_status_label", lambda *args, **kwargs: None)
-    monkeypatch.setattr(reademail, "add_status_label", record_label)
+    monkeypatch.setattr(reademail, "apply_single_status_label", record_label)
     monkeypatch.setattr(reademail, "send_reply_email", record_reply)
     monkeypatch.setattr(reademail, "send_new_email", lambda *args: calls["new"].append(args))
     monkeypatch.setattr(reademail, "send_forward_with_attachments", lambda *args: calls["forward"].append(args))
@@ -195,6 +202,10 @@ def test_no_reply_sin_xml_flag_on_usa_flujo_de_desvio(monkeypatch):
 
     assert calls["reply"] == []
     assert len(calls["new"]) == 1
+    assert calls["status_labels"] == [
+        ("message-1", reademail.LABEL_REJECTED_NAME, reademail.ARCHIVE_REJECTED),
+        ("message-1", reademail.LABEL_REVIEW_NAME, reademail.ARCHIVE_REVIEW),
+    ]
 
 
 @pytest.mark.parametrize(
