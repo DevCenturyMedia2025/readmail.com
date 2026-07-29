@@ -24,30 +24,43 @@ def _sheets_service_with_values(*responses):
     return service
 
 
-def test_load_admin_lookup_combina_administrativas_y_caja_menor(monkeypatch):
+def test_load_admin_lookup_combina_administrativas_y_caja_menor(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
     monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
     service = _sheets_service_with_values(
-        [["NIT", "Nombre"], ["900.123.456-7", "ACME S.A.S."], ["", "Sin NIT Admin"]],
-        [["NIT", "Nombre"], ["800765432", "Proveedor Caja"], ["", "Sin NIT Caja"]],
+        [["Nit", "Proveedor"], ["900.123.456-7", "ACME S.A.S."], ["", "Sin NIT Admin"]],
+        [["Nit", "Nombre"], ["", "Proveedor Caja"], ["", "Sin NIT Caja"]],
     )
 
     lookup = load_admin_lookup(service)
 
     assert lookup == AdminLookup(
-        admin_nits={"9001234567", "800765432"},
+        admin_nits={"900123456", "9001234567"},
         admin_names={"acme sas", "proveedor caja", "sin nit admin", "sin nit caja"},
         admin_rows_sin_nit={
             "sin nit admin": ("Administrativas", 3),
+            "proveedor caja": ("CajaMenor", 2),
             "sin nit caja": ("CajaMenor", 3),
         },
     )
     assert service.spreadsheets.return_value.values.return_value.get.call_args_list == [
-        call(spreadsheetId="sheet-123", range="Administrativas!A:B"),
-        call(spreadsheetId="sheet-123", range="CajaMenor!A:B"),
+        call(
+            spreadsheetId="sheet-123",
+            range="Administrativas!A:B",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ),
+        call(
+            spreadsheetId="sheet-123",
+            range="CajaMenor!A:B",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ),
     ]
+    assert "📄 Administrativas: 1 NIT, 2 nombres" in caplog.text
+    assert "📄 CajaMenor: 0 NIT, 2 nombres" in caplog.text
 
 
-def test_load_admin_lookup_tolera_una_hoja_inaccesible(monkeypatch):
+def test_load_admin_lookup_tolera_una_hoja_inaccesible(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
     monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
     service = MagicMock()
     execute = service.spreadsheets.return_value.values.return_value.get.return_value.execute
@@ -58,6 +71,71 @@ def test_load_admin_lookup_tolera_una_hoja_inaccesible(monkeypatch):
     assert lookup.admin_nits == {"901234567"}
     assert lookup.admin_names == {"caja uno"}
     assert lookup.admin_rows_sin_nit == {}
+    assert "⚠️ No pude leer la hoja Administrativas: sin hoja" in caplog.text
+
+
+@pytest.mark.parametrize("nit_value", [860009999.0, "860009999.0"])
+def test_load_admin_lookup_normaliza_nit_float_sin_decimal_extra(monkeypatch, nit_value):
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = _sheets_service_with_values(
+        [["Nit", "Proveedor"], [nit_value, "Proveedor Numérico"]],
+        [],
+    )
+
+    lookup = load_admin_lookup(service)
+
+    assert lookup.admin_nits == {"860009999"}
+    assert "8600099990" not in lookup.admin_nits
+
+
+def test_load_admin_lookup_detecta_columnas_por_contenido_si_cambia_el_orden(monkeypatch):
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = _sheets_service_with_values(
+        [["Proveedor", "Nit"], ["Proveedor Invertido", "901234567"]],
+        [],
+    )
+
+    lookup = load_admin_lookup(service)
+
+    assert lookup.admin_nits == {"901234567"}
+    assert lookup.admin_names == {"proveedor invertido"}
+
+
+def test_nit_con_dv_indexa_forma_completa_y_sin_dv(monkeypatch):
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = _sheets_service_with_values(
+        [["Nit", "Proveedor"], ["900111222-3", "ZETA S.A.S"]],
+        [],
+    )
+    lookup = load_admin_lookup(service)
+
+    assert lookup.admin_nits == {"900111222", "9001112223"}
+    assert is_administrativa_by_subject(
+        "Fwd: 900111222;ZETA S.A.S;FAC;01",
+        lookup.admin_nits,
+        lookup.admin_names,
+    ) is True
+
+
+def test_nit_sin_dv_indexa_solo_nueve_digitos_y_no_colisiona(monkeypatch):
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = _sheets_service_with_values(
+        [["Nit", "Proveedor"], ["900111222", "ZETA S.A.S"]],
+        [],
+    )
+    lookup = load_admin_lookup(service)
+
+    assert lookup.admin_nits == {"900111222"}
+    assert is_administrativa_by_subject(
+        "900111222;ZETA S.A.S;FAC;01",
+        lookup.admin_nits,
+        lookup.admin_names,
+    ) is True
+    assert is_administrativa_by_subject(
+        "900111223;OTRO PROVEEDOR;FAC;01",
+        lookup.admin_nits,
+        set(),
+    ) is False
 
 
 @pytest.mark.parametrize(

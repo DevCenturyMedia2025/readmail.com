@@ -32,6 +32,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import os.path
 import re
@@ -149,6 +150,7 @@ ADMIN_NAME_HEADER_LABELS = {
     "cliente",
     "empresa",
     "proveedor",
+    "proverdor",
     "tercero",
     "beneficiario",
     "entidad",
@@ -749,36 +751,109 @@ def normalize_admin_name(value: str) -> str:
     return re.sub(r"(?<=[a-z])\.(?=[a-z]|$|[^a-z0-9])", "", normalized)
 
 
+def _normalize_admin_nit_cell(value) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+
+    if isinstance(value, int):
+        raw_value = str(value)
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return ""
+        raw_value = str(int(value))
+    else:
+        raw_value = str(value).strip()
+        decimal_match = re.fullmatch(r"([+-]?\d+)\.0+", raw_value)
+        if decimal_match:
+            raw_value = decimal_match.group(1)
+
+    normalized_nit = normalize_nit(raw_value)
+    if len(normalized_nit) < 6:
+        return ""
+
+    alnum_characters = re.findall(r"[a-z0-9]", normalize_text(raw_value))
+    if not alnum_characters:
+        return ""
+    numeric_ratio = sum(character.isdigit() for character in alnum_characters) / len(alnum_characters)
+    return normalized_nit if numeric_ratio >= 0.70 else ""
+
+
+def _normalize_admin_name_cell(value) -> str:
+    if value is None or isinstance(value, (bool, int, float)):
+        return ""
+    normalized_name = normalize_admin_name(str(value))
+    if not re.search(r"[a-z]", normalized_name):
+        return ""
+    return normalized_name if len(normalize_alnum(normalized_name)) >= 4 else ""
+
+
+def _admin_nit_index_forms(normalized_nit: str) -> Set[str]:
+    """
+    Genera las claves exactas de búsqueda para un NIT leído de la hoja.
+
+    Nueve dígitos se conservan tal cual. Diez dígitos se indexan completos y
+    también sin el último dígito, tratado como posible DV. Las demás longitudes
+    válidas conservan únicamente su forma completa.
+    """
+    forms = {normalized_nit}
+    if len(normalized_nit) == 10:
+        forms.add(normalized_nit[:9])
+    return forms
+
+
+def _looks_like_admin_header_row(row: List[object]) -> bool:
+    normalized_cells = {normalize_text(str(value)) for value in row if value is not None}
+    return bool(normalized_cells & (ADMIN_NIT_HEADER_LABELS | ADMIN_NAME_HEADER_LABELS))
+
+
 def _admin_lookup_from_values(
-    values: List[List[str]],
+    values: List[List[object]],
     tab: str,
     admin_nits: Set[str],
     admin_names: Set[str],
     admin_rows_sin_nit: Dict[str, Tuple[str, int]],
-) -> None:
+) -> Tuple[int, int]:
     if not values:
-        return
+        return 0, 0
 
-    first_row = [normalize_text(str(value)) for value in values[0]]
-    has_header = bool(first_row) and (
-        first_row[0] in ADMIN_NIT_HEADER_LABELS
-        or (len(first_row) > 1 and first_row[1] in ADMIN_NAME_HEADER_LABELS)
-    )
+    has_header = _looks_like_admin_header_row(values[0])
+    detected_nits: Set[str] = set()
+    detected_names: Set[str] = set()
     for row_number, row in enumerate(values, start=1):
         if has_header and row_number == 1:
             continue
         if not row:
             continue
-        raw_nit = str(row[0]).strip() if len(row) > 0 else ""
-        nit = normalize_nit(raw_nit)
-        name = normalize_admin_name(str(row[1])) if len(row) > 1 else ""
-        if len(nit) >= 6:
-            admin_nits.add(nit)
-        if len(normalize_alnum(name)) >= 4:
+
+        nit = ""
+        nit_cell_index: Optional[int] = None
+        for cell_index, cell_value in enumerate(row):
+            candidate_nit = _normalize_admin_nit_cell(cell_value)
+            if candidate_nit:
+                nit = candidate_nit
+                nit_cell_index = cell_index
+                break
+
+        name = ""
+        for cell_index, cell_value in enumerate(row):
+            if cell_index == nit_cell_index:
+                continue
+            candidate_name = _normalize_admin_name_cell(cell_value)
+            if candidate_name:
+                name = candidate_name
+                break
+
+        if nit:
+            detected_nits.add(nit)
+            admin_nits.update(_admin_nit_index_forms(nit))
+        if name:
+            detected_names.add(name)
             admin_names.add(name)
-            # La fila 1 nunca es destino de escritura: puede ser un rótulo no reconocido.
-            if not raw_nit and row_number > 1:
+            first_cell_is_empty = not row or row[0] is None or not str(row[0]).strip()
+            # Auto-fill escribe en A: solo se registra una fila si A está realmente vacía.
+            if not nit and first_cell_is_empty and row_number > 1:
                 admin_rows_sin_nit.setdefault(name, (tab, row_number))
+    return len(detected_nits), len(detected_names)
 
 
 def load_admin_lookup(sheets_service) -> AdminLookup:
@@ -796,11 +871,26 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
             result = sheets_service.spreadsheets().values().get(
                 spreadsheetId=SHEET_ID,
                 range=sheet_range,
+                valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
             values = result.get("values", []) or []
-            _admin_lookup_from_values(values, tab, admin_nits, admin_names, admin_rows_sin_nit)
+            tab_nits: Set[str] = set()
+            tab_names: Set[str] = set()
+            tab_rows_sin_nit: Dict[str, Tuple[str, int]] = {}
+            tab_nit_count, tab_name_count = _admin_lookup_from_values(
+                values,
+                tab,
+                tab_nits,
+                tab_names,
+                tab_rows_sin_nit,
+            )
+            admin_nits.update(tab_nits)
+            admin_names.update(tab_names)
+            for name, location in tab_rows_sin_nit.items():
+                admin_rows_sin_nit.setdefault(name, location)
+            logger.info("📄 %s: %d NIT, %d nombres", tab, tab_nit_count, tab_name_count)
         except Exception as error:
-            logger.warning("⚠️ No pude cargar la hoja %s: %s", tab, error)
+            logger.warning("⚠️ No pude leer la hoja %s: %s", tab, error)
 
     print(
         f"✅ Listas administrativas cargadas: {len(admin_nits)} NIT y "
