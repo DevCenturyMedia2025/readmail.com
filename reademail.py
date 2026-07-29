@@ -856,6 +856,38 @@ def _admin_lookup_from_values(
     return len(detected_nits), len(detected_names)
 
 
+def _normalize_sheet_title(title: str) -> str:
+    """Normaliza un título solo para localizarlo, sin modificar su forma real."""
+    return strip_accents((title or "").strip()).lower()
+
+
+def _quote_sheet_title(title: str) -> str:
+    """Cita un título para notación A1 y duplica las comillas simples internas."""
+    escaped_title = str(title).replace("'", "''")
+    return f"'{escaped_title}'"
+
+
+def resolve_sheet_titles(sheets_service, spreadsheet_id: str) -> Dict[str, str]:
+    """Devuelve títulos reales de pestañas indexados sin espacios extremos, caso ni acentos."""
+    try:
+        result = sheets_service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets.properties.title",
+        ).execute()
+        resolved_titles: Dict[str, str] = {}
+        for sheet in (result or {}).get("sheets", []) or []:
+            title = (sheet.get("properties", {}) or {}).get("title")
+            if not isinstance(title, str):
+                continue
+            normalized_title = _normalize_sheet_title(title)
+            if normalized_title:
+                resolved_titles[normalized_title] = title
+        return resolved_titles
+    except Exception as error:
+        logger.warning("⚠️ No pude resolver los títulos de las pestañas: %s", error)
+        return {}
+
+
 def load_admin_lookup(sheets_service) -> AdminLookup:
     admin_nits: Set[str] = set()
     admin_names: Set[str] = set()
@@ -865,8 +897,17 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
         print("⚠️ CLIENT_SHEET_ID vacío. Se seguirá sin listas Administrativas/CajaMenor.")
         return AdminLookup(admin_nits, admin_names, admin_rows_sin_nit)
 
-    for tab in ADMIN_SHEET_TABS:
-        sheet_range = f"{tab}!A:B"
+    resolved_titles = resolve_sheet_titles(sheets_service, SHEET_ID)
+    for expected_tab in ADMIN_SHEET_TABS:
+        real_title = resolved_titles.get(_normalize_sheet_title(expected_tab))
+        if not real_title:
+            logger.warning(
+                "⚠️ No encontré la pestaña parecida a '%s' en el spreadsheet",
+                expected_tab,
+            )
+            continue
+
+        sheet_range = f"{_quote_sheet_title(real_title)}!A:B"
         try:
             result = sheets_service.spreadsheets().values().get(
                 spreadsheetId=SHEET_ID,
@@ -879,7 +920,7 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
             tab_rows_sin_nit: Dict[str, Tuple[str, int]] = {}
             tab_nit_count, tab_name_count = _admin_lookup_from_values(
                 values,
-                tab,
+                real_title,
                 tab_nits,
                 tab_names,
                 tab_rows_sin_nit,
@@ -888,9 +929,9 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
             admin_names.update(tab_names)
             for name, location in tab_rows_sin_nit.items():
                 admin_rows_sin_nit.setdefault(name, location)
-            logger.info("📄 %s: %d NIT, %d nombres", tab, tab_nit_count, tab_name_count)
+            logger.info("📄 %s: %d NIT, %d nombres", real_title, tab_nit_count, tab_name_count)
         except Exception as error:
-            logger.warning("⚠️ No pude leer la hoja %s: %s", tab, error)
+            logger.warning("⚠️ No pude leer la hoja %s: %s", real_title, error)
 
     print(
         f"✅ Listas administrativas cargadas: {len(admin_nits)} NIT y "
@@ -954,7 +995,7 @@ def should_auto_fill_admin_nit(
 
 
 def _admin_nit_cell_is_empty(sheets_service, tab: str, row_number: int) -> bool:
-    cell_range = f"{tab}!A{row_number}"
+    cell_range = f"{_quote_sheet_title(tab)}!A{row_number}"
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID,
@@ -968,7 +1009,7 @@ def _admin_nit_cell_is_empty(sheets_service, tab: str, row_number: int) -> bool:
 
 
 def write_nit_to_admin_sheet(sheets_service, tab: str, row_number: int, nit: str) -> bool:
-    cell_range = f"{tab}!A{row_number}"
+    cell_range = f"{_quote_sheet_title(tab)}!A{row_number}"
     try:
         sheets_service.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,

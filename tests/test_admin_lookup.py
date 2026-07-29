@@ -11,17 +11,54 @@ from reademail import (
     extract_nit_and_name_from_dian_subject,
     is_administrativa_by_subject,
     load_admin_lookup,
+    resolve_sheet_titles,
     should_auto_fill_admin_nit,
     write_nit_to_admin_sheet,
 )
 
 
-def _sheets_service_with_values(*responses):
+def _sheets_service_with_values(*responses, titles=None):
     service = MagicMock()
+    titles = list(titles or reademail.ADMIN_SHEET_TABS)
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [{"properties": {"title": title}} for title in titles]
+    }
     service.spreadsheets.return_value.values.return_value.get.return_value.execute.side_effect = [
         {"values": values} for values in responses
     ]
     return service
+
+
+def test_resolve_sheet_titles_mapea_al_titulo_real_normalizado():
+    service = MagicMock()
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [
+            {"properties": {"title": "ADMINISTRÁTIVAS "}},
+            {"properties": {"title": "cajamenor"}},
+        ]
+    }
+
+    titles = resolve_sheet_titles(service, "sheet-123")
+
+    assert titles == {
+        "administrativas": "ADMINISTRÁTIVAS ",
+        "cajamenor": "cajamenor",
+    }
+    service.spreadsheets.return_value.get.assert_called_once_with(
+        spreadsheetId="sheet-123",
+        fields="sheets.properties.title",
+    )
+
+
+def test_resolve_sheet_titles_devuelve_vacio_si_fallan_metadatos(caplog):
+    caplog.set_level(logging.WARNING)
+    service = MagicMock()
+    service.spreadsheets.return_value.get.return_value.execute.side_effect = RuntimeError(
+        "sin metadatos"
+    )
+
+    assert resolve_sheet_titles(service, "sheet-123") == {}
+    assert "⚠️ No pude resolver los títulos de las pestañas: sin metadatos" in caplog.text
 
 
 def test_load_admin_lookup_combina_administrativas_y_caja_menor(monkeypatch, caplog):
@@ -30,6 +67,7 @@ def test_load_admin_lookup_combina_administrativas_y_caja_menor(monkeypatch, cap
     service = _sheets_service_with_values(
         [["Nit", "Proveedor"], ["900.123.456-7", "ACME S.A.S."], ["", "Sin NIT Admin"]],
         [["Nit", "Nombre"], ["", "Proveedor Caja"], ["", "Sin NIT Caja"]],
+        titles=["Administrativas ", "CajaMenor"],
     )
 
     lookup = load_admin_lookup(service)
@@ -38,7 +76,7 @@ def test_load_admin_lookup_combina_administrativas_y_caja_menor(monkeypatch, cap
         admin_nits={"900123456", "9001234567"},
         admin_names={"acme sas", "proveedor caja", "sin nit admin", "sin nit caja"},
         admin_rows_sin_nit={
-            "sin nit admin": ("Administrativas", 3),
+            "sin nit admin": ("Administrativas ", 3),
             "proveedor caja": ("CajaMenor", 2),
             "sin nit caja": ("CajaMenor", 3),
         },
@@ -46,16 +84,16 @@ def test_load_admin_lookup_combina_administrativas_y_caja_menor(monkeypatch, cap
     assert service.spreadsheets.return_value.values.return_value.get.call_args_list == [
         call(
             spreadsheetId="sheet-123",
-            range="Administrativas!A:B",
+            range="'Administrativas '!A:B",
             valueRenderOption="UNFORMATTED_VALUE",
         ),
         call(
             spreadsheetId="sheet-123",
-            range="CajaMenor!A:B",
+            range="'CajaMenor'!A:B",
             valueRenderOption="UNFORMATTED_VALUE",
         ),
     ]
-    assert "📄 Administrativas: 1 NIT, 2 nombres" in caplog.text
+    assert "📄 Administrativas : 1 NIT, 2 nombres" in caplog.text
     assert "📄 CajaMenor: 0 NIT, 2 nombres" in caplog.text
 
 
@@ -63,6 +101,12 @@ def test_load_admin_lookup_tolera_una_hoja_inaccesible(monkeypatch, caplog):
     caplog.set_level(logging.WARNING)
     monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
     service = MagicMock()
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [
+            {"properties": {"title": "Administrativas"}},
+            {"properties": {"title": "CajaMenor"}},
+        ]
+    }
     execute = service.spreadsheets.return_value.values.return_value.get.return_value.execute
     execute.side_effect = [RuntimeError("sin hoja"), {"values": [["901234567", "Caja Uno"]]}]
 
@@ -72,6 +116,30 @@ def test_load_admin_lookup_tolera_una_hoja_inaccesible(monkeypatch, caplog):
     assert lookup.admin_names == {"caja uno"}
     assert lookup.admin_rows_sin_nit == {}
     assert "⚠️ No pude leer la hoja Administrativas: sin hoja" in caplog.text
+
+
+def test_load_admin_lookup_omite_pestana_no_encontrada(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = _sheets_service_with_values(
+        [["Nit", "Nombre"], ["", "Caja Uno"]],
+        titles=["CajaMenor"],
+    )
+
+    lookup = load_admin_lookup(service)
+
+    assert lookup.admin_nits == set()
+    assert lookup.admin_names == {"caja uno"}
+    assert lookup.admin_rows_sin_nit == {"caja uno": ("CajaMenor", 2)}
+    assert (
+        "⚠️ No encontré la pestaña parecida a 'Administrativas' en el spreadsheet"
+        in caplog.text
+    )
+    service.spreadsheets.return_value.values.return_value.get.assert_called_once_with(
+        spreadsheetId="sheet-123",
+        range="'CajaMenor'!A:B",
+        valueRenderOption="UNFORMATTED_VALUE",
+    )
 
 
 @pytest.mark.parametrize("nit_value", [860009999.0, "860009999.0"])
@@ -262,12 +330,12 @@ def test_write_nit_to_admin_sheet_actualiza_rango_y_valor(monkeypatch):
     monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
     service = MagicMock()
 
-    result = write_nit_to_admin_sheet(service, "CajaMenor", 7, "900123456")
+    result = write_nit_to_admin_sheet(service, "Caja'Menor ", 7, "900123456")
 
     assert result is True
     service.spreadsheets.return_value.values.return_value.update.assert_called_once_with(
         spreadsheetId="sheet-123",
-        range="CajaMenor!A7",
+        range="'Caja''Menor '!A7",
         valueInputOption="RAW",
         body={"values": [["900123456"]]},
     )
@@ -287,7 +355,7 @@ def test_auto_fill_nit_respeta_candado_y_actualiza_lookup(monkeypatch):
     service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
         "values": []
     }
-    lookup = AdminLookup(set(), {"acme sas"}, {"acme sas": ("Administrativas", 2)})
+    lookup = AdminLookup(set(), {"acme sas"}, {"acme sas": ("Administrativas ", 2)})
 
     result = auto_fill_nit_from_subject(
         service,
@@ -303,7 +371,13 @@ def test_auto_fill_nit_respeta_candado_y_actualiza_lookup(monkeypatch):
     assert lookup.admin_rows_sin_nit == {}
     service.spreadsheets.return_value.values.return_value.get.assert_called_once_with(
         spreadsheetId="sheet-123",
-        range="Administrativas!A2",
+        range="'Administrativas '!A2",
+    )
+    service.spreadsheets.return_value.values.return_value.update.assert_called_once_with(
+        spreadsheetId="sheet-123",
+        range="'Administrativas '!A2",
+        valueInputOption="RAW",
+        body={"values": [["900123456"]]},
     )
 
 
