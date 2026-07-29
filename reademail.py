@@ -47,7 +47,7 @@ from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import parseaddr
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -135,6 +135,7 @@ _WHATSAPP_ALERT_CACHE: Dict[str, float] = {}
 SHEET_ID = env_first("CLIENT_SHEET_ID")
 SHEET_RANGE = env_first("CLIENT_SHEET_RANGE", default="Clientes!A:Z")
 CLIENT_LOOKUP_RANGE = env_first("CLIENT_LOOKUP_RANGE", default="Clientes!A:Z")
+ADMIN_SHEET_TABS = ("Administrativas", "CajaMenor")
 ACTIVE_VALUES = {x.strip().lower() for x in env_first("ACTIVE_VALUES", default="activo,active,si,yes,1,true").split(",") if x.strip()}
 
 # Etiquetas nuevas con fallback al .env viejo
@@ -244,6 +245,11 @@ class ClientMatchResult:
     record: Optional[ClientRecord] = None
     raw: Optional[str] = None
     source: str = ""
+
+
+class AdminLookup(NamedTuple):
+    admin_nits: Set[str]
+    admin_names: Set[str]
 
 
 @dataclass
@@ -712,6 +718,64 @@ def load_client_catalog(sheets_service) -> List[ClientRecord]:
 
     print(f"✅ Catálogo/lista blanca cargado: {len(catalog)} registros desde {', '.join(ranges)}")
     return catalog
+
+
+def _admin_lookup_from_values(values: List[List[str]], admin_nits: Set[str], admin_names: Set[str]) -> None:
+    if not values:
+        return
+
+    first_row = [normalize_text(str(value)) for value in values[0]]
+    has_header = bool(first_row) and (
+        first_row[0] in {"nit", "nit cliente", "tax id"}
+        or (len(first_row) > 1 and first_row[1] in {"nombre", "razon social", "cliente", "empresa"})
+    )
+    data_rows = values[1:] if has_header else values
+
+    for row in data_rows:
+        if not row:
+            continue
+        nit = normalize_nit(str(row[0])) if len(row) > 0 else ""
+        name = normalize_alnum(str(row[1])) if len(row) > 1 else ""
+        if len(nit) >= 6:
+            admin_nits.add(nit)
+        if len(name) >= 4:
+            admin_names.add(name)
+
+
+def load_admin_lookup(sheets_service) -> AdminLookup:
+    admin_nits: Set[str] = set()
+    admin_names: Set[str] = set()
+
+    if not SHEET_ID:
+        print("⚠️ CLIENT_SHEET_ID vacío. Se seguirá sin listas Administrativas/CajaMenor.")
+        return AdminLookup(admin_nits, admin_names)
+
+    for tab in ADMIN_SHEET_TABS:
+        sheet_range = f"{tab}!A:B"
+        try:
+            result = sheets_service.spreadsheets().values().get(
+                spreadsheetId=SHEET_ID,
+                range=sheet_range,
+            ).execute()
+            values = result.get("values", []) or []
+            _admin_lookup_from_values(values, admin_nits, admin_names)
+        except Exception as error:
+            logger.warning("⚠️ No pude cargar la hoja %s: %s", tab, error)
+
+    print(
+        f"✅ Listas administrativas cargadas: {len(admin_nits)} NIT y "
+        f"{len(admin_names)} nombres desde {', '.join(ADMIN_SHEET_TABS)}"
+    )
+    return AdminLookup(admin_nits, admin_names)
+
+
+def is_administrativa_by_subject(subject: str, admin_nits: Set[str], admin_names: Set[str]) -> bool:
+    subject_nit = normalize_nit(subject)
+    if any(len(nit) >= 6 and nit in subject_nit for nit in admin_nits):
+        return True
+
+    normalized_subject = normalize_alnum(subject)
+    return any(len(name) >= 4 and name in normalized_subject for name in admin_names)
 
 
 def find_client_by_nit(nit: str, catalog: List[ClientRecord]) -> Optional[ClientRecord]:
@@ -2140,7 +2204,14 @@ def safe_get_message_full(gmail_service, message_id: str) -> Optional[Dict]:
         raise
 
 
-def process_message(gmail_service, sheets_service, message_id: str, catalog: List[ClientRecord], account_id: Optional[str] = None) -> None:
+def process_message(
+    gmail_service,
+    sheets_service,
+    message_id: str,
+    catalog: List[ClientRecord],
+    account_id: Optional[str] = None,
+    admin_lookup: Optional[AdminLookup] = None,
+) -> None:
     state = load_state(account_id)
 
     if state_has_replied(state, message_id):
@@ -2240,16 +2311,23 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
     xmls = [f for f in unified_files if f.is_xml]
     images = [f for f in unified_files if f.is_image]
 
-    # 2) Ruta administrativa por NIT o nombre en lista blanca
+    # 2) Ruta administrativa por NIT/nombre del catálogo o por asunto en hojas administrativas
     nit = extract_nit_from_text(combined_email_text)
     matched_nit_client = find_client_by_nit(nit, catalog) if nit else None
     if not matched_nit_client:
         matched_nit = find_client_by_nit_in_text(combined_email_text, catalog)
         if matched_nit:
             nit, matched_nit_client = matched_nit
-    if matched_nit_client:
+    current_admin_lookup = admin_lookup or AdminLookup(set(), set())
+    matched_admin_subject = is_administrativa_by_subject(
+        subject,
+        current_admin_lookup.admin_nits,
+        current_admin_lookup.admin_names,
+    )
+    if matched_nit_client or matched_admin_subject:
         apply_single_status_label(gmail_service, message_id, LABEL_ADMIN_NAME, archive=ARCHIVE_ADMIN)
-        print(f"🟦 ADMINISTRATIVA | {radicado} | NIT={nit} | cliente={matched_nit_client.name}")
+        matched_name = matched_nit_client.name if matched_nit_client else "asunto administrativo"
+        print(f"🟦 ADMINISTRATIVA | {radicado} | NIT={nit} | cliente={matched_name}")
         state_add_processed(state, message_id)
         save_state(state, account_id)
         return
@@ -2520,7 +2598,7 @@ def process_message(gmail_service, sheets_service, message_id: str, catalog: Lis
 def listen_pubsub(accounts: Dict[str, Dict]) -> None:
     """
     accounts: dict con clave = email en minúsculas, valor = {
-        "gmail_service", "sheets_service", "catalog_data", "account_id"
+        "gmail_service", "sheets_service", "catalog_data", "admin_lookup", "account_id"
     }
     """
     subscriber = pubsub_v1.SubscriberClient(transport="rest")
@@ -2534,6 +2612,7 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
     def refresh_catalog_for(acc: Dict) -> None:
         try:
             acc["catalog_data"] = load_client_catalog(acc["sheets_service"])
+            acc["admin_lookup"] = load_admin_lookup(acc["sheets_service"])
             print(f"🔄 Catálogo actualizado ({acc['account_id'] or 'cuenta única'}): {len(acc['catalog_data'])} registros")
         except Exception as e:
             print(f"⚠️ No pude refrescar el catálogo: {e}")
@@ -2634,7 +2713,14 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
                         print(f"🔔 Evento ({email_address}) historyId={history_id} -> {len(new_ids)} mensaje(s)")
                         refresh_catalog_for(acc)
                         for mid in new_ids:
-                            process_message(acc_gmail, acc_sheets, mid, acc["catalog_data"], account_id)
+                            process_message(
+                                acc_gmail,
+                                acc_sheets,
+                                mid,
+                                acc["catalog_data"],
+                                account_id,
+                                acc["admin_lookup"],
+                            )
 
                 except Exception as e:
                     should_ack = False
@@ -2780,6 +2866,7 @@ def main() -> None:
             print(f"   ✅ Autenticado como: {profile.get('emailAddress')}")
             print(f"   📁 State: {_state_file_for_account(email_lc)}")
             catalog = load_client_catalog(sheets_svc)
+            admin_lookup = load_admin_lookup(sheets_svc)
             ensure_status_labels(gmail_svc)
             print("   Etiquetas verificadas/creadas")
             ensure_gmail_watch(gmail_svc, account_id=email_lc)
@@ -2787,6 +2874,7 @@ def main() -> None:
                 "gmail_service": gmail_svc,
                 "sheets_service": sheets_svc,
                 "catalog_data": catalog,
+                "admin_lookup": admin_lookup,
                 "account_id": email_lc,
             }
         alert_failed_token_accounts(failed_token_accounts, accounts)
@@ -2812,6 +2900,7 @@ def main() -> None:
         print("✅ Autenticado como:", profile.get("emailAddress"))
         print("🗂️ STATE_FILE:", STATE_FILE)
         client_catalog = load_client_catalog(sheets_service)
+        admin_lookup = load_admin_lookup(sheets_service)
         ensure_status_labels(gmail_service)
         print("Etiquetas verificadas/creadas")
         ensure_gmail_watch(gmail_service)
@@ -2820,6 +2909,7 @@ def main() -> None:
                 "gmail_service": gmail_service,
                 "sheets_service": sheets_service,
                 "catalog_data": client_catalog,
+                "admin_lookup": admin_lookup,
                 "account_id": None,
             }
         }
