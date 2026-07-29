@@ -115,6 +115,24 @@ def test_nit_con_dv_indexa_forma_completa_y_sin_dv(monkeypatch):
         lookup.admin_nits,
         lookup.admin_names,
     ) is True
+    assert is_administrativa_by_subject(
+        "Fwd: 9001112223;ZETA S.A.S;FAC;01",
+        lookup.admin_nits,
+        lookup.admin_names,
+    ) is True
+
+
+@pytest.mark.parametrize(
+    ("nit", "expected"),
+    [
+        ("123456", {"123456"}),
+        ("900111222", {"900111222"}),
+        ("9001112223", {"900111222", "9001112223"}),
+        ("90011122234", {"90011122234"}),
+    ],
+)
+def test_admin_nit_index_forms_solo_recorta_posible_dv_de_diez_digitos(nit, expected):
+    assert reademail._admin_nit_index_forms(nit) == expected
 
 
 def test_nit_sin_dv_indexa_solo_nueve_digitos_y_no_colisiona(monkeypatch):
