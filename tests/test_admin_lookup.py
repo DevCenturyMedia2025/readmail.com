@@ -1,6 +1,8 @@
 import logging
 from unittest.mock import MagicMock, call
 
+import pytest
+
 import reademail
 from reademail import (
     AdminLookup,
@@ -33,10 +35,10 @@ def test_load_admin_lookup_combina_administrativas_y_caja_menor(monkeypatch):
 
     assert lookup == AdminLookup(
         admin_nits={"9001234567", "800765432"},
-        admin_names={"acmesas", "proveedorcaja", "sinnitadmin", "sinnitcaja"},
+        admin_names={"acme sas", "proveedor caja", "sin nit admin", "sin nit caja"},
         admin_rows_sin_nit={
-            "sinnitadmin": ("Administrativas", 3),
-            "sinnitcaja": ("CajaMenor", 3),
+            "sin nit admin": ("Administrativas", 3),
+            "sin nit caja": ("CajaMenor", 3),
         },
     )
     assert service.spreadsheets.return_value.values.return_value.get.call_args_list == [
@@ -54,21 +56,42 @@ def test_load_admin_lookup_tolera_una_hoja_inaccesible(monkeypatch):
     lookup = load_admin_lookup(service)
 
     assert lookup.admin_nits == {"901234567"}
-    assert lookup.admin_names == {"cajauno"}
+    assert lookup.admin_names == {"caja uno"}
     assert lookup.admin_rows_sin_nit == {}
 
 
-def test_is_administrativa_by_subject_coincide_por_nit_o_nombre():
-    nits = {"900123456"}
-    names = {"acmesas"}
+@pytest.mark.parametrize(
+    ("subject", "admin_nits", "admin_names"),
+    [
+        ("8991234567;PROVEEDOR;FAC;01", {"123456"}, set()),
+        ("901234567;PROVEEDOR;FAC;01;0123", {"567012"}, set()),
+        ("Factura ACMEDICA SAS", set(), {"acme"}),
+        ("Distribuidora Rioseco Ltda", set(), {"rios"}),
+        ("ACMES ASOCIADOS", set(), {"acmesas"}),
+    ],
+)
+def test_is_administrativa_by_subject_rechaza_falsos_positivos(
+    subject, admin_nits, admin_names
+):
+    assert is_administrativa_by_subject(subject, admin_nits, admin_names) is False
 
-    assert is_administrativa_by_subject("900123456;OTRO PROVEEDOR;FAC;01", nits, names) is True
-    assert is_administrativa_by_subject("Factura mensual - ACME S.A.S.", nits, names) is True
+
+@pytest.mark.parametrize(
+    ("subject", "admin_nits", "admin_names"),
+    [
+        ("900123456;OTRO PROVEEDOR;FAC;01", {"900123456"}, set()),
+        ("900123456;ACME SAS;FAC;01", set(), {"acme sas"}),
+    ],
+)
+def test_is_administrativa_by_subject_acepta_coincidencia_exacta(
+    subject, admin_nits, admin_names
+):
+    assert is_administrativa_by_subject(subject, admin_nits, admin_names) is True
 
 
 def test_is_administrativa_by_subject_no_busca_en_cuerpo():
     nits = {"900123456"}
-    names = {"acmesas"}
+    names = {"acme sas"}
 
     assert is_administrativa_by_subject("Factura mensual", nits, names) is False
 
@@ -77,7 +100,7 @@ def test_process_message_clasifica_por_nombre_administrativo_en_asunto(monkeypat
     payload = {
         "headers": [
             {"name": "From", "value": "proveedor@example.com"},
-            {"name": "Subject", "value": "Factura mensual - ACME S.A.S."},
+            {"name": "Subject", "value": "Factura mensual - ACME SAS"},
         ]
     }
     labels = []
@@ -110,7 +133,7 @@ def test_process_message_clasifica_por_nombre_administrativo_en_asunto(monkeypat
         object(),
         "message-1",
         [],
-        admin_lookup=AdminLookup(set(), {"acmesas"}, {}),
+        admin_lookup=AdminLookup(set(), {"acme sas"}, {}),
     )
 
     assert labels == [(reademail.LABEL_ADMIN_NAME, reademail.ARCHIVE_ADMIN)]
@@ -125,14 +148,14 @@ def test_extract_nit_and_name_from_dian_subject():
 
 
 def test_should_auto_fill_admin_nit_aplica_guardias():
-    rows = {"acmesas": ("Administrativas", 2)}
+    rows = {"acme sas": ("Administrativas", 2)}
 
-    assert should_auto_fill_admin_nit("900123456", "acmesas", rows, True, False, False) is True
-    assert should_auto_fill_admin_nit("900123456", "acmesas", rows, False, False, False) is False
-    assert should_auto_fill_admin_nit("900123456", "acmesas", rows, True, True, False) is False
-    assert should_auto_fill_admin_nit("900123456", "acmesas", rows, True, False, True) is False
-    assert should_auto_fill_admin_nit("12345", "acmesas", rows, True, False, False) is False
-    assert should_auto_fill_admin_nit("900123456", "nombreconnit", rows, True, False, False) is False
+    assert should_auto_fill_admin_nit("900123456", "acme sas", rows, True, False, False) is True
+    assert should_auto_fill_admin_nit("900123456", "acme sas", rows, False, False, False) is False
+    assert should_auto_fill_admin_nit("900123456", "acme sas", rows, True, True, False) is False
+    assert should_auto_fill_admin_nit("900123456", "acme sas", rows, True, False, True) is False
+    assert should_auto_fill_admin_nit("12345", "acme sas", rows, True, False, False) is False
+    assert should_auto_fill_admin_nit("900123456", "nombre con nit", rows, True, False, False) is False
 
 
 def test_write_nit_to_admin_sheet_actualiza_rango_y_valor(monkeypatch):
@@ -164,7 +187,7 @@ def test_auto_fill_nit_respeta_candado_y_actualiza_lookup(monkeypatch):
     service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
         "values": []
     }
-    lookup = AdminLookup(set(), {"acmesas"}, {"acmesas": ("Administrativas", 2)})
+    lookup = AdminLookup(set(), {"acme sas"}, {"acme sas": ("Administrativas", 2)})
 
     result = auto_fill_nit_from_subject(
         service,
@@ -190,7 +213,7 @@ def test_auto_fill_nit_no_sobrescribe_celda_con_valor(monkeypatch):
     service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
         "values": [["800999888"]]
     }
-    lookup = AdminLookup(set(), {"acmesas"}, {"acmesas": ("Administrativas", 2)})
+    lookup = AdminLookup(set(), {"acme sas"}, {"acme sas": ("Administrativas", 2)})
 
     result = auto_fill_nit_from_subject(
         service,
@@ -207,7 +230,7 @@ def test_auto_fill_nit_no_sobrescribe_celda_con_valor(monkeypatch):
 
 def test_auto_fill_nit_en_pruebas_solo_loguea(caplog):
     caplog.set_level(logging.INFO)
-    lookup = AdminLookup(set(), {"acmesas"}, {"acmesas": ("CajaMenor", 5)})
+    lookup = AdminLookup(set(), {"acme sas"}, {"acme sas": ("CajaMenor", 5)})
 
     result = auto_fill_nit_from_subject(
         object(),
@@ -220,3 +243,33 @@ def test_auto_fill_nit_en_pruebas_solo_loguea(caplog):
 
     assert result is False
     assert "🧪 habría escrito NIT 900123456 en CajaMenor!A5 (nombre=ACME SAS)" in caplog.text
+
+
+def test_auto_fill_flag_apagado_no_llama_api_sheets():
+    class SheetsServiceQueFalla:
+        def spreadsheets(self):
+            raise AssertionError("No debe llamar la API de Sheets")
+
+    lookup = AdminLookup(set(), {"acme sas"}, {"acme sas": ("Administrativas", 2)})
+
+    assert auto_fill_nit_from_subject(
+        SheetsServiceQueFalla(),
+        "900123456;ACME SAS;FAC;01;ACME SAS",
+        lookup,
+        enabled=False,
+        modo_pruebas=False,
+        dry_run=False,
+    ) is False
+
+
+def test_load_admin_lookup_no_habilita_escritura_en_fila_uno_sin_encabezado(monkeypatch):
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = _sheets_service_with_values(
+        [["", "Rótulo especial"], ["", "ACME SAS"]],
+        [],
+    )
+
+    lookup = load_admin_lookup(service)
+
+    assert "rotulo especial" not in lookup.admin_rows_sin_nit
+    assert lookup.admin_rows_sin_nit["acme sas"] == ("Administrativas", 2)

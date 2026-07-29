@@ -139,6 +139,20 @@ SHEET_ID = env_first("CLIENT_SHEET_ID")
 SHEET_RANGE = env_first("CLIENT_SHEET_RANGE", default="Clientes!A:Z")
 CLIENT_LOOKUP_RANGE = env_first("CLIENT_LOOKUP_RANGE", default="Clientes!A:Z")
 ADMIN_SHEET_TABS = ("Administrativas", "CajaMenor")
+ADMIN_NIT_HEADER_LABELS = {"nit", "nit cliente", "tax id", "identificacion", "identificación"}
+ADMIN_NAME_HEADER_LABELS = {
+    "nombre",
+    "nombre proveedor",
+    "nombre tercero",
+    "razon social",
+    "razón social",
+    "cliente",
+    "empresa",
+    "proveedor",
+    "tercero",
+    "beneficiario",
+    "entidad",
+}
 ACTIVE_VALUES = {x.strip().lower() for x in env_first("ACTIVE_VALUES", default="activo,active,si,yes,1,true").split(",") if x.strip()}
 
 # Etiquetas nuevas con fallback al .env viejo
@@ -736,8 +750,8 @@ def _admin_lookup_from_values(
 
     first_row = [normalize_text(str(value)) for value in values[0]]
     has_header = bool(first_row) and (
-        first_row[0] in {"nit", "nit cliente", "tax id"}
-        or (len(first_row) > 1 and first_row[1] in {"nombre", "razon social", "cliente", "empresa"})
+        first_row[0] in ADMIN_NIT_HEADER_LABELS
+        or (len(first_row) > 1 and first_row[1] in ADMIN_NAME_HEADER_LABELS)
     )
     for row_number, row in enumerate(values, start=1):
         if has_header and row_number == 1:
@@ -746,12 +760,13 @@ def _admin_lookup_from_values(
             continue
         raw_nit = str(row[0]).strip() if len(row) > 0 else ""
         nit = normalize_nit(raw_nit)
-        name = normalize_alnum(str(row[1])) if len(row) > 1 else ""
+        name = normalize_text(str(row[1])) if len(row) > 1 else ""
         if len(nit) >= 6:
             admin_nits.add(nit)
-        if len(name) >= 4:
+        if len(normalize_alnum(name)) >= 4:
             admin_names.add(name)
-            if not raw_nit:
+            # La fila 1 nunca es destino de escritura: puede ser un rótulo no reconocido.
+            if not raw_nit and row_number > 1:
                 admin_rows_sin_nit.setdefault(name, (tab, row_number))
 
 
@@ -784,12 +799,27 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
 
 
 def is_administrativa_by_subject(subject: str, admin_nits: Set[str], admin_names: Set[str]) -> bool:
-    subject_nit = normalize_nit(subject)
-    if any(len(nit) >= 6 and nit in subject_nit for nit in admin_nits):
+    subject_nits = {
+        normalize_nit(sequence)
+        for sequence in re.findall(r"\d+", subject or "")
+        if len(normalize_nit(sequence)) >= 6
+    }
+    normalized_admin_nits = {
+        normalize_nit(nit)
+        for nit in admin_nits
+        if len(normalize_nit(nit)) >= 6
+    }
+    if subject_nits & normalized_admin_nits:
         return True
 
-    normalized_subject = normalize_alnum(subject)
-    return any(len(name) >= 4 and name in normalized_subject for name in admin_names)
+    normalized_subject = normalize_text(subject)
+    for admin_name in admin_names:
+        normalized_name = normalize_text(admin_name)
+        if len(normalize_alnum(normalized_name)) < 4:
+            continue
+        if re.search(rf"\b{re.escape(normalized_name)}\b", normalized_subject):
+            return True
+    return False
 
 
 def extract_nit_and_name_from_dian_subject(subject: str) -> Tuple[Optional[str], Optional[str]]:
@@ -864,7 +894,7 @@ def auto_fill_nit_from_subject(
     dry_run = DRY_RUN if dry_run is None else dry_run
 
     nit, name = extract_nit_and_name_from_dian_subject(subject)
-    normalized_name = normalize_alnum(name or "")
+    normalized_name = normalize_text(name or "")
     normalized_nit = normalize_nit(nit or "")
     location = admin_lookup.admin_rows_sin_nit.get(normalized_name)
     is_candidate = bool(enabled and len(normalized_nit) >= 6 and location)
