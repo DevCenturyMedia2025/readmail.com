@@ -27,7 +27,7 @@ def _sheets_service_with_values(*responses):
 def test_load_admin_lookup_combina_administrativas_y_caja_menor(monkeypatch):
     monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
     service = _sheets_service_with_values(
-        [["NIT", "Nombre"], ["900.123.456-7", "ACME SAS"], ["", "Sin NIT Admin"]],
+        [["NIT", "Nombre"], ["900.123.456-7", "ACME S.A.S."], ["", "Sin NIT Admin"]],
         [["NIT", "Nombre"], ["800765432", "Proveedor Caja"], ["", "Sin NIT Caja"]],
     )
 
@@ -81,6 +81,10 @@ def test_is_administrativa_by_subject_rechaza_falsos_positivos(
     [
         ("900123456;OTRO PROVEEDOR;FAC;01", {"900123456"}, set()),
         ("900123456;ACME SAS;FAC;01", set(), {"acme sas"}),
+        ("Factura mensual - ACME S.A.S.", set(), {"acme s.a.s."}),
+        ("Cobro ACME LTDA. abril", set(), {"acme ltda."}),
+        ("Factura mensual - ACME S.A.S.", set(), {"acme sas"}),
+        ("Factura mensual - ACME SAS", set(), {"acme s.a.s."}),
     ],
 )
 def test_is_administrativa_by_subject_acepta_coincidencia_exacta(
@@ -100,7 +104,7 @@ def test_process_message_clasifica_por_nombre_administrativo_en_asunto(monkeypat
     payload = {
         "headers": [
             {"name": "From", "value": "proveedor@example.com"},
-            {"name": "Subject", "value": "Factura mensual - ACME SAS"},
+            {"name": "Subject", "value": "Factura mensual - ACME S.A.S."},
         ]
     }
     labels = []

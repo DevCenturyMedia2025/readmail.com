@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Programa de facturación BTL - versión ajustada al nuevo flujo
+Programa de facturación Century - versión ajustada al nuevo flujo
 
 Flujo implementado:
 1. Lee asunto y cuerpo.
@@ -738,6 +738,17 @@ def load_client_catalog(sheets_service) -> List[ClientRecord]:
     return catalog
 
 
+def normalize_admin_name(value: str) -> str:
+    """
+    Normaliza nombres administrativos conservando espacios y signos.
+
+    Solo elimina puntos precedidos por una letra para hacer equivalentes las
+    siglas puntuadas y no puntuadas: S.A.S. -> sas y LTDA. -> ltda.
+    """
+    normalized = normalize_text(value)
+    return re.sub(r"(?<=[a-z])\.(?=[a-z]|$|[^a-z0-9])", "", normalized)
+
+
 def _admin_lookup_from_values(
     values: List[List[str]],
     tab: str,
@@ -760,7 +771,7 @@ def _admin_lookup_from_values(
             continue
         raw_nit = str(row[0]).strip() if len(row) > 0 else ""
         nit = normalize_nit(raw_nit)
-        name = normalize_text(str(row[1])) if len(row) > 1 else ""
+        name = normalize_admin_name(str(row[1])) if len(row) > 1 else ""
         if len(nit) >= 6:
             admin_nits.add(nit)
         if len(normalize_alnum(name)) >= 4:
@@ -812,12 +823,12 @@ def is_administrativa_by_subject(subject: str, admin_nits: Set[str], admin_names
     if subject_nits & normalized_admin_nits:
         return True
 
-    normalized_subject = normalize_text(subject)
+    normalized_subject = normalize_admin_name(subject)
     for admin_name in admin_names:
-        normalized_name = normalize_text(admin_name)
+        normalized_name = normalize_admin_name(admin_name)
         if len(normalize_alnum(normalized_name)) < 4:
             continue
-        if re.search(rf"\b{re.escape(normalized_name)}\b", normalized_subject):
+        if re.search(rf"(?<!\w){re.escape(normalized_name)}(?!\w)", normalized_subject):
             return True
     return False
 
@@ -894,7 +905,7 @@ def auto_fill_nit_from_subject(
     dry_run = DRY_RUN if dry_run is None else dry_run
 
     nit, name = extract_nit_and_name_from_dian_subject(subject)
-    normalized_name = normalize_text(name or "")
+    normalized_name = normalize_admin_name(name or "")
     normalized_nit = normalize_nit(nit or "")
     location = admin_lookup.admin_rows_sin_nit.get(normalized_name)
     is_candidate = bool(enabled and len(normalized_nit) >= 6 and location)
