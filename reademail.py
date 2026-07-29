@@ -80,7 +80,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    # Este scope de escritura EXIGE re-autorizar todas las cuentas OAuth existentes.
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
 
@@ -123,6 +124,8 @@ WATCH_LABEL_IDS = [x.strip() for x in env_first("GMAIL_LABEL_IDS", default="INBO
 GMAIL_SYSTEM_LABEL_IDS = {"INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED", "IMPORTANT", "UNREAD"}
 MODO_PRUEBAS = env_bool("MODO_PRUEBAS", default=False)
 ETIQUETA_PRUEBAS = env_first("ETIQUETA_PRUEBAS", default="pruebas")
+DRY_RUN = env_bool("DRY_RUN", default=False)
+AUTO_FILL_NIT_ENABLED = env_bool("AUTO_FILL_NIT_ENABLED", default=False)
 LIMITE_ANTIGUEDAD_ENABLED = env_bool("LIMITE_ANTIGUEDAD_ENABLED", default=True)
 MAX_DIAS_ANTIGUEDAD = env_int("MAX_DIAS_ANTIGUEDAD", default=5)
 WHATSAPP_ALERT_ENABLED = env_bool("WHATSAPP_ALERT_ENABLED", default=False)
@@ -250,6 +253,7 @@ class ClientMatchResult:
 class AdminLookup(NamedTuple):
     admin_nits: Set[str]
     admin_names: Set[str]
+    admin_rows_sin_nit: Dict[str, Tuple[str, int]]
 
 
 @dataclass
@@ -720,7 +724,13 @@ def load_client_catalog(sheets_service) -> List[ClientRecord]:
     return catalog
 
 
-def _admin_lookup_from_values(values: List[List[str]], admin_nits: Set[str], admin_names: Set[str]) -> None:
+def _admin_lookup_from_values(
+    values: List[List[str]],
+    tab: str,
+    admin_nits: Set[str],
+    admin_names: Set[str],
+    admin_rows_sin_nit: Dict[str, Tuple[str, int]],
+) -> None:
     if not values:
         return
 
@@ -729,26 +739,30 @@ def _admin_lookup_from_values(values: List[List[str]], admin_nits: Set[str], adm
         first_row[0] in {"nit", "nit cliente", "tax id"}
         or (len(first_row) > 1 and first_row[1] in {"nombre", "razon social", "cliente", "empresa"})
     )
-    data_rows = values[1:] if has_header else values
-
-    for row in data_rows:
+    for row_number, row in enumerate(values, start=1):
+        if has_header and row_number == 1:
+            continue
         if not row:
             continue
-        nit = normalize_nit(str(row[0])) if len(row) > 0 else ""
+        raw_nit = str(row[0]).strip() if len(row) > 0 else ""
+        nit = normalize_nit(raw_nit)
         name = normalize_alnum(str(row[1])) if len(row) > 1 else ""
         if len(nit) >= 6:
             admin_nits.add(nit)
         if len(name) >= 4:
             admin_names.add(name)
+            if not raw_nit:
+                admin_rows_sin_nit.setdefault(name, (tab, row_number))
 
 
 def load_admin_lookup(sheets_service) -> AdminLookup:
     admin_nits: Set[str] = set()
     admin_names: Set[str] = set()
+    admin_rows_sin_nit: Dict[str, Tuple[str, int]] = {}
 
     if not SHEET_ID:
         print("⚠️ CLIENT_SHEET_ID vacío. Se seguirá sin listas Administrativas/CajaMenor.")
-        return AdminLookup(admin_nits, admin_names)
+        return AdminLookup(admin_nits, admin_names, admin_rows_sin_nit)
 
     for tab in ADMIN_SHEET_TABS:
         sheet_range = f"{tab}!A:B"
@@ -758,7 +772,7 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
                 range=sheet_range,
             ).execute()
             values = result.get("values", []) or []
-            _admin_lookup_from_values(values, admin_nits, admin_names)
+            _admin_lookup_from_values(values, tab, admin_nits, admin_names, admin_rows_sin_nit)
         except Exception as error:
             logger.warning("⚠️ No pude cargar la hoja %s: %s", tab, error)
 
@@ -766,7 +780,7 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
         f"✅ Listas administrativas cargadas: {len(admin_nits)} NIT y "
         f"{len(admin_names)} nombres desde {', '.join(ADMIN_SHEET_TABS)}"
     )
-    return AdminLookup(admin_nits, admin_names)
+    return AdminLookup(admin_nits, admin_names, admin_rows_sin_nit)
 
 
 def is_administrativa_by_subject(subject: str, admin_nits: Set[str], admin_names: Set[str]) -> bool:
@@ -776,6 +790,125 @@ def is_administrativa_by_subject(subject: str, admin_nits: Set[str], admin_names
 
     normalized_subject = normalize_alnum(subject)
     return any(len(name) >= 4 and name in normalized_subject for name in admin_names)
+
+
+def extract_nit_and_name_from_dian_subject(subject: str) -> Tuple[Optional[str], Optional[str]]:
+    fields = (subject or "").split(";")
+    if len(fields) < 3:
+        return None, None
+    raw_nit = fields[0].strip()
+    nit = normalize_nit(raw_nit)
+    name = fields[1].strip()
+    if len(nit) < 6 or not re.fullmatch(r"[0-9.\-\s]+", raw_nit) or not name:
+        return None, None
+    return nit, name
+
+
+def should_auto_fill_admin_nit(
+    nit: Optional[str],
+    normalized_name: str,
+    admin_rows_sin_nit: Dict[str, Tuple[str, int]],
+    enabled: bool,
+    modo_pruebas: bool,
+    dry_run: bool,
+) -> bool:
+    normalized_nit = normalize_nit(nit or "")
+    return bool(
+        enabled
+        and not modo_pruebas
+        and not dry_run
+        and len(normalized_nit) >= 6
+        and normalized_name in admin_rows_sin_nit
+    )
+
+
+def _admin_nit_cell_is_empty(sheets_service, tab: str, row_number: int) -> bool:
+    cell_range = f"{tab}!A{row_number}"
+    try:
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=cell_range,
+        ).execute()
+        values = result.get("values", []) or []
+        return not values or not values[0] or not str(values[0][0]).strip()
+    except Exception as error:
+        logger.error("❌ No pude verificar el candado de NIT en %s: %s", cell_range, error)
+        return False
+
+
+def write_nit_to_admin_sheet(sheets_service, tab: str, row_number: int, nit: str) -> bool:
+    cell_range = f"{tab}!A{row_number}"
+    try:
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=cell_range,
+            valueInputOption="RAW",
+            body={"values": [[nit]]},
+        ).execute()
+        return True
+    except Exception as error:
+        logger.error("❌ No pude escribir el NIT en %s: %s", cell_range, error)
+        return False
+
+
+def auto_fill_nit_from_subject(
+    sheets_service,
+    subject: str,
+    admin_lookup: AdminLookup,
+    enabled: Optional[bool] = None,
+    modo_pruebas: Optional[bool] = None,
+    dry_run: Optional[bool] = None,
+) -> bool:
+    enabled = AUTO_FILL_NIT_ENABLED if enabled is None else enabled
+    modo_pruebas = MODO_PRUEBAS if modo_pruebas is None else modo_pruebas
+    dry_run = DRY_RUN if dry_run is None else dry_run
+
+    nit, name = extract_nit_and_name_from_dian_subject(subject)
+    normalized_name = normalize_alnum(name or "")
+    normalized_nit = normalize_nit(nit or "")
+    location = admin_lookup.admin_rows_sin_nit.get(normalized_name)
+    is_candidate = bool(enabled and len(normalized_nit) >= 6 and location)
+
+    if is_candidate and (modo_pruebas or dry_run):
+        tab, row_number = location
+        logger.info(
+            "🧪 habría escrito NIT %s en %s!A%s (nombre=%s)",
+            normalized_nit,
+            tab,
+            row_number,
+            name,
+        )
+        return False
+
+    if not should_auto_fill_admin_nit(
+        normalized_nit,
+        normalized_name,
+        admin_lookup.admin_rows_sin_nit,
+        enabled,
+        modo_pruebas,
+        dry_run,
+    ):
+        return False
+
+    tab, row_number = location
+    if not _admin_nit_cell_is_empty(sheets_service, tab, row_number):
+        logger.warning("🔒 No se sobrescribe %s!A%s porque ya contiene un NIT.", tab, row_number)
+        admin_lookup.admin_rows_sin_nit.pop(normalized_name, None)
+        return False
+
+    if not write_nit_to_admin_sheet(sheets_service, tab, row_number, normalized_nit):
+        return False
+
+    admin_lookup.admin_rows_sin_nit.pop(normalized_name, None)
+    admin_lookup.admin_nits.add(normalized_nit)
+    logger.info(
+        "✍️ NIT %s auto-llenado en %s!A%s (nombre=%s)",
+        normalized_nit,
+        tab,
+        row_number,
+        name,
+    )
+    return True
 
 
 def find_client_by_nit(nit: str, catalog: List[ClientRecord]) -> Optional[ClientRecord]:
@@ -2312,13 +2445,15 @@ def process_message(
     images = [f for f in unified_files if f.is_image]
 
     # 2) Ruta administrativa por NIT/nombre del catálogo o por asunto en hojas administrativas
+    current_admin_lookup = admin_lookup or AdminLookup(set(), set(), {})
+    auto_fill_nit_from_subject(sheets_service, subject, current_admin_lookup)
+
     nit = extract_nit_from_text(combined_email_text)
     matched_nit_client = find_client_by_nit(nit, catalog) if nit else None
     if not matched_nit_client:
         matched_nit = find_client_by_nit_in_text(combined_email_text, catalog)
         if matched_nit:
             nit, matched_nit_client = matched_nit
-    current_admin_lookup = admin_lookup or AdminLookup(set(), set())
     matched_admin_subject = is_administrativa_by_subject(
         subject,
         current_admin_lookup.admin_nits,

@@ -190,7 +190,7 @@ def _run_single_event_listener(monkeypatch, modo_pruebas, labeled_ids, processed
     monkeypatch.setattr(reademail, "resolve_modo_pruebas_label_id", lambda *args: "Label_pruebas")
     monkeypatch.setattr(reademail, "fetch_new_message_ids", lambda *args, **kwargs: (set(), "200"))
     monkeypatch.setattr(reademail, "load_client_catalog", lambda service: [])
-    monkeypatch.setattr(reademail, "load_admin_lookup", lambda service: reademail.AdminLookup(set(), set()))
+    monkeypatch.setattr(reademail, "load_admin_lookup", lambda service: reademail.AdminLookup(set(), set(), {}))
 
     def fetch_labeled(*args, **kwargs):
         labeled_calls.append((args, kwargs))
@@ -207,7 +207,7 @@ def _run_single_event_listener(monkeypatch, modo_pruebas, labeled_ids, processed
             "gmail_service": object(),
             "sheets_service": object(),
             "catalog_data": [],
-            "admin_lookup": reademail.AdminLookup(set(), set()),
+            "admin_lookup": reademail.AdminLookup(set(), set(), {}),
             "account_id": "cuenta@example.com",
         }
     }

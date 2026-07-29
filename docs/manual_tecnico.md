@@ -64,7 +64,9 @@ El sistema solicita estos scopes:
 | `https://www.googleapis.com/auth/gmail.modify` | Modificar etiquetas y estado de mensajes. |
 | `https://www.googleapis.com/auth/gmail.readonly` | Leer mensajes y adjuntos. |
 | `https://www.googleapis.com/auth/gmail.send` | Enviar respuestas automáticas. |
-| `https://www.googleapis.com/auth/spreadsheets.readonly` | Leer catálogo de clientes en Google Sheets. |
+| `https://www.googleapis.com/auth/spreadsheets` | Leer catálogos y auto-completar NIT faltantes en Google Sheets. |
+
+> El cambio al scope de escritura exige volver a autorizar todas las cuentas OAuth existentes.
 
 ## 5. Variables de entorno
 

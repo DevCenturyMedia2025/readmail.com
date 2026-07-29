@@ -1,11 +1,16 @@
+import logging
 from unittest.mock import MagicMock, call
 
 import reademail
 from reademail import (
     AdminLookup,
     UnifiedFile,
+    auto_fill_nit_from_subject,
+    extract_nit_and_name_from_dian_subject,
     is_administrativa_by_subject,
     load_admin_lookup,
+    should_auto_fill_admin_nit,
+    write_nit_to_admin_sheet,
 )
 
 
@@ -20,15 +25,19 @@ def _sheets_service_with_values(*responses):
 def test_load_admin_lookup_combina_administrativas_y_caja_menor(monkeypatch):
     monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
     service = _sheets_service_with_values(
-        [["NIT", "Nombre"], ["900.123.456-7", "ACME SAS"]],
-        [["NIT", "Nombre"], ["800765432", "Proveedor Caja"]],
+        [["NIT", "Nombre"], ["900.123.456-7", "ACME SAS"], ["", "Sin NIT Admin"]],
+        [["NIT", "Nombre"], ["800765432", "Proveedor Caja"], ["", "Sin NIT Caja"]],
     )
 
     lookup = load_admin_lookup(service)
 
     assert lookup == AdminLookup(
         admin_nits={"9001234567", "800765432"},
-        admin_names={"acmesas", "proveedorcaja"},
+        admin_names={"acmesas", "proveedorcaja", "sinnitadmin", "sinnitcaja"},
+        admin_rows_sin_nit={
+            "sinnitadmin": ("Administrativas", 3),
+            "sinnitcaja": ("CajaMenor", 3),
+        },
     )
     assert service.spreadsheets.return_value.values.return_value.get.call_args_list == [
         call(spreadsheetId="sheet-123", range="Administrativas!A:B"),
@@ -46,6 +55,7 @@ def test_load_admin_lookup_tolera_una_hoja_inaccesible(monkeypatch):
 
     assert lookup.admin_nits == {"901234567"}
     assert lookup.admin_names == {"cajauno"}
+    assert lookup.admin_rows_sin_nit == {}
 
 
 def test_is_administrativa_by_subject_coincide_por_nit_o_nombre():
@@ -100,7 +110,113 @@ def test_process_message_clasifica_por_nombre_administrativo_en_asunto(monkeypat
         object(),
         "message-1",
         [],
-        admin_lookup=AdminLookup(set(), {"acmesas"}),
+        admin_lookup=AdminLookup(set(), {"acmesas"}, {}),
     )
 
     assert labels == [(reademail.LABEL_ADMIN_NAME, reademail.ARCHIVE_ADMIN)]
+
+
+def test_extract_nit_and_name_from_dian_subject():
+    assert extract_nit_and_name_from_dian_subject(
+        "900123456;ACME SAS;FAC;01;ACME SAS"
+    ) == ("900123456", "ACME SAS")
+    assert extract_nit_and_name_from_dian_subject("123456;EMPRESA;FAC") == ("123456", "EMPRESA")
+    assert extract_nit_and_name_from_dian_subject("Factura normal") == (None, None)
+
+
+def test_should_auto_fill_admin_nit_aplica_guardias():
+    rows = {"acmesas": ("Administrativas", 2)}
+
+    assert should_auto_fill_admin_nit("900123456", "acmesas", rows, True, False, False) is True
+    assert should_auto_fill_admin_nit("900123456", "acmesas", rows, False, False, False) is False
+    assert should_auto_fill_admin_nit("900123456", "acmesas", rows, True, True, False) is False
+    assert should_auto_fill_admin_nit("900123456", "acmesas", rows, True, False, True) is False
+    assert should_auto_fill_admin_nit("12345", "acmesas", rows, True, False, False) is False
+    assert should_auto_fill_admin_nit("900123456", "nombreconnit", rows, True, False, False) is False
+
+
+def test_write_nit_to_admin_sheet_actualiza_rango_y_valor(monkeypatch):
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = MagicMock()
+
+    result = write_nit_to_admin_sheet(service, "CajaMenor", 7, "900123456")
+
+    assert result is True
+    service.spreadsheets.return_value.values.return_value.update.assert_called_once_with(
+        spreadsheetId="sheet-123",
+        range="CajaMenor!A7",
+        valueInputOption="RAW",
+        body={"values": [["900123456"]]},
+    )
+
+
+def test_write_nit_to_admin_sheet_devuelve_false_si_falla(monkeypatch):
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = MagicMock()
+    service.spreadsheets.return_value.values.return_value.update.side_effect = RuntimeError("sin permisos")
+
+    assert write_nit_to_admin_sheet(service, "Administrativas", 4, "900123456") is False
+
+
+def test_auto_fill_nit_respeta_candado_y_actualiza_lookup(monkeypatch):
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = MagicMock()
+    service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+        "values": []
+    }
+    lookup = AdminLookup(set(), {"acmesas"}, {"acmesas": ("Administrativas", 2)})
+
+    result = auto_fill_nit_from_subject(
+        service,
+        "900123456;ACME SAS;FAC;01;ACME SAS",
+        lookup,
+        enabled=True,
+        modo_pruebas=False,
+        dry_run=False,
+    )
+
+    assert result is True
+    assert lookup.admin_nits == {"900123456"}
+    assert lookup.admin_rows_sin_nit == {}
+    service.spreadsheets.return_value.values.return_value.get.assert_called_once_with(
+        spreadsheetId="sheet-123",
+        range="Administrativas!A2",
+    )
+
+
+def test_auto_fill_nit_no_sobrescribe_celda_con_valor(monkeypatch):
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-123")
+    service = MagicMock()
+    service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+        "values": [["800999888"]]
+    }
+    lookup = AdminLookup(set(), {"acmesas"}, {"acmesas": ("Administrativas", 2)})
+
+    result = auto_fill_nit_from_subject(
+        service,
+        "900123456;ACME SAS;FAC;01;ACME SAS",
+        lookup,
+        enabled=True,
+        modo_pruebas=False,
+        dry_run=False,
+    )
+
+    assert result is False
+    service.spreadsheets.return_value.values.return_value.update.assert_not_called()
+
+
+def test_auto_fill_nit_en_pruebas_solo_loguea(caplog):
+    caplog.set_level(logging.INFO)
+    lookup = AdminLookup(set(), {"acmesas"}, {"acmesas": ("CajaMenor", 5)})
+
+    result = auto_fill_nit_from_subject(
+        object(),
+        "900123456;ACME SAS;FAC;01;ACME SAS",
+        lookup,
+        enabled=True,
+        modo_pruebas=True,
+        dry_run=False,
+    )
+
+    assert result is False
+    assert "🧪 habría escrito NIT 900123456 en CajaMenor!A5 (nombre=ACME SAS)" in caplog.text
