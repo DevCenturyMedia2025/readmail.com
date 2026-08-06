@@ -140,6 +140,7 @@ SHEET_ID = env_first("CLIENT_SHEET_ID")
 SHEET_RANGE = env_first("CLIENT_SHEET_RANGE", default="Clientes!A:Z")
 CLIENT_LOOKUP_RANGE = env_first("CLIENT_LOOKUP_RANGE", default="Clientes!A:Z")
 ADMIN_SHEET_TABS = ("Administrativas", "CajaMenor")
+KNOWN_ENTITY_TABS = ("Clientes", "Terceros")
 ADMIN_NIT_HEADER_LABELS = {"nit", "nit cliente", "tax id", "identificacion", "identificación"}
 ADMIN_NAME_HEADER_LABELS = {
     "nombre",
@@ -740,6 +741,11 @@ def load_client_catalog(sheets_service) -> List[ClientRecord]:
     return catalog
 
 
+def _strip_invisible_characters(value: str) -> str:
+    """Elimina caracteres Unicode de formato invisibles sin alterar el texto visible."""
+    return "".join(character for character in str(value or "") if unicodedata.category(character) != "Cf")
+
+
 def normalize_admin_name(value: str) -> str:
     """
     Normaliza nombres administrativos conservando espacios y signos.
@@ -747,7 +753,7 @@ def normalize_admin_name(value: str) -> str:
     Solo elimina puntos precedidos por una letra para hacer equivalentes las
     siglas puntuadas y no puntuadas: S.A.S. -> sas y LTDA. -> ltda.
     """
-    normalized = normalize_text(value)
+    normalized = normalize_text(_strip_invisible_characters(value))
     return re.sub(r"(?<=[a-z])\.(?=[a-z]|$|[^a-z0-9])", "", normalized)
 
 
@@ -802,7 +808,11 @@ def _admin_nit_index_forms(normalized_nit: str) -> Set[str]:
 
 
 def _looks_like_admin_header_row(row: List[object]) -> bool:
-    normalized_cells = {normalize_text(str(value)) for value in row if value is not None}
+    normalized_cells = {
+        normalize_text(_strip_invisible_characters(str(value)))
+        for value in row
+        if value is not None
+    }
     return bool(normalized_cells & (ADMIN_NIT_HEADER_LABELS | ADMIN_NAME_HEADER_LABELS))
 
 
@@ -858,7 +868,7 @@ def _admin_lookup_from_values(
 
 def _normalize_sheet_title(title: str) -> str:
     """Normaliza un título solo para localizarlo, sin modificar su forma real."""
-    return strip_accents((title or "").strip()).lower()
+    return strip_accents(_strip_invisible_characters(title).strip()).lower()
 
 
 def _quote_sheet_title(title: str) -> str:
@@ -940,6 +950,54 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
     return AdminLookup(admin_nits, admin_names, admin_rows_sin_nit)
 
 
+def load_registered_entities(sheets_service) -> Tuple[Set[str], Set[str]]:
+    registered_nits: Set[str] = set()
+    registered_names: Set[str] = set()
+
+    if not SHEET_ID:
+        print("⚠️ CLIENT_SHEET_ID vacío. Se seguirá sin listas Clientes/Terceros.")
+        return registered_nits, registered_names
+
+    resolved_titles = resolve_sheet_titles(sheets_service, SHEET_ID)
+    for expected_tab in KNOWN_ENTITY_TABS:
+        real_title = resolved_titles.get(_normalize_sheet_title(expected_tab))
+        if not real_title:
+            logger.warning(
+                "⚠️ No encontré la pestaña parecida a '%s' en el spreadsheet",
+                expected_tab,
+            )
+            continue
+
+        sheet_range = f"{_quote_sheet_title(real_title)}!A:B"
+        try:
+            result = sheets_service.spreadsheets().values().get(
+                spreadsheetId=SHEET_ID,
+                range=sheet_range,
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+            values = result.get("values", []) or []
+            tab_nits: Set[str] = set()
+            tab_names: Set[str] = set()
+            tab_nit_count, tab_name_count = _admin_lookup_from_values(
+                values,
+                real_title,
+                tab_nits,
+                tab_names,
+                {},
+            )
+            registered_nits.update(tab_nits)
+            registered_names.update(tab_names)
+            logger.info("📄 %s: %d NIT, %d nombres", real_title, tab_nit_count, tab_name_count)
+        except Exception as error:
+            logger.warning("⚠️ No pude leer la hoja %s: %s", real_title, error)
+
+    print(
+        f"✅ Entidades registradas cargadas: {len(registered_nits)} NIT y "
+        f"{len(registered_names)} nombres desde {', '.join(KNOWN_ENTITY_TABS)}"
+    )
+    return registered_nits, registered_names
+
+
 def is_administrativa_by_subject(subject: str, admin_nits: Set[str], admin_names: Set[str]) -> bool:
     subject_nits = {
         normalize_nit(sequence)
@@ -962,6 +1020,14 @@ def is_administrativa_by_subject(subject: str, admin_nits: Set[str], admin_names
         if re.search(rf"(?<!\w){re.escape(normalized_name)}(?!\w)", normalized_subject):
             return True
     return False
+
+
+def is_registered_entity_by_subject(
+    subject: str,
+    registered_nits: Set[str],
+    registered_names: Set[str],
+) -> bool:
+    return is_administrativa_by_subject(subject, registered_nits, registered_names)
 
 
 def extract_nit_and_name_from_dian_subject(subject: str) -> Tuple[Optional[str], Optional[str]]:
@@ -2905,7 +2971,8 @@ def process_message(
 def listen_pubsub(accounts: Dict[str, Dict]) -> None:
     """
     accounts: dict con clave = email en minúsculas, valor = {
-        "gmail_service", "sheets_service", "catalog_data", "admin_lookup", "account_id"
+        "gmail_service", "sheets_service", "catalog_data", "admin_lookup",
+        "registered_lookup", "account_id"
     }
     """
     subscriber = pubsub_v1.SubscriberClient(transport="rest")
@@ -2920,6 +2987,7 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
         try:
             acc["catalog_data"] = load_client_catalog(acc["sheets_service"])
             acc["admin_lookup"] = load_admin_lookup(acc["sheets_service"])
+            acc["registered_lookup"] = load_registered_entities(acc["sheets_service"])
             print(f"🔄 Catálogo actualizado ({acc['account_id'] or 'cuenta única'}): {len(acc['catalog_data'])} registros")
         except Exception as e:
             print(f"⚠️ No pude refrescar el catálogo: {e}")
@@ -3174,6 +3242,7 @@ def main() -> None:
             print(f"   📁 State: {_state_file_for_account(email_lc)}")
             catalog = load_client_catalog(sheets_svc)
             admin_lookup = load_admin_lookup(sheets_svc)
+            registered_lookup = load_registered_entities(sheets_svc)
             ensure_status_labels(gmail_svc)
             print("   Etiquetas verificadas/creadas")
             ensure_gmail_watch(gmail_svc, account_id=email_lc)
@@ -3182,6 +3251,7 @@ def main() -> None:
                 "sheets_service": sheets_svc,
                 "catalog_data": catalog,
                 "admin_lookup": admin_lookup,
+                "registered_lookup": registered_lookup,
                 "account_id": email_lc,
             }
         alert_failed_token_accounts(failed_token_accounts, accounts)
@@ -3208,6 +3278,7 @@ def main() -> None:
         print("🗂️ STATE_FILE:", STATE_FILE)
         client_catalog = load_client_catalog(sheets_service)
         admin_lookup = load_admin_lookup(sheets_service)
+        registered_lookup = load_registered_entities(sheets_service)
         ensure_status_labels(gmail_service)
         print("Etiquetas verificadas/creadas")
         ensure_gmail_watch(gmail_service)
@@ -3217,6 +3288,7 @@ def main() -> None:
                 "sheets_service": sheets_service,
                 "catalog_data": client_catalog,
                 "admin_lookup": admin_lookup,
+                "registered_lookup": registered_lookup,
                 "account_id": None,
             }
         }

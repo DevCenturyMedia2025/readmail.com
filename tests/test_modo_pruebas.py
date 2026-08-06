@@ -181,6 +181,7 @@ def _run_single_event_listener(monkeypatch, modo_pruebas, labeled_ids, processed
     state = {"last_history_id": "100", "processed_message_ids": list(processed_ids)}
     processed_calls = []
     labeled_calls = []
+    registered_loads = []
 
     monkeypatch.setattr(reademail, "MODO_PRUEBAS", modo_pruebas)
     monkeypatch.setattr(reademail.pubsub_v1, "SubscriberClient", lambda transport: subscriber)
@@ -191,6 +192,12 @@ def _run_single_event_listener(monkeypatch, modo_pruebas, labeled_ids, processed
     monkeypatch.setattr(reademail, "fetch_new_message_ids", lambda *args, **kwargs: (set(), "200"))
     monkeypatch.setattr(reademail, "load_client_catalog", lambda service: [])
     monkeypatch.setattr(reademail, "load_admin_lookup", lambda service: reademail.AdminLookup(set(), set(), {}))
+
+    def load_registered(service):
+        registered_loads.append(service)
+        return {"900123456"}, {"entidad ficticia"}
+
+    monkeypatch.setattr(reademail, "load_registered_entities", load_registered)
 
     def fetch_labeled(*args, **kwargs):
         labeled_calls.append((args, kwargs))
@@ -208,16 +215,17 @@ def _run_single_event_listener(monkeypatch, modo_pruebas, labeled_ids, processed
             "sheets_service": object(),
             "catalog_data": [],
             "admin_lookup": reademail.AdminLookup(set(), set(), {}),
+            "registered_lookup": (set(), set()),
             "account_id": "cuenta@example.com",
         }
     }
 
     reademail.listen_pubsub(accounts)
-    return processed_calls, labeled_calls
+    return processed_calls, labeled_calls, registered_loads, accounts
 
 
 def test_modo_pruebas_excluye_ids_ya_procesados(monkeypatch, capsys):
-    processed_calls, labeled_calls = _run_single_event_listener(
+    processed_calls, labeled_calls, registered_loads, accounts = _run_single_event_listener(
         monkeypatch,
         modo_pruebas=True,
         labeled_ids=["procesado", "pendiente"],
@@ -226,11 +234,16 @@ def test_modo_pruebas_excluye_ids_ya_procesados(monkeypatch, capsys):
 
     assert processed_calls == ["pendiente"]
     assert len(labeled_calls) == 1
+    assert len(registered_loads) == 1
+    assert accounts["cuenta@example.com"]["registered_lookup"] == (
+        {"900123456"},
+        {"entidad ficticia"},
+    )
     assert "🧪 MODO PRUEBAS: 1 correo(s) con etiqueta pruebas por procesar" in capsys.readouterr().out
 
 
 def test_modo_produccion_no_invoca_busqueda_directa_por_etiqueta(monkeypatch):
-    processed_calls, labeled_calls = _run_single_event_listener(
+    processed_calls, labeled_calls, registered_loads, accounts = _run_single_event_listener(
         monkeypatch,
         modo_pruebas=False,
         labeled_ids=["no-debe-consultarse"],
@@ -239,3 +252,5 @@ def test_modo_produccion_no_invoca_busqueda_directa_por_etiqueta(monkeypatch):
 
     assert labeled_calls == []
     assert processed_calls == []
+    assert registered_loads == []
+    assert accounts["cuenta@example.com"]["registered_lookup"] == (set(), set())
