@@ -15,10 +15,10 @@ Flujo implementado:
 7. Valida mínimos:
    - Electrónica: mínimo 2 PDF
    - Cuenta de cobro: mínimo 4 PDF
-8. Validación de contenido:
-   - Tiene orden (nombre o texto)
+8. Validación de documentos:
+   - Tiene PDF de orden de compra
    - Identifica cliente
-   - Tiene OK de compras (texto del PDF)
+   - Tiene PDF o sello de OK de compras
 9. Si todo cumple -> APROBADO y notifica.
 10. Si falla -> RECHAZADO y notifica el motivo específico.
 
@@ -233,30 +233,25 @@ OK_COMPRAS_PATTERNS = [
     ).split(",") if x.strip()
 ]
 
-ORDER_REGEXES = [
-    re.compile(
-        r"\borden\s+de\s+compra(?:\s+(?:n(?:o|ro|umero)\.?|#))?"
-        r"\s*[:#\-]?\s*(?=[a-z0-9.\-]*\d)[a-z0-9][a-z0-9.\-]*\b"
-    ),
-    re.compile(
-        r"\borden\s+(?:n(?:o|ro|umero)\.?|#)\s*[:#\-]?\s*"
-        r"(?=[a-z0-9.\-]*\d)[a-z0-9][a-z0-9.\-]*\b"
-    ),
-    re.compile(r"\boc\b\s*[:#\-]?\s*(?=[a-z0-9.\-]*\d)[a-z0-9][a-z0-9.\-]*\b"),
-    re.compile(r"\bop\b\s*[:#\-]?\s*(?=[a-z0-9.\-]*\d)[a-z0-9][a-z0-9.\-]*\b"),
-]
+PURCHASE_ORDER_FILENAME_REGEXES = (
+    re.compile(r"\borden\s+(?:de\s+)?compra\b"),
+    re.compile(r"\borden\b"),
+    re.compile(r"(?<![a-z0-9])oc(?=$|[\s_.-])"),
+    re.compile(r"(?<![a-z0-9])o\s*\.\s*c\s*\.?(?![a-z0-9])"),
+)
+PURCHASE_ORDER_FILENAME_EXCLUSIONS = re.compile(r"\borden\s+de\s+(?:servicio|trabajo)\b")
+PURCHASE_ORDER_HEADER_REGEX = re.compile(
+    r"^(?:orden\s+(?:de\s+)?compra|orden\s+(?:n(?:o|ro|umero)\.?|#)\b|"
+    r"o\s*\.\s*c\s*\.?|oc(?:\b|(?=[\s_.-])))"
+)
 
-ORDER_NEGATIVE_REGEXES = [
-    re.compile(pattern)
-    for pattern in (
-        r"\bno\s+reemplaza\b",
-        r"\bno\s+constituye\b",
-        r"\bno\s+requiere\b",
-        r"\bsin\s+orden\b",
-        r"\bno\s+aplica\b",
-        r"\bdocumento\s+equivalente\b",
-    )
-]
+OK_COMPRAS_FILENAME_REGEXES = (
+    re.compile(r"\bok\s+(?:de\s+)?compras\b"),
+    re.compile(r"\bvisto\s+bueno(?:\s+compras)?\b"),
+    re.compile(r"\bvo\s*bo(?:\s+compras)?\b"),
+    re.compile(r"\bvobo(?:\s+compras)?\b"),
+    re.compile(r"\baprob(?:ado|ada|acion)(?:\s+de)?\s+compras\b"),
+)
 
 OK_COMPRAS_NEGATIVE_REGEXES = [
     re.compile(pattern)
@@ -2185,34 +2180,46 @@ def is_note_credit_by_text(pdfs: List[UnifiedFile]) -> bool:
     return False
 
 
-def contains_purchase_order_reference(text: str) -> bool:
-    """Detecta una orden solo si tiene ID y no aparece en un contexto negativo.
+def filename_declares_purchase_order(filename: str) -> bool:
+    """Indica si el nombre identifica un PDF de orden, sin exigir número/código."""
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    normalized_name = normalize_text(stem.replace("_", " "))
+    if PURCHASE_ORDER_FILENAME_EXCLUSIONS.search(normalized_name):
+        return False
+    return any(pattern.search(normalized_name) for pattern in PURCHASE_ORDER_FILENAME_REGEXES)
 
-    Las menciones genéricas (incluidas orden de servicio/trabajo) no cuentan. Cada
-    referencia candidata se descarta cuando su ventana cercana indica ausencia,
-    inaplicabilidad o que el documento no constituye/reemplaza una orden.
+
+def contains_purchase_order_reference(text: str) -> bool:
+    """Reconoce una orden declarada como título/encabezado del propio documento.
+
+    Solo revisa las primeras líneas no vacías y exige que la declaración comience
+    la línea. Así, una mención narrativa dentro del texto de una factura no cuenta.
     """
-    normalized_text = normalize_text(text)
-    for pattern in ORDER_REGEXES:
-        for match in pattern.finditer(normalized_text):
-            context = normalized_text[max(0, match.start() - 60) : match.end() + 40]
-            if any(exclusion.search(context) for exclusion in ORDER_NEGATIVE_REGEXES):
-                continue
+    header_lines = [line.strip() for line in (text or "").splitlines() if line.strip()][:8]
+    for line in header_lines:
+        normalized_line = normalize_text(line)
+        if PURCHASE_ORDER_FILENAME_EXCLUSIONS.search(normalized_line):
+            continue
+        if PURCHASE_ORDER_HEADER_REGEX.search(normalized_line):
             return True
     return False
+
+
+def is_purchase_order_document(file_obj: UnifiedFile) -> bool:
+    """Valida presencia por nombre del adjunto o encabezado del propio PDF."""
+    return filename_declares_purchase_order(file_obj.name) or contains_purchase_order_reference(
+        file_obj.extracted_text
+    )
 
 
 def detect_order(pdfs: List[UnifiedFile]) -> bool:
-    for pdf in pdfs:
-        sample = f"{pdf.name}\n{pdf.extracted_text}"
-        if contains_purchase_order_reference(sample):
-            return True
-    return False
+    return any(is_purchase_order_document(pdf) for pdf in pdfs)
 
 
 def is_order_file(file_obj: UnifiedFile) -> bool:
-    sample = f"{file_obj.name}\n{file_obj.extracted_text}"
-    return contains_purchase_order_reference(sample)
+    if classify_document_type(file_obj) == "orden_compra":
+        return True
+    return is_purchase_order_document(file_obj)
 
 
 def identify_client_in_order_pdfs(pdfs: List[UnifiedFile], catalog: List[ClientRecord]) -> ClientMatchResult:
@@ -2260,31 +2267,43 @@ def identify_client_in_order_pdfs(pdfs: List[UnifiedFile], catalog: List[ClientR
 
 
 def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) -> bool:
-    """Detecta aprobación de compras e ignora negaciones o estados pendientes.
+    """Detecta un sello/aprobación e ignora negaciones en la misma frase.
 
-    Una frase configurada solo cuenta cuando sus 40 caracteres anteriores no
-    indican que el OK falta, está pendiente, se requiere o no existe.
+    La frase comienza después del último punto, punto y coma, dos puntos o salto
+    de línea. Una negación de otra frase nunca veta un OK válido por proximidad.
     """
     configured_patterns = patterns if patterns is not None else OK_COMPRAS_PATTERNS
-    normalized_text = normalize_text(text)
-    for raw_pattern in configured_patterns:
-        normalized_pattern = normalize_text(raw_pattern)
-        if not normalized_pattern:
-            continue
-        pattern = re.compile(rf"(?<!\w){re.escape(normalized_pattern)}(?!\w)")
-        for match in pattern.finditer(normalized_text):
-            context_before = normalized_text[max(0, match.start() - 40) : match.start()]
-            if any(exclusion.search(context_before) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
-                continue
-            return True
+    normalized_patterns = [normalize_text(pattern) for pattern in configured_patterns if pattern]
+    for raw_phrase in re.split(r"[.;:\n]+", text or ""):
+        normalized_phrase = normalize_text(raw_phrase)
+        for normalized_pattern in normalized_patterns:
+            pattern = re.compile(rf"(?<!\w){re.escape(normalized_pattern)}(?!\w)")
+            for match in pattern.finditer(normalized_phrase):
+                same_phrase_before = normalized_phrase[: match.start()]
+                if any(exclusion.search(same_phrase_before) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
+                    continue
+                return True
     return False
+
+
+def filename_declares_ok_compras(filename: str) -> bool:
+    """Indica si el nombre identifica un adjunto de OK/visto bueno de compras."""
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    normalized_name = normalize_text(stem.replace("_", " "))
+    if any(exclusion.search(normalized_name) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
+        return False
+    return any(pattern.search(normalized_name) for pattern in OK_COMPRAS_FILENAME_REGEXES)
+
+
+def is_ok_compras_document(file_obj: UnifiedFile) -> bool:
+    """Valida el adjunto por nombre y conserva como respaldo el sello en su texto."""
+    return filename_declares_ok_compras(file_obj.name) or contains_ok_compras_text(
+        file_obj.extracted_text
+    )
 
 
 def detect_ok_compras(pdfs: List[UnifiedFile]) -> bool:
-    for pdf in pdfs:
-        if contains_ok_compras_text(pdf.extracted_text):
-            return True
-    return False
+    return any(is_ok_compras_document(pdf) for pdf in pdfs)
 
 
 CUENTA_COBRO_REQUIRED_DOCS = [
@@ -2421,9 +2440,6 @@ def _classify_document_sample(sample: str, file_obj: UnifiedFile) -> Optional[st
         allow_images = bool(config.get("allow_images"))
         if not file_obj.is_pdf and not (allow_images and file_obj.is_image):
             continue
-        if doc_type == "orden_compra" and not contains_purchase_order_reference(sample):
-            continue
-
         score = _document_classifier_score(sample, config)
         if score:
             matches.append((score, doc_type))

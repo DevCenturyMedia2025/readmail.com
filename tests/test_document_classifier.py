@@ -65,8 +65,8 @@ def test_nota_credito_por_texto_extraido():
 
 
 def test_detect_order_por_frase_completa():
-    files = [pdf("adjunto.pdf", text="Se anexa la Orden de compra No 4501234")]
-    assert detect_order(files) is True
+    files = [pdf("adjunto.pdf", text="Se anexa la orden de compra correspondiente")]
+    assert detect_order(files) is False
 
 
 def test_detect_order_por_numero():
@@ -166,6 +166,17 @@ def test_paquete_completo():
     assert result["faltantes"] == []
     assert result["desconocidos"] == []
     assert set(result["identificados"].keys()) == set(CUENTA_COBRO_REQUIRED_DOCS)
+
+
+def test_paquete_cuenta_cobro_acepta_orden_por_nombre_sin_texto():
+    files = paquete_completo()
+    files[-1] = pdf("orden de compra.pdf")
+
+    result = validate_cuenta_cobro_package(files)
+
+    assert result["estado"] == "completo"
+    assert result["faltantes"] == []
+    assert result["identificados"]["orden_compra"] == ["orden de compra.pdf (nombre)"]
 
 
 def test_paquete_incompleto():
