@@ -125,7 +125,9 @@ def _run_rejected_message(
             {"name": "Subject", "value": subject},
         ]
     }
-    files = [UnifiedFile("factura.pdf", "application/pdf", b"", "test")]
+    # Este helper prueba rechazos posteriores del paquete de cuenta de cobro.
+    # El PDF debe declarar el tipo para superar el último filtro de revisión manual.
+    files = [UnifiedFile("cuenta de cobro.pdf", "application/pdf", b"", "test")]
     if with_xml:
         files.append(UnifiedFile("factura.xml", "application/xml", _invoice_with_supplier_email("proveedor@example.com"), "test"))
 

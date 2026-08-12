@@ -2927,6 +2927,24 @@ def process_message(
 
     invoice_type = classify_invoice_type(len(xmls))
 
+    if invoice_type == "CUENTA DE COBRO" and not any(
+        classify_document_type(file_obj) == "cuenta_cobro"
+        for file_obj in pdfs + images
+    ):
+        apply_single_status_label(
+            gmail_service,
+            message_id,
+            LABEL_REVIEW_NAME,
+            archive=ARCHIVE_REVIEW,
+        )
+        print(
+            f"🟨 REVISIÓN MANUAL | {radicado} | "
+            "sin XML y ningún PDF declara ser cuenta de cobro"
+        )
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
     reasons: List[str] = []
     cuenta_cobro_validation: Optional[Dict[str, object]] = None
     if invoice_type == "CUENTA DE COBRO":
