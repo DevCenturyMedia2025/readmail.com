@@ -2750,6 +2750,7 @@ def process_message(
     catalog: List[ClientRecord],
     account_id: Optional[str] = None,
     admin_lookup: Optional[AdminLookup] = None,
+    registered_lookup: Optional[RegisteredLookup] = None,
 ) -> None:
     state = load_state(account_id)
 
@@ -2876,6 +2877,21 @@ def process_message(
     # La búsqueda por nombre en texto del correo se eliminó porque generaba falsos positivos:
     # proveedores que mencionan el nombre del cliente en el asunto/cuerpo eran marcados como
     # ADMINISTRATIVA en lugar de pasar por el flujo de validación de facturas.
+
+    # 2.b) MEDICIÓN EN SECO de la regla "entidad no registrada -> REVISIÓN MANUAL".
+    # Solo observa y registra: no etiqueta, no responde y no altera la ruta. Sirve para
+    # dimensionar el volumen que caería en revisión manual antes de conectar la regla.
+    current_registered_lookup = registered_lookup or RegisteredLookup(set(), set(), {})
+    is_registered = is_registered_entity_by_subject(
+        subject,
+        current_registered_lookup.registered_nits,
+        current_registered_lookup.registered_names,
+    )
+    if not is_registered:
+        print(
+            f"🔎 [SIMULACIÓN] Entidad no registrada — con la regla nueva iría a "
+            f"REVISIÓN MANUAL | asunto={subject[:60]} | {radicado}"
+        )
 
     # 3) Nota de crédito: texto del correo
     if contains_note_credit_text(combined_email_text):
@@ -3263,6 +3279,7 @@ def listen_pubsub(accounts: Dict[str, Dict]) -> None:
                                 acc["catalog_data"],
                                 account_id,
                                 acc["admin_lookup"],
+                                acc.get("registered_lookup"),
                             )
 
                 except Exception as e:

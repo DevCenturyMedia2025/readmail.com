@@ -207,7 +207,7 @@ def _run_single_event_listener(monkeypatch, modo_pruebas, labeled_ids, processed
     monkeypatch.setattr(
         reademail,
         "process_message",
-        lambda gmail, sheets, message_id, catalog, account_id, admin_lookup: processed_calls.append(message_id),
+        lambda gmail, sheets, message_id, catalog, *args, **kwargs: processed_calls.append(message_id),
     )
     accounts = {
         "cuenta@example.com": {
