@@ -234,12 +234,40 @@ OK_COMPRAS_PATTERNS = [
 ]
 
 ORDER_REGEXES = [
-    re.compile(r"\borden\s+de\s+compra\b", re.IGNORECASE),
-    re.compile(r"\borden\s+n(?:o|ro|umero|úmero)?\.?\s*[a-z0-9\-.]+", re.IGNORECASE),
-    re.compile(r"\borden\b", re.IGNORECASE),
-    re.compile(r"\boc\b\s*[:#\-]?\s*[a-z0-9\-.]+", re.IGNORECASE),
-    re.compile(r"\bop\b\s*[:#\-]?\s*[a-z0-9\-.]+", re.IGNORECASE),
-    re.compile(r"\borden\s*[:#\-]?\s*[a-z0-9\-.]+", re.IGNORECASE),
+    re.compile(
+        r"\borden\s+de\s+compra(?:\s+(?:n(?:o|ro|umero)\.?|#))?"
+        r"\s*[:#\-]?\s*(?=[a-z0-9.\-]*\d)[a-z0-9][a-z0-9.\-]*\b"
+    ),
+    re.compile(
+        r"\borden\s+(?:n(?:o|ro|umero)\.?|#)\s*[:#\-]?\s*"
+        r"(?=[a-z0-9.\-]*\d)[a-z0-9][a-z0-9.\-]*\b"
+    ),
+    re.compile(r"\boc\b\s*[:#\-]?\s*(?=[a-z0-9.\-]*\d)[a-z0-9][a-z0-9.\-]*\b"),
+    re.compile(r"\bop\b\s*[:#\-]?\s*(?=[a-z0-9.\-]*\d)[a-z0-9][a-z0-9.\-]*\b"),
+]
+
+ORDER_NEGATIVE_REGEXES = [
+    re.compile(pattern)
+    for pattern in (
+        r"\bno\s+reemplaza\b",
+        r"\bno\s+constituye\b",
+        r"\bno\s+requiere\b",
+        r"\bsin\s+orden\b",
+        r"\bno\s+aplica\b",
+        r"\bdocumento\s+equivalente\b",
+    )
+]
+
+OK_COMPRAS_NEGATIVE_REGEXES = [
+    re.compile(pattern)
+    for pattern in (
+        r"\bpendiente(?:\s+de)?\b",
+        r"\bsin\b",
+        r"\bfalta\b",
+        r"\bno\s+tiene\b",
+        r"\bno\s+cuenta\s+con\b",
+        r"\brequiere\b",
+    )
 ]
 
 NIT_REGEX = re.compile(r"\bnit\b\s*[:#\-]?\s*([0-9][0-9.\-]{5,20})", re.IGNORECASE)
@@ -2157,20 +2185,34 @@ def is_note_credit_by_text(pdfs: List[UnifiedFile]) -> bool:
     return False
 
 
+def contains_purchase_order_reference(text: str) -> bool:
+    """Detecta una orden solo si tiene ID y no aparece en un contexto negativo.
+
+    Las menciones genéricas (incluidas orden de servicio/trabajo) no cuentan. Cada
+    referencia candidata se descarta cuando su ventana cercana indica ausencia,
+    inaplicabilidad o que el documento no constituye/reemplaza una orden.
+    """
+    normalized_text = normalize_text(text)
+    for pattern in ORDER_REGEXES:
+        for match in pattern.finditer(normalized_text):
+            context = normalized_text[max(0, match.start() - 60) : match.end() + 40]
+            if any(exclusion.search(context) for exclusion in ORDER_NEGATIVE_REGEXES):
+                continue
+            return True
+    return False
+
+
 def detect_order(pdfs: List[UnifiedFile]) -> bool:
     for pdf in pdfs:
         sample = f"{pdf.name}\n{pdf.extracted_text}"
-        for pattern in ORDER_REGEXES:
-            if pattern.search(sample):
-                return True
+        if contains_purchase_order_reference(sample):
+            return True
     return False
 
 
 def is_order_file(file_obj: UnifiedFile) -> bool:
-    if classify_document_type(file_obj) == "orden_compra":
-        return True
     sample = f"{file_obj.name}\n{file_obj.extracted_text}"
-    return any(pattern.search(sample) for pattern in ORDER_REGEXES)
+    return contains_purchase_order_reference(sample)
 
 
 def identify_client_in_order_pdfs(pdfs: List[UnifiedFile], catalog: List[ClientRecord]) -> ClientMatchResult:
@@ -2217,11 +2259,30 @@ def identify_client_in_order_pdfs(pdfs: List[UnifiedFile], catalog: List[ClientR
     return ClientMatchResult(source="ORDER_BLOCK")
 
 
+def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) -> bool:
+    """Detecta aprobación de compras e ignora negaciones o estados pendientes.
+
+    Una frase configurada solo cuenta cuando sus 40 caracteres anteriores no
+    indican que el OK falta, está pendiente, se requiere o no existe.
+    """
+    configured_patterns = patterns if patterns is not None else OK_COMPRAS_PATTERNS
+    normalized_text = normalize_text(text)
+    for raw_pattern in configured_patterns:
+        normalized_pattern = normalize_text(raw_pattern)
+        if not normalized_pattern:
+            continue
+        pattern = re.compile(rf"(?<!\w){re.escape(normalized_pattern)}(?!\w)")
+        for match in pattern.finditer(normalized_text):
+            context_before = normalized_text[max(0, match.start() - 40) : match.start()]
+            if any(exclusion.search(context_before) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
+                continue
+            return True
+    return False
+
+
 def detect_ok_compras(pdfs: List[UnifiedFile]) -> bool:
-    normalized_patterns = [normalize_alnum(x) for x in OK_COMPRAS_PATTERNS if x.strip()]
     for pdf in pdfs:
-        text = normalize_alnum(pdf.extracted_text)
-        if any(p and p in text for p in normalized_patterns):
+        if contains_ok_compras_text(pdf.extracted_text):
             return True
     return False
 
@@ -2359,6 +2420,8 @@ def _classify_document_sample(sample: str, file_obj: UnifiedFile) -> Optional[st
     for doc_type, config in DOCUMENT_CLASSIFIERS.items():
         allow_images = bool(config.get("allow_images"))
         if not file_obj.is_pdf and not (allow_images and file_obj.is_image):
+            continue
+        if doc_type == "orden_compra" and not contains_purchase_order_reference(sample):
             continue
 
         score = _document_classifier_score(sample, config)

@@ -65,7 +65,7 @@ def test_nota_credito_por_texto_extraido():
 
 
 def test_detect_order_por_frase_completa():
-    files = [pdf("adjunto.pdf", text="Se anexa la orden de compra correspondiente")]
+    files = [pdf("adjunto.pdf", text="Se anexa la Orden de compra No 4501234")]
     assert detect_order(files) is True
 
 
