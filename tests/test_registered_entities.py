@@ -44,6 +44,7 @@ def test_load_registered_entities_combina_clientes_y_terceros_con_parser_robusto
     assert lookup.registered_nits == {"900123456", "9001234567", "860009999"}
     assert lookup.registered_names == {"cliente ejemplo sas", "tercero agil ltda"}
     assert lookup.registered_docs == {
+        "900123456": {"carpeta": "", "rut": "", "camara": "", "bancaria": ""},
         "9001234567": {"carpeta": "", "rut": "", "camara": "", "bancaria": ""},
         "860009999": {"carpeta": "", "rut": "", "camara": "", "bancaria": ""},
     }
@@ -163,6 +164,12 @@ def test_registered_docs_detecta_encabezados_y_cuenta_papeleria_completa():
 
     assert counts == (2, 2, 1)
     assert registered_docs == {
+        "900123456": {
+            "carpeta": "carpeta-1",
+            "rut": "rut-1",
+            "camara": "camara-1",
+            "bancaria": "bancaria-1",
+        },
         "9001234567": {
             "carpeta": "carpeta-1",
             "rut": "rut-1",
@@ -170,6 +177,12 @@ def test_registered_docs_detecta_encabezados_y_cuenta_papeleria_completa():
             "bancaria": "bancaria-1",
         },
         "9012345678": {
+            "carpeta": "carpeta-2",
+            "rut": "rut-2",
+            "camara": "camara-2",
+            "bancaria": "",
+        },
+        "901234567": {
             "carpeta": "carpeta-2",
             "rut": "rut-2",
             "camara": "camara-2",
@@ -207,6 +220,71 @@ def test_registered_docs_sin_encabezado_usa_fallback_posicional():
         "camara": "camara-posicional",
         "bancaria": "bancaria-posicional",
     }
+
+
+@pytest.mark.parametrize("complete_row_first", [True, False])
+def test_registered_docs_fusiona_filas_duplicadas_sin_perder_ids(complete_row_first):
+    complete_docs = [
+        "CLI-001",
+        "900.111.222-3",
+        "Entidad Duplicada",
+        "entidad@example.test",
+        "ACTIVO",
+        "",
+        "",
+        "",
+        "",
+        "carpeta-1",
+        "rut-1",
+        "camara-1",
+        "bancaria-1",
+    ]
+    empty_docs = [
+        "CLI-002",
+        "900.111.222-3",
+        "Entidad Duplicada",
+        "entidad@example.test",
+        "ACTIVO",
+    ]
+    rows = [complete_docs, empty_docs] if complete_row_first else [empty_docs, complete_docs]
+    registered_docs = {}
+
+    counts = reademail._registered_lookup_from_values(rows, set(), set(), registered_docs)
+
+    assert counts == (1, 1, 1)
+    assert registered_docs["9001112223"] == {
+        "carpeta": "carpeta-1",
+        "rut": "rut-1",
+        "camara": "camara-1",
+        "bancaria": "bancaria-1",
+    }
+
+
+def test_registered_docs_indexa_nit_con_y_sin_dv_sin_inflar_conteo():
+    registered_docs = {}
+    values = [
+        [
+            "CLI-001",
+            "900111222-3",
+            "Entidad Con DV",
+            "entidad@example.test",
+            "ACTIVO",
+            "",
+            "",
+            "",
+            "",
+            "carpeta-1",
+            "rut-1",
+            "camara-1",
+            "bancaria-1",
+        ]
+    ]
+
+    counts = reademail._registered_lookup_from_values(values, set(), set(), registered_docs)
+
+    assert counts == (1, 1, 1)
+    assert registered_docs["900111222"] == registered_docs["9001112223"]
+    assert registered_docs["900111222"] is registered_docs["9001112223"]
 
 
 @pytest.mark.parametrize(

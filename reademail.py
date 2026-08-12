@@ -991,6 +991,36 @@ def _registered_entity_header_indexes(row: List[object]) -> Dict[str, Optional[i
     return indexes
 
 
+def _merge_registered_docs(
+    registered_docs: Dict[str, Dict[str, str]],
+    nit: str,
+    new_docs: Dict[str, str],
+) -> Dict[str, str]:
+    fields = ("carpeta", "rut", "camara", "bancaria")
+    nit_forms = _admin_nit_index_forms(nit)
+    ordered_forms = [nit, *sorted(nit_forms - {nit})]
+    existing_records = [
+        registered_docs[nit_form]
+        for nit_form in ordered_forms
+        if nit_form in registered_docs
+    ]
+    merged_docs = existing_records[0] if existing_records else {field: "" for field in fields}
+
+    for existing_docs in existing_records:
+        for field in fields:
+            if not merged_docs.get(field) and existing_docs.get(field):
+                merged_docs[field] = existing_docs[field]
+    for field in fields:
+        if new_docs.get(field):
+            merged_docs[field] = new_docs[field]
+        else:
+            merged_docs.setdefault(field, "")
+
+    for nit_form in ordered_forms:
+        registered_docs[nit_form] = merged_docs
+    return merged_docs
+
+
 def _registered_lookup_from_values(
     values: List[List[object]],
     registered_nits: Set[str],
@@ -1049,7 +1079,7 @@ def _registered_lookup_from_values(
         if nit:
             detected_nits.add(nit)
             registered_nits.update(_admin_nit_index_forms(nit))
-            registered_docs[nit] = {
+            row_docs = {
                 field: (
                     _strip_invisible_characters(str(row[indexes[field]])).strip()
                     if indexes[field] is not None
@@ -1059,13 +1089,18 @@ def _registered_lookup_from_values(
                 )
                 for field in ("carpeta", "rut", "camara", "bancaria")
             }
+            _merge_registered_docs(registered_docs, nit, row_docs)
         if name:
             detected_names.add(name)
             registered_names.add(name)
 
-    complete_docs_count = sum(
-        all(registered_docs[nit][field] for field in ("rut", "camara", "bancaria"))
+    unique_doc_records = {
+        id(registered_docs[nit]): registered_docs[nit]
         for nit in detected_nits
+    }.values()
+    complete_docs_count = sum(
+        all(docs[field] for field in ("rut", "camara", "bancaria"))
+        for docs in unique_doc_records
     )
     return len(detected_nits), len(detected_names), complete_docs_count
 
@@ -1108,7 +1143,12 @@ def load_registered_entities(sheets_service) -> RegisteredLookup:
             )
             registered_nits.update(tab_nits)
             registered_names.update(tab_names)
-            registered_docs.update(tab_docs)
+            merged_tab_records: Set[int] = set()
+            for nit, docs in tab_docs.items():
+                if id(docs) in merged_tab_records:
+                    continue
+                _merge_registered_docs(registered_docs, nit, docs)
+                merged_tab_records.add(id(docs))
             logger.info(
                 "📄 %s: %d NIT, %d nombres, %d con papelería completa",
                 real_title,
