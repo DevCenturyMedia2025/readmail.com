@@ -273,6 +273,12 @@ class AdminLookup(NamedTuple):
     admin_rows_sin_nit: Dict[str, Tuple[str, int]]
 
 
+class RegisteredLookup(NamedTuple):
+    registered_nits: Set[str]
+    registered_names: Set[str]
+    registered_docs: Dict[str, Dict[str, str]]
+
+
 @dataclass
 class UnifiedFile:
     name: str
@@ -950,13 +956,128 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
     return AdminLookup(admin_nits, admin_names, admin_rows_sin_nit)
 
 
-def load_registered_entities(sheets_service) -> Tuple[Set[str], Set[str]]:
+def _registered_entity_header_indexes(row: List[object]) -> Dict[str, Optional[int]]:
+    aliases = {
+        "nit": ADMIN_NIT_HEADER_LABELS,
+        "nombre": {"nombre", "razon social"},
+        "correo": {"correo", "correo electronico", "email"},
+        "estado": {"estado", "status"},
+        "carpeta": {"carpeta", "carpeta drive", "id carpeta", "id carpeta drive"},
+        "rut": {"rut", "id rut"},
+        "camara": {"camara de comercio", "id camara de comercio"},
+        "bancaria": {"certificacion bancaria", "id certificacion bancaria"},
+    }
+    normalized_aliases = {
+        field: {normalize_text(alias) for alias in field_aliases}
+        for field, field_aliases in aliases.items()
+    }
+    indexes: Dict[str, Optional[int]] = {
+        "nit": None,
+        "nombre": None,
+        "correo": None,
+        "estado": None,
+        "carpeta": None,
+        "rut": None,
+        "camara": None,
+        "bancaria": None,
+    }
+
+    for index, value in enumerate(row):
+        raw_header = "" if value is None else str(value)
+        normalized_header = normalize_text(_strip_invisible_characters(raw_header))
+        for field, field_aliases in normalized_aliases.items():
+            if indexes[field] is None and normalized_header in field_aliases:
+                indexes[field] = index
+    return indexes
+
+
+def _registered_lookup_from_values(
+    values: List[List[object]],
+    registered_nits: Set[str],
+    registered_names: Set[str],
+    registered_docs: Dict[str, Dict[str, str]],
+) -> Tuple[int, int, int]:
+    if not values:
+        return 0, 0, 0
+
+    header_indexes = _registered_entity_header_indexes(values[0])
+    has_header = any(index is not None for index in header_indexes.values())
+    default_indexes = {
+        "nit": 1,
+        "nombre": 2,
+        "correo": 3,
+        "estado": 4,
+        "carpeta": 9,
+        "rut": 10,
+        "camara": 11,
+        "bancaria": 12,
+    }
+    indexes = (
+        {
+            field: detected_index if detected_index is not None else default_indexes[field]
+            for field, detected_index in header_indexes.items()
+        }
+        if has_header
+        else default_indexes
+    )
+    data_rows = values[1:] if has_header else values
+    detected_nits: Set[str] = set()
+    detected_names: Set[str] = set()
+
+    for row in data_rows:
+        if not row:
+            continue
+
+        estado_index = indexes["estado"]
+        estado = ""
+        if estado_index is not None and estado_index < len(row):
+            raw_estado = "" if row[estado_index] is None else str(row[estado_index])
+            estado = _strip_invisible_characters(raw_estado).strip()
+        if estado and normalize_text(estado) not in ACTIVE_VALUES:
+            continue
+
+        nit = ""
+        nit_index = indexes["nit"]
+        if nit_index is not None and nit_index < len(row):
+            nit = _normalize_admin_nit_cell(row[nit_index])
+
+        name = ""
+        name_index = indexes["nombre"]
+        if name_index is not None and name_index < len(row):
+            name = _normalize_admin_name_cell(row[name_index])
+
+        if nit:
+            detected_nits.add(nit)
+            registered_nits.update(_admin_nit_index_forms(nit))
+            registered_docs[nit] = {
+                field: (
+                    _strip_invisible_characters(str(row[indexes[field]])).strip()
+                    if indexes[field] is not None
+                    and indexes[field] < len(row)
+                    and row[indexes[field]] is not None
+                    else ""
+                )
+                for field in ("carpeta", "rut", "camara", "bancaria")
+            }
+        if name:
+            detected_names.add(name)
+            registered_names.add(name)
+
+    complete_docs_count = sum(
+        all(registered_docs[nit][field] for field in ("rut", "camara", "bancaria"))
+        for nit in detected_nits
+    )
+    return len(detected_nits), len(detected_names), complete_docs_count
+
+
+def load_registered_entities(sheets_service) -> RegisteredLookup:
     registered_nits: Set[str] = set()
     registered_names: Set[str] = set()
+    registered_docs: Dict[str, Dict[str, str]] = {}
 
     if not SHEET_ID:
         print("⚠️ CLIENT_SHEET_ID vacío. Se seguirá sin listas Clientes/Terceros.")
-        return registered_nits, registered_names
+        return RegisteredLookup(registered_nits, registered_names, registered_docs)
 
     resolved_titles = resolve_sheet_titles(sheets_service, SHEET_ID)
     for expected_tab in KNOWN_ENTITY_TABS:
@@ -968,7 +1089,7 @@ def load_registered_entities(sheets_service) -> Tuple[Set[str], Set[str]]:
             )
             continue
 
-        sheet_range = f"{_quote_sheet_title(real_title)}!A:B"
+        sheet_range = f"{_quote_sheet_title(real_title)}!A:M"
         try:
             result = sheets_service.spreadsheets().values().get(
                 spreadsheetId=SHEET_ID,
@@ -978,16 +1099,23 @@ def load_registered_entities(sheets_service) -> Tuple[Set[str], Set[str]]:
             values = result.get("values", []) or []
             tab_nits: Set[str] = set()
             tab_names: Set[str] = set()
-            tab_nit_count, tab_name_count = _admin_lookup_from_values(
+            tab_docs: Dict[str, Dict[str, str]] = {}
+            tab_nit_count, tab_name_count, tab_complete_docs_count = _registered_lookup_from_values(
                 values,
-                real_title,
                 tab_nits,
                 tab_names,
-                {},
+                tab_docs,
             )
             registered_nits.update(tab_nits)
             registered_names.update(tab_names)
-            logger.info("📄 %s: %d NIT, %d nombres", real_title, tab_nit_count, tab_name_count)
+            registered_docs.update(tab_docs)
+            logger.info(
+                "📄 %s: %d NIT, %d nombres, %d con papelería completa",
+                real_title,
+                tab_nit_count,
+                tab_name_count,
+                tab_complete_docs_count,
+            )
         except Exception as error:
             logger.warning("⚠️ No pude leer la hoja %s: %s", real_title, error)
 
@@ -995,7 +1123,7 @@ def load_registered_entities(sheets_service) -> Tuple[Set[str], Set[str]]:
         f"✅ Entidades registradas cargadas: {len(registered_nits)} NIT y "
         f"{len(registered_names)} nombres desde {', '.join(KNOWN_ENTITY_TABS)}"
     )
-    return registered_nits, registered_names
+    return RegisteredLookup(registered_nits, registered_names, registered_docs)
 
 
 def is_administrativa_by_subject(subject: str, admin_nits: Set[str], admin_names: Set[str]) -> bool:
