@@ -5,11 +5,14 @@ Los textos de prueba imitan muestras reales (nombres de archivo y texto
 extraido) sin I/O. Se congela el comportamiento actual del clasificador.
 """
 
+import pytest
+
 from app.models import UnifiedFile
 from app.services.document_classifier import (
     CUENTA_COBRO_REQUIRED_DOCS,
     classify_document_type,
     classify_document_type_with_method,
+    contains_credit_or_debit_note_text,
     contains_note_credit_text,
     detect_ok_compras,
     detect_order,
@@ -38,6 +41,23 @@ def test_nota_de_credito():
 
 def test_credit_note_en_ingles():
     assert contains_note_credit_text("Please find the Credit Note attached") is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Nota de débito 123",
+        "nota debito ND-1",
+        "NOTA DE DEBITO",
+        "debit note 55",
+        "Adjunto la Nota Credito No. 123",
+        "nota de credito por devolucion",
+        "Please find the Credit Note attached",
+    ],
+)
+def test_detecta_notas_de_credito_y_debito(text):
+    assert contains_credit_or_debit_note_text(text) is True
+    assert contains_note_credit_text(text) is True
 
 
 def test_texto_sin_nota_credito():

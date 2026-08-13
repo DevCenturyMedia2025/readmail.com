@@ -2159,23 +2159,31 @@ def extract_nit_from_text(text: str) -> Optional[str]:
     return nit or None
 
 
-def contains_note_credit_text(text: str) -> bool:
+def contains_credit_or_debit_note_text(text: str) -> bool:
+    """Detecta notas de crédito o débito en español e inglés."""
     normalized_text = normalize_text(text)
     if not normalized_text:
         return False
-    return bool(re.search(r"\bnota\s+(?:de\s+)?credito\b", normalized_text) or re.search(r"\bcredit\s+note\b", normalized_text))
+    return bool(
+        re.search(r"\bnota\s+(?:de\s+)?(?:credito|debito)\b", normalized_text)
+        or re.search(r"\b(?:credit|debit)\s+note\b", normalized_text)
+    )
+
+
+# Alias retrocompatible para llamadores e imports existentes.
+contains_note_credit_text = contains_credit_or_debit_note_text
 
 
 def is_note_credit_by_filename(pdfs: List[UnifiedFile]) -> bool:
     for pdf in pdfs:
-        if contains_note_credit_text(pdf.name):
+        if contains_credit_or_debit_note_text(pdf.name):
             return True
     return False
 
 
 def is_note_credit_by_text(pdfs: List[UnifiedFile]) -> bool:
     for pdf in pdfs:
-        if contains_note_credit_text(pdf.extracted_text):
+        if contains_credit_or_debit_note_text(pdf.extracted_text):
             return True
     return False
 
@@ -2973,7 +2981,7 @@ def process_message(
         )
 
     # 3) Nota de crédito: texto del correo
-    if contains_note_credit_text(combined_email_text):
+    if contains_credit_or_debit_note_text(combined_email_text):
         apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
         print(f"🟪 NOTA DE CREDITO por correo | {radicado}")
         state_add_processed(state, message_id)
