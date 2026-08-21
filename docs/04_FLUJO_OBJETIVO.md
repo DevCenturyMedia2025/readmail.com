@@ -96,7 +96,7 @@ nombre descriptivo.
 | Filtro 5 (administrativa) | ✅ Implementado |
 | §A1 (entidad no registrada) | ⚠️ Programado en `email_routing.py`, **no conectado** |
 | §A2, A3 | ✅ Implementado |
-| §A4, A5 (rechazo solo por orden/OK + reenvío a Compras) | ❌ Pendiente |
+| §A4, A5 (rechazo solo por orden/OK + reenvío a Compras) | ✅ Implementado |
 | §B1 (último filtro de cuenta de cobro) | ✅ Implementado |
 | §B2, B3 | ✅ Implementado |
 | Fugas F1 y F3 | ✅ Corregidas |

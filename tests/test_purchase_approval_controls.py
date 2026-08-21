@@ -328,7 +328,6 @@ def _run_electronic_invoice(monkeypatch, extra_pdfs):
         lambda service, message_id, attachments: ([pdf, *extra_pdfs, xml], [], []),
     )
     monkeypatch.setattr(reademail, "auto_fill_nit_from_subject", lambda *args, **kwargs: None)
-    monkeypatch.setattr(reademail, "validate_electronic_invoice_minimum", lambda *args: [])
     monkeypatch.setattr(
         reademail,
         "identify_client_in_order_pdfs",

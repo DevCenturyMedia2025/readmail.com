@@ -165,12 +165,16 @@ def _run_rejected_message(
     monkeypatch.setattr(reademail, "send_reply_email", record_reply)
     monkeypatch.setattr(reademail, "send_new_email", lambda *args: calls["new"].append(args))
     monkeypatch.setattr(reademail, "send_forward_with_attachments", lambda *args: calls["forward"].append(args))
-    if approved:
+    if with_xml:
         client = _record("ACME", "123456789", "contacto@acme.test")
-        monkeypatch.setattr(reademail, "validate_electronic_invoice_minimum", lambda *args: [])
-        monkeypatch.setattr(reademail, "detect_order", lambda pdfs: True)
-        monkeypatch.setattr(reademail, "identify_client_in_order_pdfs", lambda pdfs, catalog: ClientMatchResult(record=client))
-        monkeypatch.setattr(reademail, "detect_ok_compras", lambda pdfs: True)
+        monkeypatch.setattr(reademail, "detect_order", lambda pdfs: approved)
+        monkeypatch.setattr(
+            reademail,
+            "identify_client_in_order_pdfs",
+            lambda pdfs, catalog: ClientMatchResult(record=client),
+        )
+        monkeypatch.setattr(reademail, "identify_client_from_fields", lambda *args: client)
+        monkeypatch.setattr(reademail, "detect_ok_compras", lambda pdfs: approved)
 
     reademail.process_message(object(), object(), "message-1", [])
     return calls

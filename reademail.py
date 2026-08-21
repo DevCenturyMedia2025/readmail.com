@@ -125,6 +125,7 @@ WATCH_LABEL_IDS = [x.strip() for x in env_first("GMAIL_LABEL_IDS", default="INBO
 GMAIL_SYSTEM_LABEL_IDS = {"INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED", "IMPORTANT", "UNREAD"}
 MODO_PRUEBAS = env_bool("MODO_PRUEBAS", default=False)
 ETIQUETA_PRUEBAS = env_first("ETIQUETA_PRUEBAS", default="pruebas")
+COMPRAS_EMAIL = env_first("COMPRAS_EMAIL", default="")
 DRY_RUN = env_bool("DRY_RUN", default=False)
 AUTO_FILL_NIT_ENABLED = env_bool("AUTO_FILL_NIT_ENABLED", default=False)
 LIMITE_ANTIGUEDAD_ENABLED = env_bool("LIMITE_ANTIGUEDAD_ENABLED", default=True)
@@ -3094,18 +3095,12 @@ def process_message(
             faltantes = cuenta_cobro_validation.get("faltantes") or []
             reasons.append("Cuenta de cobro incompleta. Faltan: " + ", ".join(str(x) for x in faltantes) + ".")
         print("📦 Validación cuenta de cobro:", json.dumps(cuenta_cobro_validation, ensure_ascii=False))
-    else:
-        reasons.extend(validate_electronic_invoice_minimum(len(pdfs), len(xmls)))
-
-    if zip_errors:
-        reasons.extend(zip_errors)
+        if zip_errors:
+            reasons.extend(zip_errors)
 
     has_order = bool(cuenta_cobro_validation and "orden_compra" in (cuenta_cobro_validation.get("identificados") or {}))
     if invoice_type != "CUENTA DE COBRO":
         has_order = detect_order(pdfs)
-    if invoice_type != "CUENTA DE COBRO" and not has_order:
-        reasons.append("No se detectó orden de compra en nombre ni texto de los PDF.")
-
     client_catalog_only = client_lookup_catalog(catalog)
     client_candidate_texts = [subject, body_text, snippet] + [f.name for f in pdfs] + [f.extracted_text for f in pdfs]
     order_client_result = identify_client_in_order_pdfs(pdfs, client_catalog_only) if invoice_type != "CUENTA DE COBRO" else ClientMatchResult()
@@ -3125,11 +3120,131 @@ def process_message(
         )
         logger.info(f"🔎 Fuente final cliente: {'FALLBACK' if client_match else 'SIN_CLIENTE'}")
     if invoice_type != "CUENTA DE COBRO" and not client_match:
-        reasons.append("No se logró identificar el cliente con el contenido del correo o los PDF.")
+        apply_single_status_label(
+            gmail_service,
+            message_id,
+            LABEL_REVIEW_NAME,
+            archive=ARCHIVE_REVIEW,
+        )
+        logger.info(
+            "🟨 REVISIÓN MANUAL | %s | factura electrónica sin cliente identificado; "
+            "no se responde al proveedor",
+            radicado,
+        )
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
 
     has_ok_compras = detect_ok_compras(pdfs)
-    if invoice_type != "CUENTA DE COBRO" and not has_ok_compras:
-        reasons.append("No se detectó OK de compras dentro de los PDF.")
+    missing_purchase_documents: List[str] = []
+    if invoice_type != "CUENTA DE COBRO":
+        if not has_order:
+            reasons.append("No se detectó orden de compra en nombre ni texto de los PDF.")
+            missing_purchase_documents.append("orden de compra")
+        if not has_ok_compras:
+            reasons.append("No se detectó OK de compras dentro de los PDF.")
+            missing_purchase_documents.append("OK de compras")
+
+    if reasons and invoice_type != "CUENTA DE COBRO" and MODO_PRUEBAS:
+        if COMPRAS_EMAIL:
+            faltantes = " y ".join(missing_purchase_documents)
+            request_text = (
+                f"Falta documentación para completar la radicación {radicado}:\n"
+                + "\n".join(f"- {item}" for item in missing_purchase_documents)
+                + "\n\nPor favor responder este correo adjuntando el archivo requerido."
+            )
+            forward_body = build_forward_body(
+                rejection_text=request_text,
+                from_header=from_header,
+                fecha=get_header(payload, "Date"),
+                asunto=subject,
+                para=get_header(payload, "To"),
+                body_text=body_text,
+            )
+            forward_subject = f"Falta documentación - {subject} (ID: {radicado})"
+            original_attachments: List[Dict[str, object]] = []
+            for attachment in attachments:
+                attachment_id = attachment.get("attachmentId")
+                if not attachment_id:
+                    continue
+                filename = str(attachment.get("filename") or "adjunto")
+                try:
+                    attachment_data = gmail_download_attachment_bytes(
+                        gmail_service,
+                        message_id,
+                        attachment_id,
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "No pude descargar adjunto original %s para Compras: %s",
+                        filename,
+                        error,
+                    )
+                    continue
+                original_attachments.append(
+                    {
+                        "filename": filename,
+                        "mime_type": attachment.get("mimeType") or "application/octet-stream",
+                        "data": attachment_data,
+                    }
+                )
+
+            try:
+                attachments_size = sum(len(item["data"]) for item in original_attachments)
+                if attachments_size > 20 * 1024 * 1024:
+                    forward_body += "\nLa factura no se reenvió por superar el tamaño permitido.\n"
+                    logger.warning(
+                        "Adjuntos para Compras superan 20 MB; se envía solo texto | %s",
+                        radicado,
+                    )
+                    send_new_email(
+                        gmail_service,
+                        COMPRAS_EMAIL,
+                        forward_subject,
+                        forward_body,
+                    )
+                else:
+                    send_forward_with_attachments(
+                        gmail_service,
+                        COMPRAS_EMAIL,
+                        forward_subject,
+                        forward_body,
+                        original_attachments,
+                    )
+                logger.info(
+                    "📨 Reenviado a Compras (%s) por falta de: %s | %s",
+                    COMPRAS_EMAIL,
+                    faltantes,
+                    radicado,
+                )
+            except Exception as error:
+                logger.error(
+                    "❌ Falló reenvío a Compras (%s) por falta de: %s | %s: %s",
+                    COMPRAS_EMAIL,
+                    faltantes,
+                    radicado,
+                    error,
+                )
+
+            try:
+                gmail_service.users().messages().modify(
+                    userId="me",
+                    id=message_id,
+                    body={"addLabelIds": ["UNREAD"]},
+                ).execute()
+            except Exception as error:
+                logger.error("❌ Falló marcado como no leído | %s: %s", radicado, error)
+
+            state_mark_replied(state, message_id)
+            state_add_processed(state, message_id)
+            save_state(state, account_id)
+            return
+
+        logger.warning(
+            "MODO_PRUEBAS activo pero COMPRAS_EMAIL está vacío; "
+            "se aplica rechazo normal | %s",
+            radicado,
+        )
 
     if reasons:
         apply_single_status_label(gmail_service, message_id, LABEL_REJECTED_NAME, archive=ARCHIVE_REJECTED)

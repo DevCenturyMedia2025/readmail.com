@@ -1,4 +1,5 @@
 import reademail
+from app.models import ClientMatchResult, ClientRecord
 from reademail import UnifiedFile
 
 
@@ -66,6 +67,14 @@ def _run_message(monkeypatch, files):
 
     monkeypatch.setattr(reademail, "validate_cuenta_cobro_package", validate_cuenta)
     monkeypatch.setattr(reademail, "validate_electronic_invoice_minimum", validate_electronic)
+    if any(file.name.lower().endswith(".xml") for file in files):
+        client = ClientRecord("Cliente Demo", "clientedemo")
+        monkeypatch.setattr(
+            reademail,
+            "identify_client_in_order_pdfs",
+            lambda pdfs, catalog: ClientMatchResult(record=client),
+        )
+        monkeypatch.setattr(reademail, "identify_client_from_fields", lambda *args: client)
 
     reademail.process_message(object(), object(), "message-filter", [])
     calls["state"] = state
@@ -109,14 +118,14 @@ def test_sin_xml_y_sin_pdf_cuenta_cobro_va_a_revision_sin_responder(
     ) in capsys.readouterr().out
 
 
-def test_con_xml_conserva_flujo_de_factura_electronica(monkeypatch):
+def test_con_xml_omite_validacion_minima_y_conserva_flujo_fe(monkeypatch):
     pdf = UnifiedFile("factura.pdf", "application/pdf", b"", "test")
     xml = UnifiedFile("factura.xml", "application/xml", b"<Invoice />", "test")
 
     calls = _run_message(monkeypatch, [pdf, xml])
 
     assert calls["cuenta_validation"] == []
-    assert calls["electronic_validation"] == [(1, 1)]
+    assert calls["electronic_validation"] == []
     assert calls["labels"][0] == (reademail.LABEL_REJECTED_NAME, reademail.ARCHIVE_REJECTED)
     assert all(label != reademail.LABEL_REVIEW_NAME for label, _ in calls["labels"])
     assert len(calls["replies"]) == 1
