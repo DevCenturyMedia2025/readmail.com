@@ -36,6 +36,7 @@ import math
 import os
 import os.path
 import re
+import shutil
 import time
 import urllib.parse
 import urllib.request
@@ -48,6 +49,7 @@ from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import parseaddr
+from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 from dotenv import load_dotenv
@@ -140,6 +142,9 @@ _WHATSAPP_ALERT_CACHE: Dict[str, float] = {}
 SHEET_ID = env_first("CLIENT_SHEET_ID")
 SHEET_RANGE = env_first("CLIENT_SHEET_RANGE", default="Clientes!A:Z")
 CLIENT_LOOKUP_RANGE = env_first("CLIENT_LOOKUP_RANGE", default="Clientes!A:Z")
+SHEET_BACKUP_ENABLED = env_bool("SHEET_BACKUP_ENABLED", default=True)
+SHEET_BACKUP_DIR = env_first("SHEET_BACKUP_DIR", default="backups")
+SHEET_BACKUP_KEEP_DAYS = env_int("SHEET_BACKUP_KEEP_DAYS", default=30)
 ADMIN_SHEET_TABS = ("Administrativas", "CajaMenor")
 KNOWN_ENTITY_TABS = ("Clientes", "Terceros")
 ADMIN_NIT_HEADER_LABELS = {"nit", "nit cliente", "tax id", "identificacion", "identificación"}
@@ -960,6 +965,77 @@ def resolve_sheet_titles(sheets_service, spreadsheet_id: str) -> Dict[str, str]:
         return {}
 
 
+def _write_sheet_backup_file(target: Path, values: List[List[object]]) -> None:
+    temporary = target.with_name(f"{target.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as backup_file:
+            json.dump(values, backup_file, ensure_ascii=False, indent=2)
+            backup_file.write("\n")
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _cleanup_old_sheet_backups(root: Path, today) -> None:
+    keep_days = max(0, SHEET_BACKUP_KEEP_DAYS)
+    if not root.exists():
+        return
+
+    for candidate in root.iterdir():
+        if not candidate.is_dir() or candidate.is_symlink():
+            continue
+        try:
+            backup_date = datetime.strptime(candidate.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if (today - backup_date).days <= keep_days:
+            continue
+        try:
+            shutil.rmtree(candidate)
+        except Exception as error:
+            logger.warning(
+                "⚠️ No pude eliminar el respaldo antiguo %s: %s",
+                candidate,
+                error,
+            )
+
+
+def _backup_sheet_tabs(raw_tabs: Dict[str, List[List[object]]]) -> None:
+    if not SHEET_BACKUP_ENABLED:
+        return
+
+    today = datetime.now().date()
+    root = Path(SHEET_BACKUP_DIR)
+    day_directory = root / today.isoformat()
+    created = False
+
+    try:
+        day_directory.mkdir(parents=True, exist_ok=True)
+    except Exception as error:
+        logger.warning("⚠️ No pude preparar el respaldo de hojas en %s: %s", day_directory, error)
+        return
+
+    for tab, values in raw_tabs.items():
+        safe_tab = re.sub(r'[<>:"/\\|?*]', "_", str(tab)).strip(" .") or "pestana"
+        target = day_directory / f"{safe_tab}.json"
+        if target.exists():
+            continue
+        try:
+            _write_sheet_backup_file(target, values)
+            created = True
+        except Exception as error:
+            logger.warning("⚠️ No pude guardar el respaldo de la hoja %s: %s", tab, error)
+
+    try:
+        _cleanup_old_sheet_backups(root, today)
+    except Exception as error:
+        logger.warning("⚠️ No pude limpiar respaldos antiguos de hojas: %s", error)
+
+    if created:
+        logger.info("💾 Respaldo de hojas guardado en %s", day_directory.as_posix())
+
+
 def load_admin_lookup(sheets_service) -> AdminLookup:
     admin_nits: Set[str] = set()
     admin_names: Set[str] = set()
@@ -970,6 +1046,7 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
         return AdminLookup(admin_nits, admin_names, admin_rows_sin_nit)
 
     resolved_titles = resolve_sheet_titles(sheets_service, SHEET_ID)
+    raw_tabs: Dict[str, List[List[object]]] = {}
     for expected_tab in ADMIN_SHEET_TABS:
         real_title = resolved_titles.get(_normalize_sheet_title(expected_tab))
         if not real_title:
@@ -987,6 +1064,7 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
             values = result.get("values", []) or []
+            raw_tabs[expected_tab] = values
             tab_nits: Set[str] = set()
             tab_names: Set[str] = set()
             tab_rows_sin_nit: Dict[str, Tuple[str, int]] = {}
@@ -1004,6 +1082,8 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
             logger.info("📄 %s: %d NIT, %d nombres", real_title, tab_nit_count, tab_name_count)
         except Exception as error:
             logger.warning("⚠️ No pude leer la hoja %s: %s", real_title, error)
+
+    _backup_sheet_tabs(raw_tabs)
 
     print(
         f"✅ Listas administrativas cargadas: {len(admin_nits)} NIT y "
@@ -1171,6 +1251,7 @@ def load_registered_entities(sheets_service) -> RegisteredLookup:
         return RegisteredLookup(registered_nits, registered_names, registered_docs)
 
     resolved_titles = resolve_sheet_titles(sheets_service, SHEET_ID)
+    raw_tabs: Dict[str, List[List[object]]] = {}
     for expected_tab in KNOWN_ENTITY_TABS:
         real_title = resolved_titles.get(_normalize_sheet_title(expected_tab))
         if not real_title:
@@ -1188,6 +1269,7 @@ def load_registered_entities(sheets_service) -> RegisteredLookup:
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
             values = result.get("values", []) or []
+            raw_tabs[expected_tab] = values
             tab_nits: Set[str] = set()
             tab_names: Set[str] = set()
             tab_docs: Dict[str, Dict[str, str]] = {}
@@ -1214,6 +1296,8 @@ def load_registered_entities(sheets_service) -> RegisteredLookup:
             )
         except Exception as error:
             logger.warning("⚠️ No pude leer la hoja %s: %s", real_title, error)
+
+    _backup_sheet_tabs(raw_tabs)
 
     print(
         f"✅ Entidades registradas cargadas: {len(registered_nits)} NIT y "

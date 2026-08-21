@@ -26,6 +26,7 @@ htmlcov/
 gmail_watch_state.json
 accounts/
 logs/
+backups/
 
 # Extra: credenciales
 credentials/
