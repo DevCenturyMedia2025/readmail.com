@@ -199,12 +199,8 @@ TOKEN_ALERT_EMAIL = env_first("TOKEN_ALERT_EMAIL", default="")
 INTERACTIVE_AUTH = env_bool("INTERACTIVE_AUTH", default=False)
 TOKEN_ALERT_COOLDOWN_HOURS = env_int("TOKEN_ALERT_COOLDOWN_HOURS", default=12)
 
-# PDFs mínimos:
-# - Factura electrónica: mínimo 3 PDF + 1 XML.
-# - Cuenta de cobro: validación documental por tipos.
+# Cuenta de cobro: validación documental por tipos.
 # - Si existe REQUIRED_PDF_COUNT del .env viejo, lo tomamos como fallback SOLO para cuenta de cobro.
-MIN_PDF_FE = env_int("MIN_PDF_FACTURA_ELECTRONICA", default=3)
-MIN_XML_FE = env_int("MIN_XML_FACTURA_ELECTRONICA", default=1)
 MIN_PDF_CC = env_int("MIN_PDF_CUENTA_COBRO", "REQUIRED_PDF_COUNT", default=4)
 INCOMPLETE_FILES_MESSAGE = (
     "Se identificaron archivos incompletos. Agradecemos revisar y confirmar que la documentación "
@@ -1083,7 +1079,13 @@ def load_admin_lookup(sheets_service) -> AdminLookup:
         except Exception as error:
             logger.warning("⚠️ No pude leer la hoja %s: %s", real_title, error)
 
-    _backup_sheet_tabs(raw_tabs)
+    try:
+        _backup_sheet_tabs(raw_tabs)
+    except Exception as error:
+        logger.warning(
+            "⚠️ Falló el respaldo de hojas administrativas; se continúa: %s",
+            error,
+        )
 
     print(
         f"✅ Listas administrativas cargadas: {len(admin_nits)} NIT y "
@@ -1297,7 +1299,13 @@ def load_registered_entities(sheets_service) -> RegisteredLookup:
         except Exception as error:
             logger.warning("⚠️ No pude leer la hoja %s: %s", real_title, error)
 
-    _backup_sheet_tabs(raw_tabs)
+    try:
+        _backup_sheet_tabs(raw_tabs)
+    except Exception as error:
+        logger.warning(
+            "⚠️ Falló el respaldo de hojas registradas; se continúa: %s",
+            error,
+        )
 
     print(
         f"✅ Entidades registradas cargadas: {len(registered_nits)} NIT y "
@@ -2661,20 +2669,6 @@ def classify_invoice_type(xml_count: int) -> str:
     return "FACTURA ELECTRONICA" if xml_count >= 1 else "CUENTA DE COBRO"
 
 
-def validate_electronic_invoice_minimum(pdf_count: int, xml_count: int) -> List[str]:
-    errors = []
-    if pdf_count < MIN_PDF_FE:
-        errors.append(
-            "Factura electrónica: archivos incompletos, revisa tus documentos y que estén completos."
-        )
-    if xml_count < MIN_XML_FE:
-        missing_xml = MIN_XML_FE - xml_count
-        errors.append(
-            f"Factura electrónica: falta {missing_xml} XML para completar el mínimo requerido de {MIN_XML_FE}."
-        )
-    return errors
-
-
 def validate_pdf_minimum(invoice_type: str, pdf_count: int) -> Optional[str]:
     if invoice_type == "CUENTA DE COBRO" and pdf_count < MIN_PDF_CC:
         return "Cuenta de cobro: archivos incompletos, revisa tus documentos y que estén completos."
@@ -3125,6 +3119,24 @@ def process_message(
         save_state(state, account_id)
         return
 
+    invoice_type = classify_invoice_type(len(xmls))
+
+    if invoice_type != "CUENTA DE COBRO" and zip_errors:
+        apply_single_status_label(
+            gmail_service,
+            message_id,
+            LABEL_REVIEW_NAME,
+            archive=ARCHIVE_REVIEW,
+        )
+        logger.warning(
+            "🟨 REVISIÓN MANUAL | %s | no se pudo leer el paquete: %s",
+            radicado,
+            zip_errors,
+        )
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
     # 4) Si no hay al menos 1 PDF -> revisión manual
     if len(pdfs) < 1:
         apply_single_status_label(gmail_service, message_id, LABEL_REVIEW_NAME, archive=ARCHIVE_REVIEW)
@@ -3148,8 +3160,6 @@ def process_message(
         state_add_processed(state, message_id)
         save_state(state, account_id)
         return
-
-    invoice_type = classify_invoice_type(len(xmls))
 
     if invoice_type == "CUENTA DE COBRO" and not any(
         classify_document_type(file_obj) == "cuenta_cobro"
@@ -3287,13 +3297,20 @@ def process_message(
                         forward_subject,
                         forward_body,
                     )
-                else:
+                elif original_attachments:
                     send_forward_with_attachments(
                         gmail_service,
                         COMPRAS_EMAIL,
                         forward_subject,
                         forward_body,
                         original_attachments,
+                    )
+                else:
+                    send_new_email(
+                        gmail_service,
+                        COMPRAS_EMAIL,
+                        forward_subject,
+                        forward_body,
                     )
                 logger.info(
                     "📨 Reenviado a Compras (%s) por falta de: %s | %s",
@@ -3308,6 +3325,10 @@ def process_message(
                     faltantes,
                     radicado,
                     error,
+                )
+                send_whatsapp_alert(
+                    f"[Reenvío Compras] Falló el reenvío de {radicado} "
+                    f"a {COMPRAS_EMAIL}: {error}"
                 )
 
             try:

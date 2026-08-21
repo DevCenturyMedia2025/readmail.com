@@ -49,6 +49,8 @@ def _run_fe(
     compras_email="",
     forward_error=None,
     attachment_size=32,
+    attachment_descriptors=None,
+    zip_errors=None,
 ):
     state = {}
     calls = {
@@ -58,6 +60,7 @@ def _run_fe(
         "new_emails": [],
         "modifications": [],
         "saved_states": [],
+        "whatsapp": [],
     }
     gmail_service = _GmailService(calls["modifications"])
     body_text = "Cuerpo original de la factura."
@@ -73,13 +76,15 @@ def _run_fe(
             {"name": "Subject", "value": "Factura Cliente Demo"},
         ],
     }
-    attachments = [
-        {
-            "attachmentId": "attachment-1",
-            "filename": "factura-original.pdf",
-            "mimeType": "application/pdf",
-        }
-    ]
+    attachments = attachment_descriptors
+    if attachments is None:
+        attachments = [
+            {
+                "attachmentId": "attachment-1",
+                "filename": "factura-original.pdf",
+                "mimeType": "application/pdf",
+            }
+        ]
     xml = UnifiedFile("factura.xml", "application/xml", b"<Invoice />", "test")
     client = ClientRecord("Cliente Demo", "clientedemo") if client_identified else None
 
@@ -108,7 +113,11 @@ def _run_fe(
     monkeypatch.setattr(
         reademail,
         "build_unified_files",
-        lambda service, message_id, current_attachments: ([*pdfs, xml], [], []),
+        lambda service, message_id, current_attachments: (
+            [*pdfs, xml],
+            list(zip_errors or []),
+            [],
+        ),
     )
     monkeypatch.setattr(reademail, "auto_fill_nit_from_subject", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -137,6 +146,11 @@ def _run_fe(
         "gmail_download_attachment_bytes",
         lambda *args: b"x" * attachment_size,
     )
+    monkeypatch.setattr(
+        reademail,
+        "send_whatsapp_alert",
+        lambda *args, **kwargs: calls["whatsapp"].append((args, kwargs)),
+    )
 
     catalog = [client] if client else []
     reademail.process_message(gmail_service, object(), "message-fe", catalog)
@@ -152,6 +166,24 @@ def test_fe_con_un_solo_pdf_orden_y_ok_se_aprueba_sin_validar_minimo(monkeypatch
 
     assert calls["labels"] == [(reademail.LABEL_APPROVED_NAME, reademail.ARCHIVE_APPROVED)]
     assert len(calls["replies"]) == 1
+
+
+def test_fe_con_zip_ilegible_va_a_revision_sin_responder(monkeypatch, caplog):
+    invoice_pdf = _pdf("factura.pdf", "Cliente Demo. OK compras para radicar.")
+    zip_error = "ZIP inválido paquete.zip: archivo corrupto"
+
+    calls = _run_fe(monkeypatch, [invoice_pdf], zip_errors=[zip_error])
+
+    radicado = calls["state"]["message_radicados"]["message-fe"]
+    assert calls["labels"] == [(reademail.LABEL_REVIEW_NAME, reademail.ARCHIVE_REVIEW)]
+    assert calls["replies"] == []
+    assert calls["forwards"] == []
+    assert calls["new_emails"] == []
+    assert calls["state"]["processed_message_ids"] == ["message-fe"]
+    assert "replied_message_ids" not in calls["state"]
+    assert f"🟨 REVISIÓN MANUAL | {radicado} | no se pudo leer el paquete: ['{zip_error}']" in caplog.text
+    assert "No se detectó orden de compra" not in caplog.text
+    assert "No se detectó OK de compras" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -255,6 +287,26 @@ def test_fe_pruebas_sin_compras_email_rechaza_y_loguea(monkeypatch, caplog):
     assert "MODO_PRUEBAS activo pero COMPRAS_EMAIL está vacío" in caplog.text
 
 
+def test_fe_pruebas_sin_adjuntos_recolectables_envia_correo_solo_texto(monkeypatch):
+    missing_ok_pdf = _pdf("orden de compra.pdf")
+
+    calls = _run_fe(
+        monkeypatch,
+        [missing_ok_pdf],
+        modo_pruebas=True,
+        compras_email="compras@example.test",
+        attachment_descriptors=[],
+    )
+
+    assert calls["forwards"] == []
+    assert len(calls["new_emails"]) == 1
+    _, destination, subject, body = calls["new_emails"][0]
+    assert destination == "compras@example.test"
+    assert subject.startswith("Falta documentación - Factura Cliente Demo (ID: ")
+    assert "- OK de compras" in body
+    assert "---------- Mensaje original ----------" in body
+
+
 def test_fallo_de_reenvio_a_compras_marca_estado_y_no_reintenta(monkeypatch, caplog):
     missing_ok_pdf = _pdf("orden de compra.pdf")
     calls = _run_fe(
@@ -269,6 +321,12 @@ def test_fallo_de_reenvio_a_compras_marca_estado_y_no_reintenta(monkeypatch, cap
     assert calls["state"]["replied_message_ids"] == ["message-fe"]
     assert calls["state"]["processed_message_ids"] == ["message-fe"]
     assert "❌ Falló reenvío a Compras" in caplog.text
+    assert len(calls["whatsapp"]) == 1
+    alert_args, alert_kwargs = calls["whatsapp"][0]
+    assert alert_kwargs == {}
+    assert alert_args[0].startswith("[Reenvío Compras] Falló el reenvío de ")
+    assert "a compras@example.test: Gmail caído" in alert_args[0]
 
     reademail.process_message(calls["gmail_service"], object(), "message-fe", [])
     assert len(calls["forwards"]) == 1
+    assert len(calls["whatsapp"]) == 1

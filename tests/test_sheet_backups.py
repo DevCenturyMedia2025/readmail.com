@@ -3,6 +3,8 @@ import logging
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
+import pytest
+
 import reademail
 
 
@@ -107,6 +109,50 @@ def test_fallo_de_escritura_no_impide_cargar_la_clasificacion(
     assert lookup.admin_nits == {"900123456"}
     assert lookup.admin_names == {"acme"}
     assert "No pude guardar el respaldo de la hoja Administrativas: disco lleno" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("loader", "titles", "responses", "names_attribute", "expected_name"),
+    [
+        (
+            reademail.load_admin_lookup,
+            reademail.ADMIN_SHEET_TABS,
+            ([["Nit", "Proveedor"], ["900123456", "ACME"]], []),
+            "admin_names",
+            "acme",
+        ),
+        (
+            reademail.load_registered_entities,
+            reademail.KNOWN_ENTITY_TABS,
+            ([["NIT", "Nombre"], ["901234567", "Tercero Uno"]], []),
+            "registered_names",
+            "tercero uno",
+        ),
+    ],
+)
+def test_excepcion_arbitraria_del_respaldo_no_interrumpe_cargas(
+    monkeypatch,
+    caplog,
+    loader,
+    titles,
+    responses,
+    names_attribute,
+    expected_name,
+):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(reademail, "SHEET_ID", "sheet-prueba")
+    service = _sheets_service(*responses, titles=titles)
+    monkeypatch.setattr(
+        reademail,
+        "_backup_sheet_tabs",
+        lambda raw_tabs: (_ for _ in ()).throw(RuntimeError("fallo inesperado")),
+    )
+
+    lookup = loader(service)
+
+    assert expected_name in getattr(lookup, names_attribute)
+    assert "fallo inesperado" in caplog.text
+    assert "se continúa" in caplog.text
 
 
 def test_limpieza_borra_directorio_viejo_y_conserva_reciente(monkeypatch, tmp_path):

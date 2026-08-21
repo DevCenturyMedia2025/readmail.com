@@ -3,14 +3,13 @@ from app.models import ClientMatchResult, ClientRecord
 from reademail import UnifiedFile
 
 
-def _run_message(monkeypatch, files):
+def _run_message(monkeypatch, files, zip_errors=None):
     state = {}
     calls = {
         "labels": [],
         "replies": [],
         "saved_states": [],
         "cuenta_validation": [],
-        "electronic_validation": [],
     }
     payload = {
         "headers": [
@@ -37,7 +36,7 @@ def _run_message(monkeypatch, files):
     monkeypatch.setattr(
         reademail,
         "build_unified_files",
-        lambda service, message_id, attachments: (files, [], []),
+        lambda service, message_id, attachments: (files, list(zip_errors or []), []),
     )
     monkeypatch.setattr(reademail, "auto_fill_nit_from_subject", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -61,12 +60,8 @@ def _run_message(monkeypatch, files):
             "identificados": {"cuenta_cobro": ["cuenta de cobro.pdf (nombre)"]},
         }
 
-    def validate_electronic(pdf_count, xml_count):
-        calls["electronic_validation"].append((pdf_count, xml_count))
-        return ["Factura electronica invalida para la prueba."]
-
     monkeypatch.setattr(reademail, "validate_cuenta_cobro_package", validate_cuenta)
-    monkeypatch.setattr(reademail, "validate_electronic_invoice_minimum", validate_electronic)
+    # La validación mínima de FE fue retirada: este helper ya no parchea código inexistente.
     if any(file.name.lower().endswith(".xml") for file in files):
         client = ClientRecord("Cliente Demo", "clientedemo")
         monkeypatch.setattr(
@@ -92,7 +87,6 @@ def test_sin_xml_pdf_declara_cuenta_cobro_sigue_a_validacion(monkeypatch):
     calls = _run_message(monkeypatch, [pdf])
 
     assert calls["cuenta_validation"] == [[pdf]]
-    assert calls["electronic_validation"] == []
     assert calls["labels"][0] == (reademail.LABEL_REJECTED_NAME, reademail.ARCHIVE_REJECTED)
     assert len(calls["replies"]) == 1
 
@@ -107,7 +101,6 @@ def test_sin_xml_y_sin_pdf_cuenta_cobro_va_a_revision_sin_responder(
 
     radicado = calls["state"]["message_radicados"]["message-filter"]
     assert calls["cuenta_validation"] == []
-    assert calls["electronic_validation"] == []
     assert calls["labels"] == [(reademail.LABEL_REVIEW_NAME, reademail.ARCHIVE_REVIEW)]
     assert calls["replies"] == []
     assert calls["state"]["processed_message_ids"] == ["message-filter"]
@@ -125,7 +118,17 @@ def test_con_xml_omite_validacion_minima_y_conserva_flujo_fe(monkeypatch):
     calls = _run_message(monkeypatch, [pdf, xml])
 
     assert calls["cuenta_validation"] == []
-    assert calls["electronic_validation"] == []
     assert calls["labels"][0] == (reademail.LABEL_REJECTED_NAME, reademail.ARCHIVE_REJECTED)
     assert all(label != reademail.LABEL_REVIEW_NAME for label, _ in calls["labels"])
     assert len(calls["replies"]) == 1
+
+
+def test_cuenta_cobro_con_zip_ilegible_conserva_error_como_motivo(monkeypatch):
+    pdf = UnifiedFile("cuenta de cobro.pdf", "application/pdf", b"", "test")
+    zip_error = "ZIP inválido soportes.zip: archivo corrupto"
+
+    calls = _run_message(monkeypatch, [pdf], zip_errors=[zip_error])
+
+    assert calls["labels"][0] == (reademail.LABEL_REJECTED_NAME, reademail.ARCHIVE_REJECTED)
+    assert len(calls["replies"]) == 1
+    assert zip_error in calls["replies"][0][4]
