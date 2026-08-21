@@ -31,6 +31,7 @@ OK_COMPRAS_NEGATED_MATRIX = (
     "todavia no hay ok de compras",
     "el ok compras esta pendiente",
     "el ok de compras aun no llega",
+    "el ok de compras sigue en espera",
     "queda pendiente el ok de compras",
     "El ok de compras no ha llegado",
     "Falta la orden, el ok de compras y el soporte de pago",
@@ -58,6 +59,17 @@ OK_COMPRAS_NEGATED_ENUMERATIONS = (
     "Pendiente la orden y el ok de compras",
     "No cuenta con orden y ok de compras",
     "Requiere orden, ok de compras y RUT actualizado",
+)
+
+OK_COMPRAS_LONG_PREFIX_NEGATIONS = (
+    "Pendiente que el area de compras nos envie el ok de compras",
+    "Falta que el proveedor adjunte el documento con el ok de compras",
+    "Requiere que se anexe nuevamente el soporte con el ok de compras",
+)
+
+OK_COMPRAS_POST_NEGATION_VARIANTS = (
+    "el ok de compras aun esta pendiente",
+    "el ok de compras se encuentra pendiente",
 )
 
 
@@ -108,6 +120,9 @@ def test_presencia_no_confunde_otros_adjuntos_con_orden(detector, filename):
         "ok-compras.pdf",
         "ok-de-compras.pdf",
         "aprobado-por-compras.pdf",
+        "ok compras No 4501.pdf",
+        "OK-DE-COMPRAS-No-123.pdf",
+        "aprobado por compras - No 7.pdf",
     ],
 )
 def test_presencia_detecta_adjunto_de_ok_sin_texto(detector, filename):
@@ -165,6 +180,18 @@ def test_contexto_negativo_descarta_orden_aunque_tenga_identificador(detector):
 @pytest.mark.parametrize("detector", OK_TEXT_DETECTORS)
 @pytest.mark.parametrize("text", OK_COMPRAS_NEGATED_MATRIX)
 def test_auditoria_no_detecta_ok_negado_o_pendiente(detector, text):
+    assert detector(text) is False
+
+
+@pytest.mark.parametrize("detector", OK_TEXT_DETECTORS)
+@pytest.mark.parametrize("text", OK_COMPRAS_LONG_PREFIX_NEGATIONS)
+def test_auditoria_mantiene_negacion_lejana_en_la_misma_clausula(detector, text):
+    assert detector(text) is False
+
+
+@pytest.mark.parametrize("detector", OK_TEXT_DETECTORS)
+@pytest.mark.parametrize("text", OK_COMPRAS_POST_NEGATION_VARIANTS)
+def test_auditoria_detecta_variantes_pospuestas_de_pendiente(detector, text):
     assert detector(text) is False
 
 
@@ -365,6 +392,23 @@ def test_factura_con_enumeracion_negada_se_rechaza(monkeypatch, text):
         b"",
         "test",
         text,
+    )
+
+    labels, replies = _run_electronic_invoice(monkeypatch, [order_pdf, status_pdf])
+
+    assert labels == [reademail.LABEL_REJECTED_NAME]
+    assert reademail.LABEL_APPROVED_NAME not in labels
+    assert len(replies) == 1
+
+
+def test_factura_con_ok_que_sigue_en_espera_se_rechaza(monkeypatch):
+    order_pdf = UnifiedFile("orden de compra.pdf", "application/pdf", b"", "test")
+    status_pdf = UnifiedFile(
+        "estado de documentos.pdf",
+        "application/pdf",
+        b"",
+        "test",
+        "el ok de compras sigue en espera",
     )
 
     labels, replies = _run_electronic_invoice(monkeypatch, [order_pdf, status_pdf])

@@ -252,11 +252,10 @@ OK_COMPRAS_CLAUSE_SEPARATOR_REGEX = re.compile(
     r"[.!?;:\n]+|\b(?:pero|aunque)\b",
     re.IGNORECASE,
 )
-OK_COMPRAS_TOKEN_REGEX = re.compile(r"\b\w+\b")
-OK_COMPRAS_NEGATIVE_WINDOW_TOKENS = 6
 OK_COMPRAS_POST_NEGATIVE_REGEX = re.compile(
-    r"^\s+(?:esta\s+pendiente|aun\s+no\s+llega|no\s+ha\s+llegado|"
-    r"queda\s+pendiente|sigue\s+pendiente)\b"
+    r"^\s+(?:(?:aun\s+)?esta\s+pendiente|aun\s+no\s+llega|no\s+ha\s+llegado|"
+    r"queda\s+pendiente|sigue(?:\s+pendiente|\s+en\s+espera)|"
+    r"se\s+encuentra\s+pendiente)\b"
 )
 OK_COMPRAS_FILENAME_REGEXES = (
     re.compile(rf"\bok{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras\b"),
@@ -292,7 +291,10 @@ OK_COMPRAS_NEGATIVE_REGEXES = [
 ]
 OK_COMPRAS_FILENAME_NEGATIVE_REGEXES = (
     *OK_COMPRAS_NEGATIVE_REGEXES,
-    re.compile(r"\bno\b"),
+    re.compile(
+        r"\bno\s+(?=(?:ok|visto\s+bueno|vo\s*bo|vobo|vb|"
+        r"aprob(?:ado|ada|acion)|autorizado)\b)"
+    ),
 )
 
 NIT_REGEX = re.compile(r"\bnit\b\s*[:#\-]?\s*([0-9][0-9.\-]{5,20})", re.IGNORECASE)
@@ -2316,19 +2318,15 @@ def _compile_ok_compras_pattern(normalized_pattern: str) -> re.Pattern:
 
 def _has_ok_compras_negative_before(normalized_clause: str, match_start: int) -> bool:
     before_match = normalized_clause[:match_start]
-    tokens = list(OK_COMPRAS_TOKEN_REGEX.finditer(before_match))
-    if len(tokens) > OK_COMPRAS_NEGATIVE_WINDOW_TOKENS:
-        window_start = tokens[-OK_COMPRAS_NEGATIVE_WINDOW_TOKENS].start()
-        before_match = before_match[window_start:]
     return any(exclusion.search(before_match) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES)
 
 
 def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) -> bool:
-    """Detecta una aprobación con una ventana previa de seis tokens.
+    """Detecta una aprobación considerando el prefijo de su cláusula.
 
     Las fronteras son puntuación fuerte, salto de línea, ``pero`` y ``aunque``.
-    Una negación previa veta el término si está en sus seis tokens anteriores;
-    después solo vetan estados pendientes que siguen de forma inmediata.
+    Una negación previa veta el término sin importar la distancia dentro de la
+    cláusula; después solo vetan estados pendientes de aparición inmediata.
     """
     configured_patterns = patterns if patterns is not None else OK_COMPRAS_PATTERNS
     approval_patterns = [
