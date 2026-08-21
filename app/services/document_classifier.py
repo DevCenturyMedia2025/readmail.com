@@ -47,8 +47,14 @@ OK_COMPRAS_WITH_PURCHASES_REGEX = re.compile(
     rf"^(?P<term>.+?){OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras$"
 )
 OK_COMPRAS_CLAUSE_SEPARATOR_REGEX = re.compile(
-    r"[.!?;:,\n]+|\b(?:y|pero|aunque)\b",
+    r"[.!?;:\n]+|\b(?:pero|aunque)\b",
     re.IGNORECASE,
+)
+OK_COMPRAS_TOKEN_REGEX = re.compile(r"\b\w+\b")
+OK_COMPRAS_NEGATIVE_WINDOW_TOKENS = 6
+OK_COMPRAS_POST_NEGATIVE_REGEX = re.compile(
+    r"^\s+(?:esta\s+pendiente|aun\s+no\s+llega|no\s+ha\s+llegado|"
+    r"queda\s+pendiente|sigue\s+pendiente)\b"
 )
 OK_COMPRAS_FILENAME_REGEXES = (
     re.compile(rf"\bok{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras\b"),
@@ -75,9 +81,17 @@ OK_COMPRAS_NEGATIVE_REGEXES = [
         r"\besta\s+pendiente\b",
         r"\bqueda\s+pendiente\b",
         r"\bno\s+llega\b",
+        r"\bno\s+ha\s+llegado\b",
+        r"\bno\s+tenemos\b",
+        r"\bno\s+adjuntan\b",
+        r"\bni\b",
         r"\ben\s+espera\b",
     )
 ]
+OK_COMPRAS_FILENAME_NEGATIVE_REGEXES = (
+    *OK_COMPRAS_NEGATIVE_REGEXES,
+    re.compile(r"\bno\b"),
+)
 
 NIT_REGEX = re.compile(r"\bnit\b\s*[:#\-]?\s*([0-9][0-9.\-]{5,20})", re.IGNORECASE)
 
@@ -253,12 +267,21 @@ def _compile_ok_compras_pattern(normalized_pattern: str) -> re.Pattern:
     return re.compile(rf"(?<!\w){re.escape(normalized_pattern)}(?!\w)")
 
 
-def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) -> bool:
-    """Detecta una aprobación sin negaciones en la misma cláusula.
+def _has_ok_compras_negative_before(normalized_clause: str, match_start: int) -> bool:
+    before_match = normalized_clause[:match_start]
+    tokens = list(OK_COMPRAS_TOKEN_REGEX.finditer(before_match))
+    if len(tokens) > OK_COMPRAS_NEGATIVE_WINDOW_TOKENS:
+        window_start = tokens[-OK_COMPRAS_NEGATIVE_WINDOW_TOKENS].start()
+        before_match = before_match[window_start:]
+    return any(exclusion.search(before_match) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES)
 
-    Las cláusulas se separan por puntuación, salto de línea y las conjunciones
-    ``y``, ``pero`` y ``aunque``. Una negación solo veta la aprobación de la
-    cláusula donde aparece, antes o después del término.
+
+def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) -> bool:
+    """Detecta una aprobación con una ventana previa de seis tokens.
+
+    Las fronteras son puntuación fuerte, salto de línea, ``pero`` y ``aunque``.
+    Una negación previa veta el término si está en sus seis tokens anteriores;
+    después solo vetan estados pendientes que siguen de forma inmediata.
     """
     configured_patterns = patterns if patterns is not None else DEFAULT_OK_COMPRAS_PATTERNS
     approval_patterns = [
@@ -268,10 +291,13 @@ def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) ->
     ]
     for raw_clause in OK_COMPRAS_CLAUSE_SEPARATOR_REGEX.split(text or ""):
         normalized_clause = normalize_text(raw_clause)
-        if any(exclusion.search(normalized_clause) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
-            continue
-        if any(pattern.search(normalized_clause) for pattern in approval_patterns):
-            return True
+        for pattern in approval_patterns:
+            for match in pattern.finditer(normalized_clause):
+                if _has_ok_compras_negative_before(normalized_clause, match.start()):
+                    continue
+                if OK_COMPRAS_POST_NEGATIVE_REGEX.match(normalized_clause[match.end():]):
+                    continue
+                return True
     return False
 
 
@@ -279,7 +305,7 @@ def filename_declares_ok_compras(filename: str) -> bool:
     """Indica si el nombre identifica un adjunto de OK/visto bueno de compras."""
     stem = os.path.splitext(os.path.basename(filename or ""))[0]
     normalized_name = normalize_text(stem.replace("_", " ").replace("-", " "))
-    if any(exclusion.search(normalized_name) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
+    if any(exclusion.search(normalized_name) for exclusion in OK_COMPRAS_FILENAME_NEGATIVE_REGEXES):
         return False
     return any(pattern.search(normalized_name) for pattern in OK_COMPRAS_FILENAME_REGEXES)
 

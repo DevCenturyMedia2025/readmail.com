@@ -22,6 +22,44 @@ OK_FILE_DETECTORS = (
     document_classifier.detect_ok_compras,
 )
 
+OK_COMPRAS_NEGATED_MATRIX = (
+    "pendiente ok compras",
+    "no tiene ok compras",
+    "falta ok compras",
+    "sin visto bueno compras",
+    "Aun no tenemos el ok compras",
+    "todavia no hay ok de compras",
+    "el ok compras esta pendiente",
+    "el ok de compras aun no llega",
+    "queda pendiente el ok de compras",
+    "El ok de compras no ha llegado",
+    "Falta la orden, el ok de compras y el soporte de pago",
+    "Pendiente la orden y el ok de compras",
+    "No cuenta con orden y ok de compras",
+    "Requiere orden, ok de compras y RUT actualizado",
+    "No tenemos la orden ni el ok de compras",
+    "No adjuntan orden ni aprobado por compras",
+)
+
+OK_COMPRAS_APPROVED_MATRIX = (
+    "OK compras",
+    "ok de compras",
+    "aprobado por compras",
+    "Aprobado compras, no tiene observaciones",
+    "Cuenta con visto bueno y no requiere firma adicional",
+    "Aprobado por compras aunque falta el sello del cliente",
+    "OK de compras, no requiere orden adicional",
+    "Aprobado por compras pero sin fecha",
+    "Revisada la factura y sus soportes. OK compras para radicar.",
+)
+
+OK_COMPRAS_NEGATED_ENUMERATIONS = (
+    "Falta la orden, el ok de compras y el soporte de pago",
+    "Pendiente la orden y el ok de compras",
+    "No cuenta con orden y ok de compras",
+    "Requiere orden, ok de compras y RUT actualizado",
+)
+
 
 @pytest.mark.parametrize("detector", ORDER_FILE_DETECTORS)
 @pytest.mark.parametrize(
@@ -77,8 +115,11 @@ def test_presencia_detecta_adjunto_de_ok_sin_texto(detector, filename):
 
 
 @pytest.mark.parametrize("detector", OK_FILE_DETECTORS)
-@pytest.mark.parametrize("filename", ["Anexo VB Ltda.pdf", "VB-2024-001.pdf"])
-def test_presencia_no_confunde_vb_suelto_con_ok_compras(detector, filename):
+@pytest.mark.parametrize(
+    "filename",
+    ["Anexo VB Ltda.pdf", "VB-2024-001.pdf", "no-ok-compras.pdf"],
+)
+def test_presencia_no_acepta_nombre_negado_o_vb_suelto(detector, filename):
     assert detector([UnifiedFile(filename, "application/pdf", b"", "test")]) is False
 
 
@@ -122,34 +163,22 @@ def test_contexto_negativo_descarta_orden_aunque_tenga_identificador(detector):
 
 
 @pytest.mark.parametrize("detector", OK_TEXT_DETECTORS)
-@pytest.mark.parametrize(
-    "text",
-    [
-        "pendiente ok compras",
-        "no tiene ok compras",
-        "falta ok compras",
-        "sin visto bueno compras",
-        "Aun no tenemos el ok compras",
-        "todavia no hay ok de compras",
-        "el ok compras esta pendiente",
-        "el ok de compras aún no llega",
-        "queda pendiente el ok de compras",
-        "el ok de compras sigue en espera",
-        "texto sin ninguna frase de aprobación",
-    ],
-)
+@pytest.mark.parametrize("text", OK_COMPRAS_NEGATED_MATRIX)
 def test_auditoria_no_detecta_ok_negado_o_pendiente(detector, text):
     assert detector(text) is False
+
+
+@pytest.mark.parametrize("detector", OK_TEXT_DETECTORS)
+@pytest.mark.parametrize("text", OK_COMPRAS_APPROVED_MATRIX)
+def test_matriz_detecta_ok_real(detector, text):
+    assert detector(text) is True
 
 
 @pytest.mark.parametrize("detector", OK_TEXT_DETECTORS)
 @pytest.mark.parametrize(
     "text",
     [
-        "ok compras",
-        "OK DE COMPRAS",
         "aprobado compras",
-        "APROBADO POR COMPRAS",
         "Aprobado de compras",
         "aprobación de compras",
         "APROBACION COMPRAS",
@@ -164,13 +193,23 @@ def test_auditoria_no_detecta_ok_negado_o_pendiente(detector, text):
         "cuenta con visto bueno",
         "recibida a satisfaccion",
         "visto bueno para radicación",
-        "Aprobado compras, no tiene observaciones",
-        "Cuenta con visto bueno y no requiere firma adicional",
-        "Aprobado por compras aunque falta el sello del cliente",
     ],
 )
-def test_auditoria_detecta_ok_real(detector, text):
+def test_auditoria_detecta_variantes_ok_existentes(detector, text):
     assert detector(text) is True
+
+
+@pytest.mark.parametrize("detector", OK_TEXT_DETECTORS)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "el ok de compras queda pendiente",
+        "el ok de compras sigue pendiente",
+        "texto sin ninguna frase de aprobación",
+    ],
+)
+def test_auditoria_no_detecta_estados_pendientes_adicionales(detector, text):
+    assert detector(text) is False
 
 
 @pytest.mark.parametrize("detector", OK_FILE_DETECTORS)
@@ -311,6 +350,24 @@ def test_factura_con_vb_suelto_no_se_aprueba(monkeypatch, filename):
     misleading_pdf = UnifiedFile(filename, "application/pdf", b"", "test")
 
     labels, replies = _run_electronic_invoice(monkeypatch, [order_pdf, misleading_pdf])
+
+    assert labels == [reademail.LABEL_REJECTED_NAME]
+    assert reademail.LABEL_APPROVED_NAME not in labels
+    assert len(replies) == 1
+
+
+@pytest.mark.parametrize("text", OK_COMPRAS_NEGATED_ENUMERATIONS)
+def test_factura_con_enumeracion_negada_se_rechaza(monkeypatch, text):
+    order_pdf = UnifiedFile("orden de compra.pdf", "application/pdf", b"", "test")
+    status_pdf = UnifiedFile(
+        "estado de documentos.pdf",
+        "application/pdf",
+        b"",
+        "test",
+        text,
+    )
+
+    labels, replies = _run_electronic_invoice(monkeypatch, [order_pdf, status_pdf])
 
     assert labels == [reademail.LABEL_REJECTED_NAME]
     assert reademail.LABEL_APPROVED_NAME not in labels
