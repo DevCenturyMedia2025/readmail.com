@@ -66,7 +66,7 @@ Cada correo se evalúa en este orden exacto. El primer filtro que se cumple deci
 | **Nota de crédito** | "nota de crédito", "nota credito", "credit note" | — |
 | **Nota de débito** | "nota de débito", "nota debito", "debit note" | — |
 | **Orden de compra** | Adjunto cuyo nombre indica "orden de compra", "orden", "OC-123" u "O.C.", o cuyo encabezado declara que es una orden | "orden de servicio", "orden de trabajo", "ordenador" o una mención narrativa dentro de la factura |
-| **OK de compras** | Adjunto cuyo nombre indica "ok compras", "visto bueno", "vobo" o "aprobación compras"; como respaldo, un sello/aprobación dentro de otro PDF | Frases donde el término está negado o pendiente dentro de la misma frase |
+| **OK de compras** | Adjunto cuyo nombre o texto contiene "ok compras", "ok de compras", "aprobado compras", "aprobado por compras", "aprobado de compras", "aprobación de compras", "aprobación compras", "visto bueno compras", "visto bueno de compras", "vobo compras", "vobo de compras", "autorizado por compras" o "aprobada compras". También: "aprobado para radicar", "autorizado para radicar", "cuenta con visto bueno", "recibida a satisfacción" y "visto bueno para radicación". | Frases donde la aprobación está negada o pendiente. La negación se evalúa en la **oración completa**, tanto antes como después del término. |
 | **Entidad administrativa** | NIT exacto o nombre como frase completa, en el **asunto** | Coincidencias parciales dentro de otra palabra o de otro NIT |
 
 La orden y el OK se validan por **presencia del documento adjunto**, no por una

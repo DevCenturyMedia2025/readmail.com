@@ -57,10 +57,14 @@ def test_presencia_no_confunde_otros_adjuntos_con_orden(detector, filename):
     "filename",
     [
         "ok compras.pdf",
+        "OK DE COMPRAS.pdf",
         "visto bueno.pdf",
+        "visto bueno de compras.pdf",
         "vobo compras.pdf",
         "aprobado compras.pdf",
+        "aprobado por compras.pdf",
         "aprobacion compras.pdf",
+        "autorizado por compras.pdf",
     ],
 )
 def test_presencia_detecta_adjunto_de_ok_sin_texto(detector, filename):
@@ -114,6 +118,13 @@ def test_contexto_negativo_descarta_orden_aunque_tenga_identificador(detector):
         "no tiene ok compras",
         "falta ok compras",
         "sin visto bueno compras",
+        "Aún no tenemos el ok compras",
+        "todavía no hay ok de compras",
+        "el ok compras está pendiente",
+        "el ok de compras aún no llega",
+        "queda pendiente el ok de compras",
+        "el ok de compras sigue en espera",
+        "texto sin ninguna frase de aprobación",
     ],
 )
 def test_auditoria_no_detecta_ok_negado_o_pendiente(detector, text):
@@ -124,14 +135,41 @@ def test_auditoria_no_detecta_ok_negado_o_pendiente(detector, text):
 @pytest.mark.parametrize(
     "text",
     [
-        "OK COMPRAS",
-        "Aprobado compras",
-        "Visto bueno compras",
+        "ok compras",
+        "OK DE COMPRAS",
+        "aprobado compras",
+        "APROBADO POR COMPRAS",
+        "Aprobado de compras",
         "aprobación de compras",
+        "APROBACION COMPRAS",
+        "visto bueno compras",
+        "VISTO BUENO DE COMPRAS",
+        "vobo compras",
+        "VoBo de Compras",
+        "autorizado por compras",
+        "aprobada compras",
+        "aprobado para radicar",
+        "autorizado para radicar",
+        "cuenta con visto bueno",
+        "recibida a satisfaccion",
+        "visto bueno para radicación",
     ],
 )
 def test_auditoria_detecta_ok_real(detector, text):
     assert detector(text) is True
+
+
+@pytest.mark.parametrize("detector", OK_FILE_DETECTORS)
+def test_correo_impreso_en_pdf_con_ok_compras_se_detecta(detector):
+    printed_email = UnifiedFile(
+        "correo impreso.pdf",
+        "application/pdf",
+        b"",
+        "test",
+        "Revisada la factura y sus soportes. OK compras para radicar.",
+    )
+
+    assert detector([printed_email]) is True
 
 
 @pytest.mark.parametrize("detector", ORDER_FILE_DETECTORS)
@@ -248,6 +286,22 @@ def test_factura_con_adjuntos_de_orden_y_ok_se_aprueba(monkeypatch):
     ok_pdf = UnifiedFile("ok compras.pdf", "application/pdf", b"", "test")
 
     labels, replies = _run_electronic_invoice(monkeypatch, [order_pdf, ok_pdf])
+
+    assert labels == [reademail.LABEL_APPROVED_NAME]
+    assert len(replies) == 1
+
+
+def test_factura_con_xml_orden_y_pdf_con_ok_de_compras_se_aprueba(monkeypatch):
+    order_pdf = UnifiedFile("orden de compra.pdf", "application/pdf", b"", "test")
+    printed_email = UnifiedFile(
+        "correo impreso.pdf",
+        "application/pdf",
+        b"",
+        "test",
+        "OK DE COMPRAS",
+    )
+
+    labels, replies = _run_electronic_invoice(monkeypatch, [order_pdf, printed_email])
 
     assert labels == [reademail.LABEL_APPROVED_NAME]
     assert len(replies) == 1

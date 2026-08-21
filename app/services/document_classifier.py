@@ -24,9 +24,8 @@ DEFAULT_OK_COMPRAS_PATTERNS: List[str] = [
     x.strip()
     for x in (
         "ok compras,aprobado compras,aprobada compras,visto bueno compras,vb compras,vobo compras,"
-        "aprobacion compras,aprobación compras,aprobacion de compras,aprobación de compras,"
-        "visto bueno para radicacion,visto bueno para radicación,aprobado para radicar,"
-        "autorizado para radicar,cuenta con visto bueno,recibida a satisfaccion,recibida a satisfacción"
+        "aprobacion compras,autorizado compras,visto bueno para radicacion,aprobado para radicar,"
+        "autorizado para radicar,cuenta con visto bueno,recibida a satisfaccion"
     ).split(",")
     if x.strip()
 ]
@@ -43,12 +42,18 @@ PURCHASE_ORDER_HEADER_REGEX = re.compile(
     r"o\s*\.\s*c\s*\.?|oc(?:\b|(?=[\s_.-])))"
 )
 
+OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX = r"(?:\s+(?:de|por|del|por\s+el\s+area\s+de))?"
+OK_COMPRAS_WITH_PURCHASES_REGEX = re.compile(
+    rf"^(?P<term>.+?){OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras$"
+)
 OK_COMPRAS_FILENAME_REGEXES = (
-    re.compile(r"\bok\s+(?:de\s+)?compras\b"),
-    re.compile(r"\bvisto\s+bueno(?:\s+compras)?\b"),
-    re.compile(r"\bvo\s*bo(?:\s+compras)?\b"),
-    re.compile(r"\bvobo(?:\s+compras)?\b"),
-    re.compile(r"\baprob(?:ado|ada|acion)(?:\s+de)?\s+compras\b"),
+    re.compile(rf"\bok{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras\b"),
+    re.compile(rf"\bvisto\s+bueno(?:{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras)?\b"),
+    re.compile(rf"\bvo\s*bo(?:{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras)?\b"),
+    re.compile(rf"\bvobo(?:{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras)?\b"),
+    re.compile(rf"\bvb(?:{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras)?\b"),
+    re.compile(rf"\baprob(?:ado|ada|acion){OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras\b"),
+    re.compile(rf"\bautorizado{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras\b"),
 )
 
 OK_COMPRAS_NEGATIVE_REGEXES = [
@@ -60,6 +65,13 @@ OK_COMPRAS_NEGATIVE_REGEXES = [
         r"\bno\s+tiene\b",
         r"\bno\s+cuenta\s+con\b",
         r"\brequiere\b",
+        r"\baun\s+no\b",
+        r"\btodavia\s+no\b",
+        r"\bno\s+hay\b",
+        r"\besta\s+pendiente\b",
+        r"\bqueda\s+pendiente\b",
+        r"\bno\s+llega\b",
+        r"\ben\s+espera\b",
     )
 ]
 
@@ -227,23 +239,34 @@ def is_order_file(file_obj: UnifiedFile) -> bool:
     return is_purchase_order_document(file_obj)
 
 
-def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) -> bool:
-    """Detecta un sello/aprobación e ignora negaciones en la misma frase.
+def _compile_ok_compras_pattern(normalized_pattern: str) -> re.Pattern:
+    purchases_match = OK_COMPRAS_WITH_PURCHASES_REGEX.fullmatch(normalized_pattern)
+    if purchases_match:
+        term = re.escape(purchases_match.group("term"))
+        return re.compile(
+            rf"(?<!\w){term}{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras(?!\w)"
+        )
+    return re.compile(rf"(?<!\w){re.escape(normalized_pattern)}(?!\w)")
 
-    La frase comienza después del último punto, punto y coma, dos puntos o salto
-    de línea. Una negación de otra frase nunca veta un OK válido por proximidad.
+
+def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) -> bool:
+    """Detecta una aprobación sin negaciones en la oración completa.
+
+    Cada oración se delimita por puntuación fuerte o salto de línea. Una
+    negación anterior o posterior al término veta la aprobación de esa oración.
     """
     configured_patterns = patterns if patterns is not None else DEFAULT_OK_COMPRAS_PATTERNS
-    normalized_patterns = [normalize_text(pattern) for pattern in configured_patterns if pattern]
-    for raw_phrase in re.split(r"[.;:\n]+", text or ""):
-        normalized_phrase = normalize_text(raw_phrase)
-        for normalized_pattern in normalized_patterns:
-            pattern = re.compile(rf"(?<!\w){re.escape(normalized_pattern)}(?!\w)")
-            for match in pattern.finditer(normalized_phrase):
-                same_phrase_before = normalized_phrase[: match.start()]
-                if any(exclusion.search(same_phrase_before) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
-                    continue
-                return True
+    approval_patterns = [
+        _compile_ok_compras_pattern(normalize_text(pattern))
+        for pattern in configured_patterns
+        if pattern
+    ]
+    for raw_sentence in re.split(r"[.!?;:\n]+", text or ""):
+        normalized_sentence = normalize_text(raw_sentence)
+        if any(exclusion.search(normalized_sentence) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
+            continue
+        if any(pattern.search(normalized_sentence) for pattern in approval_patterns):
+            return True
     return False
 
 
