@@ -248,12 +248,16 @@ OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX = r"(?:\s+(?:de|por|del|por\s+el\s+area\s+de
 OK_COMPRAS_WITH_PURCHASES_REGEX = re.compile(
     rf"^(?P<term>.+?){OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras$"
 )
+OK_COMPRAS_CLAUSE_SEPARATOR_REGEX = re.compile(
+    r"[.!?;:,\n]+|\b(?:y|pero|aunque)\b",
+    re.IGNORECASE,
+)
 OK_COMPRAS_FILENAME_REGEXES = (
     re.compile(rf"\bok{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras\b"),
     re.compile(rf"\bvisto\s+bueno(?:{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras)?\b"),
     re.compile(rf"\bvo\s*bo(?:{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras)?\b"),
     re.compile(rf"\bvobo(?:{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras)?\b"),
-    re.compile(rf"\bvb(?:{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras)?\b"),
+    re.compile(rf"\bvb{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras\b"),
     re.compile(rf"\baprob(?:ado|ada|acion){OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras\b"),
     re.compile(rf"\bautorizado{OK_COMPRAS_OPTIONAL_CONNECTOR_REGEX}\s+compras\b"),
 )
@@ -2297,10 +2301,11 @@ def _compile_ok_compras_pattern(normalized_pattern: str) -> re.Pattern:
 
 
 def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) -> bool:
-    """Detecta una aprobación sin negaciones en la oración completa.
+    """Detecta una aprobación sin negaciones en la misma cláusula.
 
-    Cada oración se delimita por puntuación fuerte o salto de línea. Una
-    negación anterior o posterior al término veta la aprobación de esa oración.
+    Las cláusulas se separan por puntuación, salto de línea y las conjunciones
+    ``y``, ``pero`` y ``aunque``. Una negación solo veta la aprobación de la
+    cláusula donde aparece, antes o después del término.
     """
     configured_patterns = patterns if patterns is not None else OK_COMPRAS_PATTERNS
     approval_patterns = [
@@ -2308,11 +2313,11 @@ def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) ->
         for pattern in configured_patterns
         if pattern
     ]
-    for raw_sentence in re.split(r"[.!?;:\n]+", text or ""):
-        normalized_sentence = normalize_text(raw_sentence)
-        if any(exclusion.search(normalized_sentence) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
+    for raw_clause in OK_COMPRAS_CLAUSE_SEPARATOR_REGEX.split(text or ""):
+        normalized_clause = normalize_text(raw_clause)
+        if any(exclusion.search(normalized_clause) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
             continue
-        if any(pattern.search(normalized_sentence) for pattern in approval_patterns):
+        if any(pattern.search(normalized_clause) for pattern in approval_patterns):
             return True
     return False
 
@@ -2320,7 +2325,7 @@ def contains_ok_compras_text(text: str, patterns: Optional[List[str]] = None) ->
 def filename_declares_ok_compras(filename: str) -> bool:
     """Indica si el nombre identifica un adjunto de OK/visto bueno de compras."""
     stem = os.path.splitext(os.path.basename(filename or ""))[0]
-    normalized_name = normalize_text(stem.replace("_", " "))
+    normalized_name = normalize_text(stem.replace("_", " ").replace("-", " "))
     if any(exclusion.search(normalized_name) for exclusion in OK_COMPRAS_NEGATIVE_REGEXES):
         return False
     return any(pattern.search(normalized_name) for pattern in OK_COMPRAS_FILENAME_REGEXES)

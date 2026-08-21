@@ -66,7 +66,7 @@ Cada correo se evalúa en este orden exacto. El primer filtro que se cumple deci
 | **Nota de crédito** | "nota de crédito", "nota credito", "credit note" | — |
 | **Nota de débito** | "nota de débito", "nota debito", "debit note" | — |
 | **Orden de compra** | Adjunto cuyo nombre indica "orden de compra", "orden", "OC-123" u "O.C.", o cuyo encabezado declara que es una orden | "orden de servicio", "orden de trabajo", "ordenador" o una mención narrativa dentro de la factura |
-| **OK de compras** | Adjunto cuyo nombre o texto contiene "ok compras", "ok de compras", "aprobado compras", "aprobado por compras", "aprobado de compras", "aprobación de compras", "aprobación compras", "visto bueno compras", "visto bueno de compras", "vobo compras", "vobo de compras", "autorizado por compras" o "aprobada compras". También: "aprobado para radicar", "autorizado para radicar", "cuenta con visto bueno", "recibida a satisfacción" y "visto bueno para radicación". | Frases donde la aprobación está negada o pendiente. La negación se evalúa en la **oración completa**, tanto antes como después del término. |
+| **OK de compras** | Adjunto cuyo nombre o texto contiene "ok compras", "ok de compras", "aprobado compras", "aprobado por compras", "aprobado de compras", "aprobación de compras", "aprobación compras", "visto bueno compras", "visto bueno de compras", "vobo compras", "vobo de compras", "autorizado por compras" o "aprobada compras". También: "aprobado para radicar", "autorizado para radicar", "cuenta con visto bueno", "recibida a satisfacción" y "visto bueno para radicación". | Frases donde la aprobación está negada o pendiente en la misma cláusula. Las cláusulas se separan por puntuación, salto de línea y las conjunciones "y", "pero" y "aunque"; la negación se evalúa antes y después del término. |
 | **Entidad administrativa** | NIT exacto o nombre como frase completa, en el **asunto** | Coincidencias parciales dentro de otra palabra o de otro NIT |
 
 La orden y el OK se validan por **presencia del documento adjunto**, no por una
@@ -81,9 +81,9 @@ nombre descriptivo.
 | # | Fuga | Severidad | Estado |
 |---|---|---|---|
 | F1 | Una mención de orden dentro de la factura podía contar como documento adjunto. | 🔴 Alta | ✅ Corregida: se valida presencia por nombre o encabezado del PDF |
-| F2 | La nota de débito no se detecta; sigue al flujo de factura. | 🟠 Media | Pendiente |
+| F2 | La nota de débito no se detecta; sigue al flujo de factura. | 🟠 Media | ✅ Corregida en `5551789` |
 | F3 | "pendiente ok compras" se cuenta como OK aprobado. | 🟠 Media | ✅ Corregida: la negación se evalúa dentro de la misma frase |
-| F4 | La entidad administrativa solo se detecta por el asunto: si el asunto no trae NIT ni nombre, se escapa al flujo de factura. | 🟡 Baja | Por evaluar |
+| F4 | La entidad administrativa solo se detecta por el asunto. | 🟡 Baja | Abierta: El asunto trae NIT en los correos de plataformas DIAN, pero el filtro 5 aplica a todos los correos; una entidad administrativa con asunto libre y NIT solo en el cuerpo se escapa (verificado). |
 | F5 | Una cuenta de cobro de una entidad desconocida puede aprobarse (A1 no aplica a §B). | 🟡 Baja | Decisión tomada |
 
 ---
@@ -100,4 +100,4 @@ nombre descriptivo.
 | §B1 (último filtro de cuenta de cobro) | ✅ Implementado |
 | §B2, B3 | ✅ Implementado |
 | Fugas F1 y F3 | ✅ Corregidas |
-| Fuga F2 | ❌ Pendiente |
+| Fuga F2 | ✅ Corregida en `5551789` |

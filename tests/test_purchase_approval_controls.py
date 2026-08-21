@@ -65,10 +65,21 @@ def test_presencia_no_confunde_otros_adjuntos_con_orden(detector, filename):
         "aprobado por compras.pdf",
         "aprobacion compras.pdf",
         "autorizado por compras.pdf",
+        "vb compras.pdf",
+        "vb de compras.pdf",
+        "ok-compras.pdf",
+        "ok-de-compras.pdf",
+        "aprobado-por-compras.pdf",
     ],
 )
 def test_presencia_detecta_adjunto_de_ok_sin_texto(detector, filename):
     assert detector([UnifiedFile(filename, "application/pdf", b"", "test")]) is True
+
+
+@pytest.mark.parametrize("detector", OK_FILE_DETECTORS)
+@pytest.mark.parametrize("filename", ["Anexo VB Ltda.pdf", "VB-2024-001.pdf"])
+def test_presencia_no_confunde_vb_suelto_con_ok_compras(detector, filename):
+    assert detector([UnifiedFile(filename, "application/pdf", b"", "test")]) is False
 
 
 @pytest.mark.parametrize("detector", ORDER_TEXT_DETECTORS)
@@ -118,9 +129,9 @@ def test_contexto_negativo_descarta_orden_aunque_tenga_identificador(detector):
         "no tiene ok compras",
         "falta ok compras",
         "sin visto bueno compras",
-        "Aún no tenemos el ok compras",
-        "todavía no hay ok de compras",
-        "el ok compras está pendiente",
+        "Aun no tenemos el ok compras",
+        "todavia no hay ok de compras",
+        "el ok compras esta pendiente",
         "el ok de compras aún no llega",
         "queda pendiente el ok de compras",
         "el ok de compras sigue en espera",
@@ -153,6 +164,9 @@ def test_auditoria_no_detecta_ok_negado_o_pendiente(detector, text):
         "cuenta con visto bueno",
         "recibida a satisfaccion",
         "visto bueno para radicación",
+        "Aprobado compras, no tiene observaciones",
+        "Cuenta con visto bueno y no requiere firma adicional",
+        "Aprobado por compras aunque falta el sello del cliente",
     ],
 )
 def test_auditoria_detecta_ok_real(detector, text):
@@ -288,6 +302,18 @@ def test_factura_con_adjuntos_de_orden_y_ok_se_aprueba(monkeypatch):
     labels, replies = _run_electronic_invoice(monkeypatch, [order_pdf, ok_pdf])
 
     assert labels == [reademail.LABEL_APPROVED_NAME]
+    assert len(replies) == 1
+
+
+@pytest.mark.parametrize("filename", ["Anexo VB Ltda.pdf", "VB-2024-001.pdf"])
+def test_factura_con_vb_suelto_no_se_aprueba(monkeypatch, filename):
+    order_pdf = UnifiedFile("orden de compra.pdf", "application/pdf", b"", "test")
+    misleading_pdf = UnifiedFile(filename, "application/pdf", b"", "test")
+
+    labels, replies = _run_electronic_invoice(monkeypatch, [order_pdf, misleading_pdf])
+
+    assert labels == [reademail.LABEL_REJECTED_NAME]
+    assert reademail.LABEL_APPROVED_NAME not in labels
     assert len(replies) == 1
 
 
