@@ -356,8 +356,8 @@ def test_factura_con_orden_negada_y_ok_pendiente_no_se_aprueba(monkeypatch, caps
     assert labels == [reademail.LABEL_REJECTED_NAME]
     assert reademail.LABEL_APPROVED_NAME not in labels
     assert len(replies) == 1
-    assert "No se detectó orden de compra en nombre ni texto de los PDF." in output
-    assert "No se detectó OK de compras dentro de los PDF." in output
+    assert reademail.MISSING_ORDER_MESSAGE in output
+    assert reademail.MISSING_OK_COMPRAS_MESSAGE in output
 
 
 def test_factura_con_adjuntos_de_orden_y_ok_se_aprueba(monkeypatch):

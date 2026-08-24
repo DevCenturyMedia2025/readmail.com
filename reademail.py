@@ -207,6 +207,22 @@ INCOMPLETE_FILES_MESSAGE = (
     "esté completa antes de realizar el envío."
 )
 
+# Motivos de rechazo: le dicen al proveedor qué hacer, no qué falló internamente.
+MISSING_ORDER_MESSAGE = (
+    "Falta la ORDEN DE COMPRA. Adjunte el PDF de la orden que le envió el área de Compras. "
+    "El archivo debe tener un nombre claro (por ejemplo: orden de compra.pdf) y ser un PDF con "
+    "texto seleccionable, no una fotografía ni un escaneo de imagen."
+)
+MISSING_OK_COMPRAS_MESSAGE = (
+    "Falta el OK DE COMPRAS. Solicítelo al área de Compras y adjúntelo como PDF. "
+    "El documento debe contener la frase «OK de compras» en texto seleccionable, "
+    "no como imagen escaneada."
+)
+SELECTABLE_TEXT_NOTICE = (
+    "Recuerde: todos los documentos deben enviarse en PDF con texto seleccionable. "
+    "Los archivos escaneados como imagen no pueden ser leídos y se darán por faltantes."
+)
+
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 STATE_FILE = env_first("GMAIL_WATCH_STATE_FILE", default=os.path.join(_BASE_DIR, "gmail_watch_state.json"))
 
@@ -2685,7 +2701,7 @@ def format_missing_documents(doc_types: List[str]) -> List[str]:
 # RESPONSES
 # ============================================================
 def build_rejected_email(radicado: str, invoice_type: str, reasons: List[str], client_name: Optional[str]) -> Tuple[str, str]:
-    subject = f"RECHAZADO - facturacion no radicada (ID: {radicado})"
+    subject = f"RECHAZADO - facturación no radicada (ID: {radicado})"
     reasons_lines = "\n".join(f"  - {r}" for r in reasons) if reasons else "  - Documentación incompleta o no identificada."
     body = (
         "Hola,\n\n"
@@ -2696,6 +2712,7 @@ def build_rejected_email(radicado: str, invoice_type: str, reasons: List[str], c
         "Motivos del rechazo:\n"
         f"{reasons_lines}\n\n"
         "Por favor revisa que la documentación esté completa y vuelve a enviar.\n\n"
+        f"{SELECTABLE_TEXT_NOTICE}\n\n"
         "Gracias,\n"
         "Equipo de Facturación\n"
     )
@@ -3186,8 +3203,8 @@ def process_message(
         validation_status = str(cuenta_cobro_validation.get("estado") or "")
 
         if validation_status == "incompleto":
-            faltantes = cuenta_cobro_validation.get("faltantes") or []
-            reasons.append("Cuenta de cobro incompleta. Faltan: " + ", ".join(str(x) for x in faltantes) + ".")
+            faltantes = format_missing_documents(cuenta_cobro_validation.get("faltantes") or [])
+            reasons.append("Cuenta de cobro incompleta. Faltan: " + ", ".join(faltantes) + ".")
         print("📦 Validación cuenta de cobro:", json.dumps(cuenta_cobro_validation, ensure_ascii=False))
         if zip_errors:
             reasons.extend(zip_errors)
@@ -3233,10 +3250,10 @@ def process_message(
     missing_purchase_documents: List[str] = []
     if invoice_type != "CUENTA DE COBRO":
         if not has_order:
-            reasons.append("No se detectó orden de compra en nombre ni texto de los PDF.")
+            reasons.append(MISSING_ORDER_MESSAGE)
             missing_purchase_documents.append("orden de compra")
         if not has_ok_compras:
-            reasons.append("No se detectó OK de compras dentro de los PDF.")
+            reasons.append(MISSING_OK_COMPRAS_MESSAGE)
             missing_purchase_documents.append("OK de compras")
 
     if reasons and invoice_type != "CUENTA DE COBRO" and MODO_PRUEBAS:

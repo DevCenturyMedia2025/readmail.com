@@ -3,7 +3,7 @@ from app.models import ClientMatchResult, ClientRecord
 from reademail import UnifiedFile
 
 
-def _run_message(monkeypatch, files, zip_errors=None):
+def _run_message(monkeypatch, files, zip_errors=None, faltantes=None):
     state = {}
     calls = {
         "labels": [],
@@ -56,7 +56,7 @@ def _run_message(monkeypatch, files, zip_errors=None):
         calls["cuenta_validation"].append(files_to_validate)
         return {
             "estado": "incompleto",
-            "faltantes": ["rut"],
+            "faltantes": list(faltantes) if faltantes is not None else ["rut"],
             "identificados": {"cuenta_cobro": ["cuenta de cobro.pdf (nombre)"]},
         }
 
@@ -132,3 +132,33 @@ def test_cuenta_cobro_con_zip_ilegible_conserva_error_como_motivo(monkeypatch):
     assert calls["labels"][0] == (reademail.LABEL_REJECTED_NAME, reademail.ARCHIVE_REJECTED)
     assert len(calls["replies"]) == 1
     assert zip_error in calls["replies"][0][4]
+
+
+def test_cuenta_cobro_lista_faltantes_con_nombres_legibles(monkeypatch):
+    """El proveedor ve 'cédula', no la clave interna 'cedula'."""
+    pdf = UnifiedFile("cuenta de cobro.pdf", "application/pdf", b"", "test")
+
+    calls = _run_message(
+        monkeypatch,
+        [pdf],
+        faltantes=["cuenta_cobro", "cedula", "rut", "certificado_bancario", "orden_compra"],
+    )
+
+    body = calls["replies"][0][4]
+    assert (
+        "Cuenta de cobro incompleta. Faltan: "
+        "cuenta de cobro, cédula, RUT, certificado bancario, orden de compra." in body
+    )
+    for clave_interna in ("cuenta_cobro", "cedula", "certificado_bancario", "orden_compra"):
+        assert clave_interna not in body
+
+
+def test_cuenta_cobro_incluye_nota_de_texto_seleccionable_y_asunto_con_tilde(monkeypatch):
+    pdf = UnifiedFile("cuenta de cobro.pdf", "application/pdf", b"", "test")
+
+    calls = _run_message(monkeypatch, [pdf], faltantes=["rut"])
+
+    subject, body = calls["replies"][0][3], calls["replies"][0][4]
+    assert subject.startswith("RECHAZADO - facturación no radicada (ID: ")
+    assert reademail.SELECTABLE_TEXT_NOTICE in body
+    assert body.index(reademail.SELECTABLE_TEXT_NOTICE) < body.index("Gracias,")

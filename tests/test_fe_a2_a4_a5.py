@@ -182,8 +182,8 @@ def test_fe_con_zip_ilegible_va_a_revision_sin_responder(monkeypatch, caplog):
     assert calls["state"]["processed_message_ids"] == ["message-fe"]
     assert "replied_message_ids" not in calls["state"]
     assert f"🟨 REVISIÓN MANUAL | {radicado} | no se pudo leer el paquete: ['{zip_error}']" in caplog.text
-    assert "No se detectó orden de compra" not in caplog.text
-    assert "No se detectó OK de compras" not in caplog.text
+    assert "Falta la ORDEN DE COMPRA" not in caplog.text
+    assert "Falta el OK DE COMPRAS" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -191,13 +191,13 @@ def test_fe_con_zip_ilegible_va_a_revision_sin_responder(monkeypatch, caplog):
     [
         (
             _pdf("factura.pdf", "OK compras"),
-            "No se detectó orden de compra en nombre ni texto de los PDF.",
-            "No se detectó OK de compras dentro de los PDF.",
+            reademail.MISSING_ORDER_MESSAGE,
+            reademail.MISSING_OK_COMPRAS_MESSAGE,
         ),
         (
             _pdf("orden de compra.pdf"),
-            "No se detectó OK de compras dentro de los PDF.",
-            "No se detectó orden de compra en nombre ni texto de los PDF.",
+            reademail.MISSING_OK_COMPRAS_MESSAGE,
+            reademail.MISSING_ORDER_MESSAGE,
         ),
     ],
 )
@@ -216,6 +216,29 @@ def test_fe_real_rechaza_solo_por_orden_u_ok(
     assert unexpected_reason not in rejection_body
     assert "Factura electrónica: archivos incompletos" not in rejection_body
     assert "No se logró identificar el cliente" not in rejection_body
+
+
+def test_rechazo_fe_usa_mensajes_accionables_y_nota_de_texto_seleccionable(monkeypatch):
+    """El proveedor recibe qué hacer, no el detalle técnico de la detección."""
+    calls = _run_fe(monkeypatch, [_pdf("factura.pdf")], modo_pruebas=False)
+
+    subject, body = calls["replies"][0][3], calls["replies"][0][4]
+
+    assert subject.startswith("RECHAZADO - facturación no radicada (ID: ")
+
+    assert "Falta la ORDEN DE COMPRA." in body
+    assert "Adjunte el PDF de la orden que le envió el área de Compras." in body
+    assert "por ejemplo: orden de compra.pdf" in body
+
+    assert "Falta el OK DE COMPRAS." in body
+    assert "Solicítelo al área de Compras y adjúntelo como PDF." in body
+    assert "«OK de compras»" in body
+
+    assert reademail.SELECTABLE_TEXT_NOTICE in body
+    assert body.index(reademail.SELECTABLE_TEXT_NOTICE) < body.index("Gracias,")
+
+    # Ya no se filtra el lenguaje técnico anterior.
+    assert "No se detectó" not in body
 
 
 @pytest.mark.parametrize(
