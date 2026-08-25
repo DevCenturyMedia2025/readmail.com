@@ -686,7 +686,11 @@ def get_oauth_creds(
 # ============================================================
 def _header_aliases() -> Dict[str, Set[str]]:
     return {
-        "cliente": {"cliente", "razon social", "razón social", "nombre cliente", "client", "empresa", "proveedor", "proverdor"},
+        "cliente": {
+            "cliente", "razon social", "razón social", "nombre cliente", "client",
+            "empresa", "proveedor", "proverdor",
+            "nombre", "nombre del cliente", "razon",
+        },
         "nit": {"nit", "nit cliente", "tax id"},
         "estado": {"estado", "activo", "status"},
         "email": {"email", "correo", "email contacto", "correo contacto", "correo electronico", "correo electrónico", "email de contacto"},
@@ -704,10 +708,19 @@ def _resolve_column_indexes(headers: List[str]) -> Dict[str, Optional[int]]:
                 resolved[logical_name] = idx
                 break
 
+    # Fallback posicional: solo para columnas que ningún encabezado identificó.
+    # Nunca reutiliza una columna ya asignada a otro campo; si no, una hoja como
+    # ID|Nit|Nombre sin alias para "Nombre" cargaría los ID como nombre.
+    ocupadas = {idx for idx in resolved.values() if idx is not None}
     if resolved["cliente"] is None and headers:
-        resolved["cliente"] = 0
+        resolved["cliente"] = next(
+            (idx for idx in range(len(headers)) if idx not in ocupadas), 0
+        )
+        ocupadas.add(resolved["cliente"])
     if resolved["nit"] is None and len(headers) > 1:
-        resolved["nit"] = 1
+        resolved["nit"] = next(
+            (idx for idx in range(1, len(headers)) if idx not in ocupadas), 1
+        )
     return resolved
 
 
