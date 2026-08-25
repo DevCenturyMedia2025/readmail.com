@@ -75,6 +75,24 @@ def test_hoja_real_permite_identificar_al_cliente_por_nombre(construir):
 
 
 @pytest.mark.parametrize("construir", CONSTRUCTORES)
+def test_columna_nit_vacia_no_impide_cargar_por_nombre(construir):
+    """La columna Nit de la hoja real esta vacia y no se va a llenar."""
+    catalogo = construir(
+        [
+            HOJA_REAL,
+            ["CLI-20260804-AAAA111111", "", "DISTRIBUIDORA EJEMPLO SAS", "pagos@ejemplo.test", "Activo"],
+            ["CLI-20260804-BBBB222222", "", "OTRO CLIENTE SAS", "otro@ejemplo.test", "Activo"],
+        ],
+        sheet_range="Clientes!A:Z",
+    )
+
+    assert [r.name for r in catalogo] == ["DISTRIBUIDORA EJEMPLO SAS", "OTRO CLIENTE SAS"]
+    assert all(r.nit is None for r in catalogo)
+    encontrado = reademail.match_client_raw_to_catalog("DISTRIBUIDORA EJEMPLO SAS", catalogo)
+    assert encontrado is not None
+
+
+@pytest.mark.parametrize("construir", CONSTRUCTORES)
 def test_hoja_real_conserva_nit_y_correo_por_fila(construir):
     catalogo = construir([HOJA_REAL] + FILAS_REALES, sheet_range="Clientes!A:Z")
 

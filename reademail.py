@@ -2491,6 +2491,16 @@ def extract_order_fields_by_layout(pdf_bytes: bytes) -> Dict[str, str]:
     return campos
 
 
+def clean_client_display_name(raw_client: str) -> str:
+    """Deja presentable el nombre leído de la orden cuando no está en el catálogo.
+
+    Colapsa espacios y quita la puntuación de borde que suele arrastrar el
+    recorte del PDF (":", ".", ",", ";", "-").
+    """
+    limpio = re.sub(r"\s+", " ", str(raw_client or "")).strip()
+    return limpio.strip(":.,;-").strip()
+
+
 def identify_client_in_order_pdfs(pdfs: List[UnifiedFile], catalog: List[ClientRecord]) -> ClientMatchResult:
     order_files = []
     for pdf in pdfs:
@@ -3352,36 +3362,33 @@ def process_message(
     client_catalog_only = client_lookup_catalog(catalog)
     client_candidate_texts = [subject, body_text, snippet] + [f.name for f in pdfs] + [f.extracted_text for f in pdfs]
     order_client_result = identify_client_in_order_pdfs(pdfs, client_catalog_only) if invoice_type != "CUENTA DE COBRO" else ClientMatchResult()
+
+    # Resolución del cliente. Estar en la hoja da un nombre uniforme entre
+    # facturas, pero NO estar ya no frena la radicación: si la orden trae un
+    # nombre legible se usa tal cual. Solo se frena si no hay nombre alguno.
+    # Ojo: aquí solo se resuelve; la decisión de ruta va después de orden/OK.
+    client_match: Optional[ClientRecord] = None
+    client_display_name: Optional[str] = None
     if order_client_result.record:
         client_match = order_client_result.record
-        logger.info("✅ Fuente final cliente: ORDER_BLOCK")
+        client_display_name = client_match.name
+        logger.info("✅ Fuente final cliente: ORDER_BLOCK con match de catálogo: %s", client_display_name)
     elif order_client_result.raw:
-        client_match = None
-        logger.info("⚠️ Fuente final cliente: ORDER_BLOCK sin match de catálogo")
+        client_display_name = clean_client_display_name(order_client_result.raw)
+        logger.info(
+            "✅ Fuente final cliente: ORDER_BLOCK sin match de catálogo; "
+            "se usa el nombre leído de la orden: %s",
+            client_display_name,
+        )
     elif invoice_type != "CUENTA DE COBRO" and has_order:
-        client_match = None
         logger.info("⚠️ Fuente final cliente: ORDER_BLOCK sin cliente detectado")
     else:
         client_match = identify_client_from_fields(client_candidate_texts, client_catalog_only) or identify_client(
             candidate_texts=client_candidate_texts,
             catalog=client_catalog_only,
         )
+        client_display_name = client_match.name if client_match else None
         logger.info(f"🔎 Fuente final cliente: {'FALLBACK' if client_match else 'SIN_CLIENTE'}")
-    if invoice_type != "CUENTA DE COBRO" and not client_match:
-        apply_single_status_label(
-            gmail_service,
-            message_id,
-            LABEL_REVIEW_NAME,
-            archive=ARCHIVE_REVIEW,
-        )
-        logger.info(
-            "🟨 REVISIÓN MANUAL | %s | factura electrónica sin cliente identificado; "
-            "no se responde al proveedor",
-            radicado,
-        )
-        state_add_processed(state, message_id)
-        save_state(state, account_id)
-        return
 
     has_ok_compras = detect_ok_compras(pdfs)
     missing_purchase_documents: List[str] = []
@@ -3511,7 +3518,7 @@ def process_message(
             radicado=radicado,
             invoice_type=invoice_type,
             reasons=reasons,
-            client_name=client_match.name if client_match else None,
+            client_name=client_display_name,
         )
 
         def attempt_rejection_send(destination: str, send_operation) -> bool:
@@ -3644,11 +3651,30 @@ def process_message(
         print("=" * 80)
         return
 
+    # Cliente ilegible: se evalúa DESPUÉS de orden y OK. Una factura sin orden
+    # no tiene de dónde leer el cliente, y frenarla aquí le impedía llegar al
+    # reenvío a Compras, que es justamente quien resuelve la falta de orden.
+    if invoice_type != "CUENTA DE COBRO" and not client_display_name:
+        apply_single_status_label(
+            gmail_service,
+            message_id,
+            LABEL_REVIEW_NAME,
+            archive=ARCHIVE_REVIEW,
+        )
+        logger.info(
+            "🟨 REVISIÓN MANUAL | %s | la orden está presente pero no se pudo leer "
+            "el cliente; no se responde al proveedor",
+            radicado,
+        )
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
     apply_single_status_label(gmail_service, message_id, LABEL_APPROVED_NAME, archive=ARCHIVE_APPROVED)
     approved_subject, approved_body = build_approved_email(
         radicado=radicado,
         invoice_type=invoice_type,
-        client_name=client_match.name if client_match else "No identificado",
+        client_name=client_display_name or "No identificado",
         pdf_count=len(pdfs),
         xml_count=len(xmls),
     )
@@ -3669,7 +3695,7 @@ def process_message(
     print(f"🟩 APROBADO | {radicado}")
     print(f"From: {from_header}")
     print(f"Subject: {subject}")
-    print(f"Cliente: {client_match.name if client_match else 'No identificado'}")
+    print(f"Cliente: {client_display_name or 'No identificado'}")
     print(f"Tipo: {invoice_type}")
     print(f"PDF: {len(pdfs)} | XML: {len(xmls)}")
     if zip_analyses:
