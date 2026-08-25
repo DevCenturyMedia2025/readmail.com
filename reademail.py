@@ -2371,6 +2371,113 @@ def is_order_file(file_obj: UnifiedFile) -> bool:
     return is_purchase_order_document(file_obj)
 
 
+ORDER_LAYOUT_LABELS = ("cliente", "nit", "no", "producto", "fecha", "no ppto")
+ORDER_LAYOUT_ROW_TOLERANCE = 4.0
+
+
+def _normalize_order_layout_word(word: str) -> str:
+    """Normaliza una palabra del PDF para compararla con una etiqueta."""
+    return normalize_text((word or "").replace(":", " "))
+
+
+def extract_order_fields_by_layout(pdf_bytes: bytes) -> Dict[str, str]:
+    """
+    Lee los campos de una orden de compra usando las COORDENADAS del PDF.
+
+    pypdf extrae el texto linealmente y en este formato los valores salen ANTES
+    que las etiquetas, por eso buscar "CLIENTE:" y tomar lo siguiente falla.
+    Con coordenadas el valor es lo que está a la DERECHA de la etiqueta, en la
+    misma fila.
+
+    Devuelve un dict con las claves encontradas: "cliente", "nit", "no",
+    "producto", "fecha". Omite las que no aparezcan.
+    Devuelve {} si el PDF no abre, no tiene capa de texto, o pymupdf no está.
+    """
+    campos: Dict[str, str] = {}
+    if not pdf_bytes:
+        # Adjunto sin bytes descargados: es normal, no merece un WARNING.
+        return {}
+
+    try:
+        import pymupdf  # import local: su ausencia no debe romper el módulo
+
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            for page in doc:
+                palabras = page.get_text("words") or []
+                if not palabras:
+                    continue
+
+                # Posición de cada etiqueta encontrada en esta página.
+                etiquetas: Dict[str, List[Tuple[float, float, float]]] = {}
+                for x0, y0, x1, _y1, texto, *_ in palabras:
+                    normalizada = _normalize_order_layout_word(texto)
+                    if normalizada in ORDER_LAYOUT_LABELS:
+                        etiquetas.setdefault(normalizada, []).append((x0, y0, x1))
+
+                # Con dos "NIT" (emisor arriba, cliente en el bloque central) nos
+                # quedamos con el de la misma columna que "CLIENTE". Confundirlos
+                # asignaría la factura al emisor en vez de al cliente.
+                #
+                # Si ambos comparten columna el criterio de x empata, así que se
+                # desempata por cercanía vertical prefiriendo el que está DEBAJO
+                # de "CLIENTE": el bloque del cliente lista CLIENTE y luego su NIT.
+                if len(etiquetas.get("nit", [])) > 1:
+                    if etiquetas.get("cliente"):
+                        x0_cliente, y0_cliente, _ = etiquetas["cliente"][0]
+                        etiquetas["nit"] = [
+                            min(
+                                etiquetas["nit"],
+                                key=lambda pos: (
+                                    abs(pos[0] - x0_cliente),
+                                    0 if pos[1] > y0_cliente else 1,
+                                    abs(pos[1] - y0_cliente),
+                                ),
+                            )
+                        ]
+                    else:
+                        # Sin "CLIENTE" no hay forma de saber cuál NIT es el del
+                        # cliente. Preferimos no devolver ninguno antes que
+                        # arriesgarnos a entregar el del emisor.
+                        etiquetas.pop("nit", None)
+
+                for nombre, posiciones in etiquetas.items():
+                    if nombre in campos:
+                        continue
+                    _x0_etiqueta, y0_etiqueta, x1_etiqueta = posiciones[0]
+                    a_la_derecha = sorted(
+                        (
+                            (x0, texto)
+                            for x0, y0, _x1, _y1, texto, *_ in palabras
+                            if abs(y0 - y0_etiqueta) < ORDER_LAYOUT_ROW_TOLERANCE
+                            and x0 > x1_etiqueta
+                        ),
+                        key=lambda item: item[0],
+                    )
+
+                    # El valor termina donde empieza la siguiente etiqueta de la
+                    # misma fila: en un layout de dos columnas, "CLIENTE: X"
+                    # seguido de "FECHA: Y" no debe devolver "X FECHA: Y".
+                    #
+                    # Solo corta una etiqueta CON dos puntos. Sin esa condición,
+                    # un nombre como "EMPRESA NO REGISTRADA SAS" se truncaría en
+                    # "EMPRESA", porque "no" también es una etiqueta buscada.
+                    partes: List[str] = []
+                    for _x0, texto in a_la_derecha:
+                        es_etiqueta = _normalize_order_layout_word(texto) in ORDER_LAYOUT_LABELS
+                        if es_etiqueta and ":" in texto:
+                            break
+                        partes.append(texto)
+
+                    valor = " ".join(partes).strip()
+                    if valor:
+                        campos[nombre] = valor
+    except Exception as error:
+        logger.warning("⚠️ No pude leer los campos de la orden por layout: %s", error)
+        return {}
+
+    return campos
+
+
 def identify_client_in_order_pdfs(pdfs: List[UnifiedFile], catalog: List[ClientRecord]) -> ClientMatchResult:
     order_files = []
     for pdf in pdfs:
@@ -2385,6 +2492,23 @@ def identify_client_in_order_pdfs(pdfs: List[UnifiedFile], catalog: List[ClientR
     for pdf in order_files:
         order_text = f"{pdf.name}\n{pdf.extracted_text}"
         logger.info(f"🔎 Orden evaluada: {pdf.name}")
+
+        # (a) por layout: el nombre del cliente leído por coordenadas
+        campos = extract_order_fields_by_layout(pdf.data)
+        cliente_layout = campos.get("cliente", "").strip()
+        if cliente_layout:
+            record = match_client_raw_to_catalog(cliente_layout, catalog)
+            if record:
+                logger.info(f"✅ Cliente identificado por layout: {record.name} | archivo={pdf.name}")
+                return ClientMatchResult(record=record, raw=cliente_layout, source="ORDER_BLOCK")
+
+        # (b) por NIT leído del layout
+        nit_layout = campos.get("nit", "").strip()
+        if nit_layout:
+            record = find_client_by_nit(nit_layout, catalog)
+            if record:
+                logger.info(f"✅ Cliente identificado por NIT del layout: {record.name} | archivo={pdf.name}")
+                return ClientMatchResult(record=record, raw=nit_layout, source="ORDER_BLOCK")
 
         raw_client = extract_order_client_raw(order_text)
         logger.info(f"🔎 Cliente crudo extraído desde orden: {raw_client or 'No encontrado'}")
