@@ -168,6 +168,7 @@ ACTIVE_VALUES = {x.strip().lower() for x in env_first("ACTIVE_VALUES", default="
 LABEL_ADMIN_NAME = env_first("LABEL_ADMIN_NAME", default="ADMINISTRATIVA")
 LABEL_REVIEW_NAME = env_first("LABEL_REVIEW_NAME", default="REVISIÓN MANUAL")
 LABEL_NOTE_CREDIT_NAME = env_first("LABEL_NOTE_CREDIT_NAME", default="NOTA DE CRÉDITO")
+LABEL_NOTE_DEBIT_NAME = env_first("LABEL_NOTE_DEBIT_NAME", default="NOTA DE DÉBITO")
 LABEL_APPROVED_NAME = env_first("LABEL_APPROVED_NAME", "LABEL_ACCEPTED_NAME", default="APROBADOS")
 LABEL_REJECTED_NAME = env_first("LABEL_REJECTED_NAME", default="RECHAZADOS")
 
@@ -181,6 +182,8 @@ ARCHIVE_APPROVED = env_bool("ARCHIVE_APPROVED", default=ARCHIVE_ON_STATUS_LEGACY
 ARCHIVE_REJECTED = env_bool("ARCHIVE_REJECTED", default=ARCHIVE_ON_STATUS_LEGACY)
 ARCHIVE_ADMIN = env_bool("ARCHIVE_ADMIN", default=True)
 ARCHIVE_NOTE_CREDIT = env_bool("ARCHIVE_NOTE_CREDIT", default=True)
+# Por defecto la nota de débito se archiva igual que la de crédito.
+ARCHIVE_NOTE_DEBIT = env_bool("ARCHIVE_NOTE_DEBIT", default=ARCHIVE_NOTE_CREDIT)
 ARCHIVE_REVIEW = env_bool("ARCHIVE_REVIEW", default=False)
 
 # Compatibilidad con el .env anterior
@@ -1824,7 +1827,14 @@ def ensure_label_exists(gmail_service, label_name: str) -> Optional[str]:
 
 def ensure_status_labels(gmail_service) -> Dict[str, Optional[str]]:
     label_ids = {}
-    for name in [LABEL_ADMIN_NAME, LABEL_REVIEW_NAME, LABEL_NOTE_CREDIT_NAME, LABEL_APPROVED_NAME, LABEL_REJECTED_NAME]:
+    for name in [
+        LABEL_ADMIN_NAME,
+        LABEL_REVIEW_NAME,
+        LABEL_NOTE_CREDIT_NAME,
+        LABEL_NOTE_DEBIT_NAME,
+        LABEL_APPROVED_NAME,
+        LABEL_REJECTED_NAME,
+    ]:
         label_ids[name] = ensure_label_exists(gmail_service, name)
     return label_ids
 
@@ -2313,33 +2323,64 @@ def extract_nit_from_text(text: str) -> Optional[str]:
     return nit or None
 
 
-def contains_credit_or_debit_note_text(text: str) -> bool:
-    """Detecta notas de crédito o débito en español e inglés."""
+def _contains_note_text(text: str, tipo_es: str, tipo_en: str) -> bool:
+    """Detecta una nota del tipo indicado, en español e inglés.
+
+    Exige la palabra "nota"/"note": así "débito automático" o "tarjeta débito"
+    no cuentan. Admite singular y plural, mayúsculas y tildes.
+    """
     normalized_text = normalize_text(text)
     if not normalized_text:
         return False
     return bool(
-        re.search(r"\bnota\s+(?:de\s+)?(?:credito|debito)\b", normalized_text)
-        or re.search(r"\b(?:credit|debit)\s+note\b", normalized_text)
+        re.search(rf"\bnotas?\s+(?:de\s+)?{tipo_es}\b", normalized_text)
+        or re.search(rf"\b{tipo_en}\s+notes?\b", normalized_text)
     )
+
+
+def contains_credit_note_text(text: str) -> bool:
+    """Detecta "nota de crédito" / "credit note" (y sus plurales)."""
+    return _contains_note_text(text, "credito", "credit")
+
+
+def contains_debit_note_text(text: str) -> bool:
+    """Detecta "nota de débito" / "debit note" (y sus plurales)."""
+    return _contains_note_text(text, "debito", "debit")
+
+
+def contains_credit_or_debit_note_text(text: str) -> bool:
+    """Alias histórico: verdadero si el texto declara cualquiera de las dos."""
+    return contains_credit_note_text(text) or contains_debit_note_text(text)
 
 
 # Alias retrocompatible para llamadores e imports existentes.
 contains_note_credit_text = contains_credit_or_debit_note_text
 
 
+def is_credit_note_by_filename(pdfs: List[UnifiedFile]) -> bool:
+    return any(contains_credit_note_text(pdf.name) for pdf in pdfs)
+
+
+def is_credit_note_by_text(pdfs: List[UnifiedFile]) -> bool:
+    return any(contains_credit_note_text(pdf.extracted_text) for pdf in pdfs)
+
+
+def is_debit_note_by_filename(pdfs: List[UnifiedFile]) -> bool:
+    return any(contains_debit_note_text(pdf.name) for pdf in pdfs)
+
+
+def is_debit_note_by_text(pdfs: List[UnifiedFile]) -> bool:
+    return any(contains_debit_note_text(pdf.extracted_text) for pdf in pdfs)
+
+
 def is_note_credit_by_filename(pdfs: List[UnifiedFile]) -> bool:
-    for pdf in pdfs:
-        if contains_credit_or_debit_note_text(pdf.name):
-            return True
-    return False
+    """Alias histórico: crédito o débito por nombre de PDF."""
+    return is_credit_note_by_filename(pdfs) or is_debit_note_by_filename(pdfs)
 
 
 def is_note_credit_by_text(pdfs: List[UnifiedFile]) -> bool:
-    for pdf in pdfs:
-        if contains_credit_or_debit_note_text(pdf.extracted_text):
-            return True
-    return False
+    """Alias histórico: crédito o débito por texto de PDF."""
+    return is_credit_note_by_text(pdfs) or is_debit_note_by_text(pdfs)
 
 
 def filename_declares_purchase_order(filename: str) -> bool:
@@ -3275,10 +3316,19 @@ def process_message(
             f"REVISIÓN MANUAL | asunto={subject[:60]} | {radicado}"
         )
 
-    # 3) Nota de crédito: texto del correo
-    if contains_credit_or_debit_note_text(combined_email_text):
+    # 3) Nota de crédito o débito: texto del correo.
+    # Precedencia: crédito primero, por ser el caso frecuente. Un correo que
+    # declarara las dos cosas se archiva como nota de crédito.
+    if contains_credit_note_text(combined_email_text):
         apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
-        print(f"🟪 NOTA DE CREDITO por correo | {radicado}")
+        print(f"🟪 NOTA DE CRÉDITO por correo | {radicado}")
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
+    if contains_debit_note_text(combined_email_text):
+        apply_single_status_label(gmail_service, message_id, LABEL_NOTE_DEBIT_NAME, archive=ARCHIVE_NOTE_DEBIT)
+        print(f"🟦 NOTA DE DÉBITO por correo | {radicado}")
         state_add_processed(state, message_id)
         save_state(state, account_id)
         return
@@ -3309,18 +3359,32 @@ def process_message(
         save_state(state, account_id)
         return
 
-    # 5) Nota de crédito: nombre del PDF
-    if is_note_credit_by_filename(pdfs):
+    # 5) Nota de crédito o débito: nombre del PDF
+    if is_credit_note_by_filename(pdfs):
         apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
-        print(f"🟪 NOTA DE CREDITO por nombre | {radicado}")
+        print(f"🟪 NOTA DE CRÉDITO por nombre | {radicado}")
         state_add_processed(state, message_id)
         save_state(state, account_id)
         return
 
-    # 6) Nota de crédito: texto del PDF
-    if is_note_credit_by_text(pdfs):
+    if is_debit_note_by_filename(pdfs):
+        apply_single_status_label(gmail_service, message_id, LABEL_NOTE_DEBIT_NAME, archive=ARCHIVE_NOTE_DEBIT)
+        print(f"🟦 NOTA DE DÉBITO por nombre | {radicado}")
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
+    # 6) Nota de crédito o débito: texto del PDF
+    if is_credit_note_by_text(pdfs):
         apply_single_status_label(gmail_service, message_id, LABEL_NOTE_CREDIT_NAME, archive=ARCHIVE_NOTE_CREDIT)
-        print(f"🟪 NOTA DE CREDITO por texto | {radicado}")
+        print(f"🟪 NOTA DE CRÉDITO por texto | {radicado}")
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
+    if is_debit_note_by_text(pdfs):
+        apply_single_status_label(gmail_service, message_id, LABEL_NOTE_DEBIT_NAME, archive=ARCHIVE_NOTE_DEBIT)
+        print(f"🟦 NOTA DE DÉBITO por texto | {radicado}")
         state_add_processed(state, message_id)
         save_state(state, account_id)
         return

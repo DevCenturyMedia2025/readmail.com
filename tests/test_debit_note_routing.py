@@ -2,10 +2,11 @@ import reademail
 from reademail import UnifiedFile
 
 
-def test_pdf_nota_debito_va_a_etiqueta_nota_credito_sin_responder(
+def test_pdf_nota_debito_va_a_su_propia_etiqueta_sin_responder(
     monkeypatch,
     capsys,
 ):
+    """Antes compartia etiqueta con la nota de credito; ahora tiene la suya."""
     state = {}
     labels = []
     replies = []
@@ -52,8 +53,9 @@ def test_pdf_nota_debito_va_a_etiqueta_nota_credito_sin_responder(
 
     reademail.process_message(object(), object(), "message-debit-note", [])
 
-    assert labels == [(reademail.LABEL_NOTE_CREDIT_NAME, reademail.ARCHIVE_NOTE_CREDIT)]
+    assert labels == [(reademail.LABEL_NOTE_DEBIT_NAME, reademail.ARCHIVE_NOTE_DEBIT)]
+    assert reademail.LABEL_NOTE_CREDIT_NAME not in [nombre for nombre, _ in labels]
     assert replies == []
     assert state["processed_message_ids"] == ["message-debit-note"]
     assert saved_states[-1]["processed_message_ids"] == ["message-debit-note"]
-    assert "NOTA DE CREDITO por nombre" in capsys.readouterr().out
+    assert "NOTA DE DÉBITO por nombre" in capsys.readouterr().out

@@ -12,7 +12,8 @@ Cada correo procesado queda con **una sola** etiqueta de estado:
 | **APROBADOS** | Factura recibida y validada | Nada. Sigue el proceso interno de radicación. |
 | **RECHAZADOS** | Le faltó documentación al proveedor | Nada. Ya se le respondió pidiendo que complete. |
 | **ADMINISTRATIVA** | Entidad de las listas Administrativas/CajaMenor | Se archiva por tipo, no se valida. |
-| **NOTA DE CRÉDITO** | Nota de crédito o de débito | Gestión contable manual. |
+| **NOTA DE CRÉDITO** | Nota de crédito | Gestión contable manual. |
+| **NOTA DE DÉBITO** | Nota de débito | Gestión contable manual. |
 | **REVISIÓN MANUAL** | El programa no pudo resolverlo solo | **Requiere que alguien lo mire.** Ver sección 4. |
 
 ## 2. El portal web (registro de entidades)

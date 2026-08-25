@@ -5,7 +5,7 @@
 > especificación original diferían, se documentó el código: las diferencias
 > resultaron ser decisiones correctas y quedan explicadas en su sección.
 > Sirve como referencia de negocio y como base para auditar cambios futuros.
-> Actualizado: 24 de agosto de 2026
+> Actualizado: 25 de agosto de 2026
 
 ## Orden de evaluación
 
@@ -19,12 +19,15 @@ Cada correo se evalúa en este orden exacto. El primer filtro que se cumple deci
 | 3 | **Sin remitente** | No se puede extraer el correo del remitente | Se descarta, sin respuesta |
 | 4 | **Sin adjuntos** | `ONLY_WITH_ATTACHMENTS=true` y no hay adjuntos | Se ignora |
 | 5 | **Administrativa** | NIT o nombre del asunto está en `Administrativas` o `CajaMenor` | ADMINISTRATIVA |
-| 6a | **Nota de crédito/débito — por texto del correo** | Texto en asunto, cuerpo o snippet | NOTA DE CRÉDITO |
+| 6a | **Nota de crédito — por texto del correo** | Texto en asunto, cuerpo o snippet | NOTA DE CRÉDITO |
+| 6b | **Nota de débito — por texto del correo** | Texto en asunto, cuerpo o snippet | NOTA DE DÉBITO |
 | 7 | **Tipo** | ¿Trae XML? | Sí → §A · No → §B |
 | 8 | **Paquete ilegible** *(solo §A)* | Hubo errores al abrir un ZIP **y** el correo trae XML | REVISIÓN MANUAL, sin responder |
 | 9 | **Sin PDF** | Ningún PDF entre los adjuntos (tras abrir ZIP) | REVISIÓN MANUAL |
-| 10a | **Nota de crédito/débito — por nombre de PDF** | El nombre de algún PDF declara la nota | NOTA DE CRÉDITO |
-| 10b | **Nota de crédito/débito — por texto de PDF** | El texto extraído de algún PDF declara la nota | NOTA DE CRÉDITO |
+| 10a | **Nota de crédito — por nombre de PDF** | El nombre de algún PDF declara la nota | NOTA DE CRÉDITO |
+| 10b | **Nota de débito — por nombre de PDF** | El nombre de algún PDF declara la nota | NOTA DE DÉBITO |
+| 10c | **Nota de crédito — por texto de PDF** | El texto extraído de algún PDF declara la nota | NOTA DE CRÉDITO |
+| 10d | **Nota de débito — por texto de PDF** | El texto extraído de algún PDF declara la nota | NOTA DE DÉBITO |
 
 ### Nota sobre el filtro 2 (antigüedad) y `MODO_PRUEBAS`
 
@@ -40,13 +43,18 @@ barreras y solo la primera se evalúa antes de abrir el paquete:
 
 | Barrera | Fuente | Posición |
 |---|---|---|
-| 6a | Asunto, cuerpo y snippet del correo | **Antes** de determinar el tipo, del chequeo de ZIP y del chequeo de PDF |
-| 10a | Nombre de los PDF | **Después** del chequeo de ZIP y de PDF |
-| 10b | Texto extraído de los PDF | **Después** del chequeo de ZIP y de PDF |
+| 6a, 6b | Asunto, cuerpo y snippet del correo | **Antes** de determinar el tipo, del chequeo de ZIP y del chequeo de PDF |
+| 10a, 10b | Nombre de los PDF | **Después** del chequeo de ZIP y de PDF |
+| 10c, 10d | Texto extraído de los PDF | **Después** del chequeo de ZIP y de PDF |
+
+**Crédito y débito son estados separados**, cada uno con su etiqueta. En cada
+barrera se evalúa primero el crédito y luego el débito: un correo que declarara
+las dos cosas —caso raro— se archiva como **nota de crédito**, por ser el caso
+frecuente. Ninguna de las dos responde al remitente.
 
 **Consecuencia:** si el ZIP viene ilegible y la nota **solo** puede reconocerse
 por el PDF (no por el texto del correo), el filtro 8 corta antes y el correo
-termina en **REVISIÓN MANUAL**, no en NOTA DE CRÉDITO. Es deliberado: si el
+termina en **REVISIÓN MANUAL**, no en su etiqueta de nota. Es deliberado: si el
 paquete no se pudo abrir, el conjunto de PDF disponible es incompleto y no es
 base confiable para clasificar. Una persona revisa el caso.
 
@@ -124,7 +132,7 @@ pero con un ZIP dañado se **RECHAZA**, no se aprueba.
 
 1. **Una sola etiqueta de estado por correo.** Cada etiquetado añade la etiqueta nueva y quita todas las demás, así que el correo nunca queda con dos estados a la vez. En el desvío de rechazos a buzón interno se etiqueta dos veces (primero RECHAZADOS, luego REVISIÓN MANUAL); el estado final es uno solo.
 2. **Idempotencia.** Un correo nunca se responde dos veces. Se marca como procesado/respondido aunque el envío falle.
-3. **Sin respuesta al remitente** en: REVISIÓN MANUAL, ADMINISTRATIVA, NOTA DE CRÉDITO y reenvío a Compras.
+3. **Sin respuesta al remitente** en: REVISIÓN MANUAL, ADMINISTRATIVA, NOTA DE CRÉDITO, NOTA DE DÉBITO y reenvío a Compras.
 4. **Desvío de rechazos** (`ALT_RECIPIENT_ENABLED`): si el remitente es no-reply o proveedor tecnológico, el rechazo se envía al correo del emisor del XML → contacto del catálogo → buzón interno. Nunca al dominio propio.
 5. **Alertas WhatsApp:** solo errores técnicos (token vencido, fallo del loop, configuración faltante, rebote). Nunca por aprobaciones ni rechazos.
 6. **Modo pruebas:** solo procesa correos con la etiqueta configurada; ignora la bandeja de entrada.
@@ -135,8 +143,8 @@ pero con un ZIP dañado se **RECHAZA**, no se aprueba.
 
 | Concepto | Debe detectar | NO debe detectar |
 |---|---|---|
-| **Nota de crédito** | "nota de crédito", "nota credito", "credit note" | — |
-| **Nota de débito** | "nota de débito", "nota debito", "debit note" | — |
+| **Nota de crédito** | "nota de crédito", "nota credito", "notas de credito", "credit note(s)" | "débito automático", "tarjeta débito", "nota interna" |
+| **Nota de débito** | "nota de débito", "nota debito", "notas de debito", "debit note(s)" | "débito automático", "tarjeta débito", "nota interna" |
 | **Orden de compra** | Adjunto cuyo nombre indica "orden de compra", "orden", "OC-123" u "O.C.", o cuyo encabezado declara que es una orden | "orden de servicio", "orden de trabajo", "ordenador" o una mención narrativa dentro de la factura |
 | **OK de compras** | Adjunto cuyo nombre o texto contiene "ok compras", "ok de compras", "aprobado compras", "aprobado por compras", "aprobado de compras", "aprobación de compras", "aprobación compras", "visto bueno compras", "visto bueno de compras", "vobo compras", "vobo de compras", "autorizado por compras" o "aprobada compras". También: "aprobado para radicar", "autorizado para radicar", "cuenta con visto bueno", "recibida a satisfacción" y "visto bueno para radicación". | Una negación anterior dentro de la misma cláusula, sin cruzar `.`, `!`, `?`, `;`, `:`, salto de línea, "pero" o "aunque". Después del término solo vetan estados pendientes inmediatos y sin coma intermedia. |
 | **Entidad administrativa** | NIT exacto o nombre como frase completa, en el **asunto** | Coincidencias parciales dentro de otra palabra o de otro NIT |
@@ -171,11 +179,11 @@ Verificado ejecutando el código con escenarios sintéticos el 24 de agosto de 2
 | Filtro 2 (antigüedad) | ✅ Implementado — inactivo mientras `MODO_PRUEBAS=true`, por diseño |
 | Filtros 3, 4 (sin remitente, sin adjuntos) | ✅ Implementado |
 | Filtro 5 (administrativa) | ✅ Implementado |
-| Filtro 6a (nota por texto del correo) | ✅ Implementado |
+| Filtros 6a, 6b (nota por texto del correo) | ✅ Implementado |
 | Filtro 7 (tipo por presencia de XML) | ✅ Implementado |
 | Filtro 8 (paquete ilegible, solo §A) | ✅ Implementado |
 | Filtro 9 (sin PDF) | ✅ Implementado |
-| Filtros 10a, 10b (nota por nombre y texto de PDF) | ✅ Implementado |
+| Filtros 10a-10d (nota por nombre y texto de PDF) | ✅ Implementado |
 | §A1 (entidad no registrada) | ⚠️ **No conectado.** Solo emite un log `[SIMULACIÓN]`; la ruta no cambia |
 | §A2 (cliente no identificado → revisión manual) | ✅ Implementado |
 | §A3 (orden + OK → aprobado) | ✅ Implementado |
