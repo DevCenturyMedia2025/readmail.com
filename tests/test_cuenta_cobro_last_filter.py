@@ -161,4 +161,5 @@ def test_cuenta_cobro_incluye_nota_de_texto_seleccionable_y_asunto_con_tilde(mon
     subject, body = calls["replies"][0][3], calls["replies"][0][4]
     assert subject.startswith("RECHAZADO - facturación no radicada (ID: ")
     assert reademail.SELECTABLE_TEXT_NOTICE in body
+    assert "PDF con texto seleccionable" in body
     assert body.index(reademail.SELECTABLE_TEXT_NOTICE) < body.index("Gracias,")

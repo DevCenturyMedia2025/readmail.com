@@ -235,6 +235,8 @@ def test_rechazo_fe_usa_mensajes_accionables_y_nota_de_texto_seleccionable(monke
     assert "«OK de compras»" in body
 
     assert reademail.SELECTABLE_TEXT_NOTICE in body
+    assert "PDF con texto seleccionable" in body
+    assert "se darán por faltantes" in body
     assert body.index(reademail.SELECTABLE_TEXT_NOTICE) < body.index("Gracias,")
 
     # Ya no se filtra el lenguaje técnico anterior.
