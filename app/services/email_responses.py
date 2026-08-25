@@ -68,8 +68,7 @@ def build_approved_email(
     pdf_count: int,
     xml_count: int,
 ) -> Tuple[str, str]:
-    # El asunto no lleva tilde en "facturacion": se copia tal cual del monolito.
-    subject = f"APROBADO - facturacion recibida correctamente (ID: {radicado})"
+    subject = f"APROBADO - facturación recibida correctamente (ID: {radicado})"
     body = (
         "Hola,\n\n"
         "Confirmamos que tu correo fue recibido y validado correctamente.\n\n"

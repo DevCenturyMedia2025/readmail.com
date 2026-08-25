@@ -2720,7 +2720,7 @@ def build_rejected_email(radicado: str, invoice_type: str, reasons: List[str], c
 
 
 def build_approved_email(radicado: str, invoice_type: str, client_name: str, pdf_count: int, xml_count: int) -> Tuple[str, str]:
-    subject = f"APROBADO - facturacion recibida correctamente (ID: {radicado})"
+    subject = f"APROBADO - facturación recibida correctamente (ID: {radicado})"
     body = (
         "Hola,\n\n"
         "Confirmamos que tu correo fue recibido y validado correctamente.\n\n"

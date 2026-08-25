@@ -62,7 +62,7 @@ def test_rechazo_incluye_nota_de_texto_seleccionable_antes_de_la_despedida():
 
 def test_aprobado_asunto_exacto():
     subject, _ = build_approved_email("RAD-9", "FACTURA ELECTRONICA", "ACME", 3, 1)
-    assert subject == "APROBADO - facturacion recibida correctamente (ID: RAD-9)"
+    assert subject == "APROBADO - facturación recibida correctamente (ID: RAD-9)"
 
 
 def test_aprobado_cuerpo_completo_exacto():
