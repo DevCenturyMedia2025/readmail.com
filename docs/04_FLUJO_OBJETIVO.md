@@ -5,7 +5,7 @@
 > especificación original diferían, se documentó el código: las diferencias
 > resultaron ser decisiones correctas y quedan explicadas en su sección.
 > Sirve como referencia de negocio y como base para auditar cambios futuros.
-> Actualizado: 25 de agosto de 2026
+> Actualizado: 26 de agosto de 2026
 
 ## Orden de evaluación
 
@@ -15,7 +15,7 @@ Cada correo se evalúa en este orden exacto. El primer filtro que se cumple deci
 |---|---|---|---|
 | 0 | **Dedupe** | El mensaje ya fue procesado o respondido | Se ignora (sin efectos) |
 | 1 | **Rebote** | Remitente `mailer-daemon`/`postmaster`, asunto de fallo, o `multipart/report` | REVISIÓN MANUAL (el rebote y la factura original) + alerta WhatsApp |
-| 2 | **Antigüedad** | Más de `MAX_DIAS_ANTIGUEDAD` días — **no aplica en `MODO_PRUEBAS`** (ver nota abajo) | REVISIÓN MANUAL |
+| 2 | **Antigüedad** | `LIMITE_ANTIGUEDAD_ENABLED=true` **y** más de `MAX_DIAS_ANTIGUEDAD` días — **no aplica en `MODO_PRUEBAS`** (ver nota abajo) | REVISIÓN MANUAL |
 | 3 | **Sin remitente** | No se puede extraer el correo del remitente | Se descarta, sin respuesta |
 | 4 | **Sin adjuntos** | `ONLY_WITH_ATTACHMENTS=true` y no hay adjuntos | Se ignora |
 | 5 | **Administrativa** | NIT o nombre del asunto está en `Administrativas` o `CajaMenor` | ADMINISTRATIVA |
@@ -23,18 +23,50 @@ Cada correo se evalúa en este orden exacto. El primer filtro que se cumple deci
 | 6b | **Nota de débito — por texto del correo** | Texto en asunto, cuerpo o snippet | NOTA DE DÉBITO |
 | 7 | **Tipo** | ¿Trae XML? | Sí → §A · No → §B |
 | 8 | **Paquete ilegible** *(solo §A)* | Hubo errores al abrir un ZIP **y** el correo trae XML | REVISIÓN MANUAL, sin responder |
-| 9 | **Sin PDF** | Ningún PDF entre los adjuntos (tras abrir ZIP) | REVISIÓN MANUAL |
+| 9 | **Sin PDF** | Ningún PDF entre los adjuntos (tras abrir ZIP). **Las imágenes no cuentan** (ver nota abajo) | REVISIÓN MANUAL |
 | 10a | **Nota de crédito — por nombre de PDF** | El nombre de algún PDF declara la nota | NOTA DE CRÉDITO |
 | 10b | **Nota de débito — por nombre de PDF** | El nombre de algún PDF declara la nota | NOTA DE DÉBITO |
 | 10c | **Nota de crédito — por texto de PDF** | El texto extraído de algún PDF declara la nota | NOTA DE CRÉDITO |
 | 10d | **Nota de débito — por texto de PDF** | El texto extraído de algún PDF declara la nota | NOTA DE DÉBITO |
 
-### Nota sobre el filtro 2 (antigüedad) y `MODO_PRUEBAS`
+### Nota sobre el filtro 2 (antigüedad): dos interruptores, no uno
 
-El filtro de antigüedad **queda desactivado mientras `MODO_PRUEBAS=true`**. Es
-deliberado: en pruebas se etiquetan a propósito correos viejos ya archivados
-para ejercitar el flujo, y el filtro los desviaría a REVISIÓN MANUAL antes de
-llegar a la lógica que se quiere probar. En modo real el filtro sí aplica.
+El filtro solo actúa si se cumplen **las dos** condiciones de configuración:
+
+| Variable | Efecto | Por qué existe |
+|---|---|---|
+| `LIMITE_ANTIGUEDAD_ENABLED` (por defecto `true`) | Si es `false`, el filtro no actúa **nunca**, ni siquiera en modo real | Es el interruptor de operación. Permite apagar el control para una repesca deliberada —vaciar un atraso, reprocesar un lote que quedó sin atender— sin tocar `MODO_PRUEBAS` ni el resto del flujo |
+| `MODO_PRUEBAS` | Si es `true`, el filtro no actúa | En pruebas se etiquetan a propósito correos viejos ya archivados para ejercitar el flujo, y el filtro los desviaría a REVISIÓN MANUAL antes de llegar a la lógica que se quiere probar |
+
+Son independientes y cualquiera de los dos basta para desactivar el filtro. En
+operación normal (`LIMITE_ANTIGUEDAD_ENABLED=true`, `MODO_PRUEBAS=false`) el
+filtro sí aplica.
+
+**Cuidado al apagar `LIMITE_ANTIGUEDAD_ENABLED`:** con el filtro apagado, un
+correo de hace meses se procesa y se responde como si fuera de hoy. El
+proveedor recibe un rechazo o una aprobación por algo que quizá ya resolvió por
+otra vía. Es un interruptor para usar a conciencia y volver a encender.
+
+### Nota sobre el filtro 9: cuenta PDF, no imágenes
+
+El filtro exige **al menos un PDF**. Las imágenes adjuntas (fotos, capturas,
+escaneos guardados como JPG o PNG) no satisfacen el filtro: un correo cuyos
+únicos adjuntos son imágenes va **siempre a REVISIÓN MANUAL**, aunque una de
+esas imágenes fuera una foto legible de una cuenta de cobro.
+
+Es deliberado. El PDF es el acuse de que el proveedor envió un documento y no
+una foto de un documento: trae texto extraíble, conserva el nombre del archivo
+como pista de clasificación y no depende de que la foto esté enfocada, derecha
+y completa. Un correo que llega solo con imágenes es, casi siempre, un envío
+improvisado desde un teléfono, y ese es justamente el caso en que conviene que
+mire una persona antes de aprobar o rechazar.
+
+**Consecuencia sobre el clasificador:** el clasificador de documentos sí admite
+imágenes para el tipo `cuenta_cobro` (`allow_images`), y de hecho se le pasan
+`pdfs + images` en §B. Pero el filtro 9 corta antes, así que esa capacidad
+**solo se alcanza cuando el correo trae además al menos un PDF**. Una imagen
+nunca puede ser el único documento de un paquete aprobado. No es un defecto: es
+el filtro 9 haciendo de piso mínimo de calidad documental.
 
 ### Nota sobre las tres barreras de nota de crédito/débito
 
@@ -62,15 +94,55 @@ base confiable para clasificar. Una persona revisa el caso.
 
 ## §A — Factura electrónica (trae XML)
 
+> **Los números no son el orden de evaluación.** Primero se decide orden y OK
+> (A3/A4/A5); el cliente (A2) solo se mira si no hubo motivo de rechazo. Ver
+> "El orden real de evaluación en §A", abajo.
+
 | # | Condición | Resultado |
 |---|---|---|
 | A1 | La entidad **no está** en `Clientes` ni `Terceros` | ⚠️ **No conectado.** Hoy solo escribe un log `[SIMULACIÓN]` y el correo sigue al flujo normal. La ruta prevista es REVISIÓN MANUAL, sin responder |
-| A2 | No se identifica el cliente | REVISIÓN MANUAL, sin responder |
 | A3 | Trae los documentos PDF de **orden de compra** y **OK de compras** | APROBADO + respuesta al proveedor |
 | A4 | Falta orden y/o OK — **modo real** | RECHAZADO + respuesta indicando qué falta |
 | A5 | Falta orden y/o OK — **modo pruebas** (requiere `MODO_PRUEBAS=true` **y** `COMPRAS_EMAIL` definido) | Reenviar a `COMPRAS_EMAIL` con adjuntos y cita del original; sin responder al proveedor; sin etiqueta de estado; el correo queda en bandeja **sin leer** |
+| A2 | No se identifica el cliente — **solo si no hubo motivo de rechazo**, es decir, orden y OK están presentes | REVISIÓN MANUAL, sin responder |
 
 **No son motivos de rechazo:** cantidad mínima de PDF, ni ausencia de otros documentos.
+
+### El orden real de evaluación en §A
+
+La numeración A1–A5 es histórica y **no** refleja el orden en que el código
+decide. El orden real es:
+
+| Paso | Se evalúa | Si se cumple |
+|---|---|---|
+| 1 | ¿Están la orden de compra y el OK de compras? | **No** → A4 (rechazo con respuesta) o A5 (reenvío a Compras, en modo pruebas). Fin |
+| 2 | ¿Se pudo leer el nombre del cliente? | **No** → A2 (REVISIÓN MANUAL, sin responder). Fin |
+| 3 | — | A3 (APROBADO + respuesta) |
+
+**Por qué la orden se evalúa antes que el cliente.** El nombre del cliente se
+lee **de la propia orden de compra**. Si la orden no llegó, no hay de dónde
+leerlo: A2 se cumpliría siempre que se cumple A4, y el correo terminaría en
+REVISIÓN MANUAL en vez de rechazarse. Eso tendría dos efectos malos:
+
+1. **El proveedor no se enteraría de que le falta la orden.** REVISIÓN MANUAL
+   no responde. El proveedor quedaría esperando indefinidamente por algo que
+   podía corregir él mismo en cinco minutos, y alguien de la casa tendría que
+   escribirle a mano.
+2. **A5 sería inalcanzable.** El reenvío a Compras existe precisamente para
+   resolver la falta de orden u OK. Si el correo se desviara antes a REVISIÓN
+   MANUAL por no poder leer el cliente, nunca llegaría al área que puede
+   aportar el documento que falta.
+
+Dicho de otro modo: **"no puedo leer el cliente" no es un diagnóstico útil
+cuando la causa es "no llegó la orden".** El motivo accionable es la falta del
+documento, y ese es el que se le comunica.
+
+**Consecuencia verificada:** una factura sin orden, sin OK y con cliente
+ilegible sale **RECHAZADA con respuesta al proveedor**, no a REVISIÓN MANUAL.
+A2 queda reservado para el caso en que sí llegaron los dos documentos pero el
+nombre del cliente no se pudo extraer de la orden — ahí sí el problema es
+nuestro, es un caso raro que merece ojos humanos, y no se le responde al
+proveedor porque él no tiene nada que corregir.
 
 **El ZIP ilegible NO es motivo de rechazo en §A.** Se resuelve antes, en el
 filtro 8, enviando el correo a REVISIÓN MANUAL sin responder. El proveedor
@@ -170,22 +242,22 @@ nombre descriptivo.
 
 ## Estado de implementación
 
-Verificado ejecutando el código con escenarios sintéticos el 24 de agosto de 2026.
+Verificado ejecutando el código con escenarios sintéticos el 26 de agosto de 2026.
 
 | Sección | Estado |
 |---|---|
 | Filtro 0 (dedupe) | ✅ Implementado |
 | Filtro 1 (rebote) | ✅ Implementado |
-| Filtro 2 (antigüedad) | ✅ Implementado — inactivo mientras `MODO_PRUEBAS=true`, por diseño |
+| Filtro 2 (antigüedad) | ✅ Implementado — inactivo si `LIMITE_ANTIGUEDAD_ENABLED=false` **o** `MODO_PRUEBAS=true`, por diseño |
 | Filtros 3, 4 (sin remitente, sin adjuntos) | ✅ Implementado |
 | Filtro 5 (administrativa) | ✅ Implementado |
 | Filtros 6a, 6b (nota por texto del correo) | ✅ Implementado |
 | Filtro 7 (tipo por presencia de XML) | ✅ Implementado |
 | Filtro 8 (paquete ilegible, solo §A) | ✅ Implementado |
-| Filtro 9 (sin PDF) | ✅ Implementado |
+| Filtro 9 (sin PDF) | ✅ Implementado — exige PDF; las imágenes no cuentan, por diseño |
 | Filtros 10a-10d (nota por nombre y texto de PDF) | ✅ Implementado |
 | §A1 (entidad no registrada) | ⚠️ **No conectado.** Solo emite un log `[SIMULACIÓN]`; la ruta no cambia |
-| §A2 (cliente no identificado → revisión manual) | ✅ Implementado |
+| §A2 (cliente no identificado → revisión manual) | ✅ Implementado — se evalúa **después** de orden y OK, por diseño |
 | §A3 (orden + OK → aprobado) | ✅ Implementado |
 | §A4 (rechazo solo por orden/OK) | ✅ Implementado |
 | §A5 (reenvío a Compras) | ✅ Implementado — **inactivo hasta definir `COMPRAS_EMAIL`** |
