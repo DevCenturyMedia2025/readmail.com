@@ -210,12 +210,22 @@ def test_paquete_incompleto():
 
 
 def test_paquete_completo_con_un_desconocido():
-    files = paquete_completo()[:4]
-    files.append(pdf("misterioso.pdf", text="texto que no clasifica en nada"))
+    """El desconocido cubre un soporte del proveedor (aqui, el bancario)."""
+    files = paquete_completo()
+    files[3] = pdf("misterioso.pdf", text="texto que no clasifica en nada")
     result = validate_cuenta_cobro_package(files)
     assert result["estado"] == "completo_con_desconocido"
     assert result["mensaje"] == "Recibido archivos completos con un documento no identificado"
     assert result["desconocidos"] == ["misterioso.pdf"]
+
+
+def test_desconocido_no_cubre_la_falta_de_orden_de_compra():
+    """La orden autoriza el pago: su ausencia nunca se da por cubierta."""
+    files = paquete_completo()[:4]
+    files.append(pdf("misterioso.pdf", text="texto que no clasifica en nada"))
+    result = validate_cuenta_cobro_package(files)
+    assert result["estado"] == "incompleto"
+    assert result["faltantes"] == ["orden_compra"]
 
 
 def test_paquete_detecta_duplicados():

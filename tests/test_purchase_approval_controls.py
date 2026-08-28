@@ -448,6 +448,7 @@ def test_cuenta_cobro_con_orden_sin_texto_se_aprueba(monkeypatch):
         UnifiedFile("rut.pdf", "application/pdf", b"", "test"),
         UnifiedFile("certificado bancario.pdf", "application/pdf", b"", "test"),
         UnifiedFile("orden de compra.pdf", "application/pdf", b"", "test"),
+        UnifiedFile("ok compras.pdf", "application/pdf", b"", "test"),
     ]
     payload = {
         "headers": [

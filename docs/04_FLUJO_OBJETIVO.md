@@ -5,7 +5,7 @@
 > especificación original diferían, se documentó el código: las diferencias
 > resultaron ser decisiones correctas y quedan explicadas en su sección.
 > Sirve como referencia de negocio y como base para auditar cambios futuros.
-> Actualizado: 26 de agosto de 2026
+> Actualizado: 28 de agosto de 2026
 
 ## Orden de evaluación
 
@@ -103,7 +103,7 @@ base confiable para clasificar. Una persona revisa el caso.
 | A1 | La entidad **no está** en `Clientes` ni `Terceros` | ⚠️ **No conectado.** Hoy solo escribe un log `[SIMULACIÓN]` y el correo sigue al flujo normal. La ruta prevista es REVISIÓN MANUAL, sin responder |
 | A3 | Trae los documentos PDF de **orden de compra** y **OK de compras** | APROBADO + respuesta al proveedor |
 | A4 | Falta orden y/o OK — **modo real** | RECHAZADO + respuesta indicando qué falta |
-| A5 | Falta orden y/o OK — **modo pruebas** (requiere `MODO_PRUEBAS=true` **y** `COMPRAS_EMAIL` definido) | Reenviar a `COMPRAS_EMAIL` con adjuntos y cita del original; sin responder al proveedor; sin etiqueta de estado; el correo queda en bandeja **sin leer** |
+| A5 | Falta orden y/o OK — **modo pruebas** (requiere `MODO_PRUEBAS=true` **y** `COMPRAS_EMAIL` definido) | Reenviar a `COMPRAS_EMAIL` con adjuntos y cita del original, en **conversación aparte**; sin responder al proveedor; la factura queda en **REVISIÓN MANUAL** y **sin leer** |
 | A2 | No se identifica el cliente — **solo si no hubo motivo de rechazo**, es decir, orden y OK están presentes | REVISIÓN MANUAL, sin responder |
 
 **No son motivos de rechazo:** cantidad mínima de PDF, ni ausencia de otros documentos.
@@ -160,6 +160,48 @@ en el log.
 > el único rastro es esa línea de log, así que conviene verificar la variable
 > antes de dar por activo el modo pruebas.
 
+### El circuito de vuelta: qué pasa cuando Compras contesta
+
+El reenvío sale como **conversación aparte**, no dentro del hilo del proveedor.
+Es deliberado: si fuera en el mismo hilo, un "responder a todos" desde Compras
+le enviaría al proveedor la discusión interna sobre su propia factura.
+
+Al enviarlo se guarda en el estado el vínculo entre el hilo creado y la factura
+original (`compras_forwards`), y la factura queda en **REVISIÓN MANUAL** desde
+ese momento: está detenida esperando un documento interno, y así se ve en la
+bandeja en vez de quedar sin marca.
+
+### Qué se le dice a Compras
+
+El cuerpo del reenvío lo arma `build_compras_request_text` e instruye de forma
+explícita: **responder a ese mismo correo**, adjuntar el soporte en PDF con
+texto seleccionable, y **no crear un correo nuevo**, con la consecuencia dicha
+sin rodeos —un correo empezado desde cero no queda vinculado a nada y la
+radicación se queda detenida—. Como el reconocimiento por radicado existe, el
+texto también ofrece la salida: si tienen que usar otro correo, que conserven el
+identificador en el asunto. El mensaje identifica además el tipo de documento
+(factura electrónica o cuenta de cobro), el proveedor y qué falta.
+
+Cuando llega la respuesta de Compras, se reconoce **antes** de entrar al flujo
+de facturas, justo después del filtro de rebotes:
+
+| Señal | Uso |
+|---|---|
+| El hilo del mensaje coincide con uno rastreado | Señal principal, fiable |
+| El radicado aparece en el asunto | Respaldo, para cuando alguien reenvía a mano y se pierde el hilo |
+
+Reconocida la respuesta: se etiqueta **REVISIÓN MANUAL** la respuesta de
+Compras, se confirma **REVISIÓN MANUAL** en la factura original, y **no se
+responde a nadie**. La conversación de Compras contiene ya los adjuntos
+originales (viajaron en el reenvío) más el documento que faltaba, así que una
+persona radica con el paquete completo a la vista.
+
+**No hay aprobación automática.** Es deliberado: reabrir una factura ya marcada
+como procesada tocaría la garantía de que nunca se responde dos veces. Sin este
+reconocimiento, además, una respuesta de Compras que trajera el paquete entero
+se habría tratado como factura nueva, aprobándose con un radicado distinto y
+enviándole la confirmación a Compras en vez de al proveedor.
+
 Si el reenvío a Compras falla, el correo queda marcado como procesado (no se
 reintenta) y se emite una alerta de WhatsApp. La alerta tiene un cooldown
 compartido por área, no por factura: varios fallos seguidos dentro de la
@@ -172,11 +214,74 @@ ventana de cooldown generan una sola notificación.
 | # | Condición | Resultado |
 |---|---|---|
 | B1 | **Ningún PDF se declara "cuenta de cobro"** | REVISIÓN MANUAL, sin responder *(último filtro)* |
-| B2 | Paquete completo: cuenta de cobro, cédula, RUT, certificado bancario, orden de compra | APROBADO + respuesta |
+| B2 | Paquete completo: cuenta de cobro, cédula, RUT, certificado bancario, orden de compra **y OK de compras** | APROBADO + respuesta |
 | B3 | Paquete incompleto | RECHAZADO + respuesta indicando qué falta |
 | B4 | **ZIP ilegible** | RECHAZADO + respuesta; el error del ZIP se suma a los motivos |
+| B5 | Falta **únicamente** el OK de compras — **modo pruebas** (requiere `MODO_PRUEBAS=true` **y** `COMPRAS_EMAIL` definido) | Reenviar a `COMPRAS_EMAIL`, igual que A5: sin responder al proveedor, la factura queda en **REVISIÓN MANUAL** y **sin leer** |
 
 **La regla de entidad registrada (A1) NO aplica a cuentas de cobro**, porque llegan sin NIT ni nombre en el asunto.
+
+### El OK de compras también se exige en §B
+
+La orden de compra y el OK de compras son obligatorios en **las dos ramas**: son
+los documentos que autorizan el pago, y esa autorización no depende de si el
+proveedor factura electrónicamente o por cuenta de cobro.
+
+**El OK se detecta con `detect_ok_compras`, el mismo detector estricto de §A**,
+no con el clasificador del paquete. Es deliberado, por dos razones:
+
+1. **Un solo criterio.** El clasificador general reconoce el tipo
+   `aprobado_compras` con una regla mucho más laxa ("aprobado" más una señal de
+   apoyo), lo que aceptaría como visto bueno cualquier documento que mencione
+   una aprobación. `detect_ok_compras` exige las fórmulas acordadas y descarta
+   negaciones como "pendiente ok compras".
+2. **Un mismo archivo puede aportar la orden y el OK.** El clasificador asigna
+   **un solo tipo por archivo**: una orden de compra ya firmada por Compras se
+   clasificaría como orden, y el OK saldría como faltante pese a estar ahí. Al
+   evaluarlo con un detector aparte, ese caso —frecuente— se aprueba bien.
+
+El OK se busca sobre `pdfs + images`, igual que el resto del paquete de §B.
+
+### B5 — El reenvío a Compras también cubre la cuenta de cobro
+
+Cuando **lo único que falta es el OK de compras**, la cuenta de cobro se reenvía
+a Compras en modo pruebas, exactamente como A5. La razón es la misma que en §A:
+el OK es un documento **interno**, que el proveedor no puede emitir ni
+conseguir. Rechazárselo a él sería pedirle algo que no está en su mano; el
+reenvío se lo pide a quien sí puede firmarlo.
+
+**El reenvío cubre el OK y nada más.** Si además falta cualquier otro documento
+—orden de compra, cédula, RUT, certificado bancario— o el ZIP viene dañado, la
+cuenta de cobro se **rechaza también en modo pruebas**, con respuesta al
+proveedor. Esa parte del paquete la arma él, así que el rechazo sí es
+accionable. En el código la condición es literal: se reenvía solo si la lista de
+motivos es exactamente `[MISSING_OK_COMPRAS_MESSAGE]`.
+
+| Qué falta en la cuenta de cobro | Modo pruebas (con `COMPRAS_EMAIL`) | Modo real |
+|---|---|---|
+| Solo el OK de compras | Reenvío a Compras, sin responder, sin etiqueta, sin leer | RECHAZADO + respuesta |
+| Solo la orden de compra | RECHAZADO + respuesta | RECHAZADO + respuesta |
+| El OK y algo más | RECHAZADO + respuesta | RECHAZADO + respuesta |
+| El OK, y además el ZIP dañado | RECHAZADO + respuesta | RECHAZADO + respuesta |
+
+Si `COMPRAS_EMAIL` está vacío, aplica la misma advertencia de A5: el reenvío no
+ocurre, queda un `WARNING` en el log y la cuenta de cobro se rechaza
+respondiéndole al proveedor.
+
+### La excepción del documento no identificado
+
+Si falta **un** documento obligatorio, llega **exactamente un** archivo que el
+sistema no logra clasificar y se reconocieron los otros cuatro, el paquete se
+da por **completo con un documento no identificado** y se aprueba. La idea es
+que un archivo mal nombrado suele ser justamente el que falta.
+
+**Esa excepción solo cubre cédula, RUT y certificado bancario.** Nunca cubre la
+orden de compra —queda fuera de la lista `UNKNOWN_COVERABLE_DOCS`— ni el OK de
+compras, que ni siquiera pasa por el clasificador. Los soportes del proveedor
+admiten el beneficio de la duda; los documentos que autorizan el pago, no.
+
+Consecuencia verificada: una cuenta de cobro sin orden y con un archivo no
+identificado se **RECHAZA**. Antes se aprobaba.
 
 ### El ZIP ilegible se trata distinto en §A y en §B
 
@@ -237,12 +342,13 @@ nombre descriptivo.
 | F3 | "pendiente ok compras" se cuenta como OK aprobado. | 🟠 Media | ✅ Corregida: la negación se evalúa dentro de la misma frase |
 | F4 | La entidad administrativa solo se detecta por el asunto. | 🟡 Baja | Abierta: El asunto trae NIT en los correos de plataformas DIAN, pero el filtro 5 aplica a todos los correos; una entidad administrativa con asunto libre y NIT solo en el cuerpo se escapa (verificado). |
 | F5 | Una cuenta de cobro de una entidad desconocida puede aprobarse (A1 no aplica a §B). | 🟡 Baja | Decisión tomada |
+| F6 | Una cuenta de cobro sin OK de compras se aprobaba, y un documento no identificado podía tapar la falta de la orden. | 🟠 Media | ✅ Corregida: el OK es obligatorio en §B y la excepción solo cubre cédula, RUT y certificado bancario |
 
 ---
 
 ## Estado de implementación
 
-Verificado ejecutando el código con escenarios sintéticos el 26 de agosto de 2026.
+Verificado ejecutando el código con escenarios sintéticos el 28 de agosto de 2026.
 
 | Sección | Estado |
 |---|---|
@@ -261,8 +367,10 @@ Verificado ejecutando el código con escenarios sintéticos el 26 de agosto de 2
 | §A3 (orden + OK → aprobado) | ✅ Implementado |
 | §A4 (rechazo solo por orden/OK) | ✅ Implementado |
 | §A5 (reenvío a Compras) | ✅ Implementado — **inactivo hasta definir `COMPRAS_EMAIL`** |
+| Circuito de vuelta (respuesta de Compras → REVISIÓN MANUAL) | ✅ Implementado — por hilo, con el radicado del asunto como respaldo |
 | §B1 (último filtro de cuenta de cobro) | ✅ Implementado |
-| §B2, B3 | ✅ Implementado |
+| §B2, B3 | ✅ Implementado — el paquete exige además el **OK de compras**, con el detector estricto de §A |
+| §B5 (reenvío a Compras por falta del OK) | ✅ Implementado — solo si el OK es lo único que falta; **inactivo hasta definir `COMPRAS_EMAIL`** |
 | §B4 (ZIP ilegible como motivo) | ✅ Implementado |
 | Reglas transversales 1-6 | ✅ Implementadas |
 | Fugas F1, F2, F3 | ✅ Corregidas |
@@ -273,4 +381,4 @@ Verificado ejecutando el código con escenarios sintéticos el 26 de agosto de 2
 
 | Variable | Efecto si falta |
 |---|---|
-| `COMPRAS_EMAIL` | §A5 nunca se ejecuta; toda factura sin orden u OK se rechaza y se le responde al proveedor, incluso en modo pruebas |
+| `COMPRAS_EMAIL` | §A5 y §B5 nunca se ejecutan; toda factura sin orden u OK, y toda cuenta de cobro sin OK, se rechazan respondiéndole al proveedor, incluso en modo pruebas |

@@ -2,7 +2,7 @@
 
 Documento para dirección y contabilidad. Sin lenguaje técnico.
 Describe lo que el programa **hace hoy**, verificado ejecutándolo.
-Actualizado: 26 de agosto de 2026.
+Actualizado: 28 de agosto de 2026.
 
 ---
 
@@ -81,7 +81,7 @@ Cada correo pasa por estas preguntas **en este orden**. La primera pregunta cuya
     Se exige que lleguen como documentos adjuntos. No basta con que la factura los mencione en el texto.
     - **Vienen los dos** → **APROBADOS** y se le responde al proveedor confirmando la radicación. Con una excepción: si la orden llegó pero en ella no se puede leer el nombre del cliente, el correo va a **REVISIÓN MANUAL** y no se responde.
     - **Falta alguno** → **RECHAZADOS** y se le responde al proveedor diciéndole exactamente qué faltó. Esto ocurre así aunque tampoco se haya podido leer el nombre del cliente: cuando falta la orden, el rechazo tiene prioridad.
-    - **Falta alguno y el sistema está en modo de pruebas** con un buzón de compras configurado → el correo se reenvía completo al área de compras pidiendo el documento faltante, **no se le responde al proveedor**, no se le pone etiqueta de estado y el correo queda marcado como no leído en la bandeja. Si el reenvío falla, se avisa por WhatsApp al responsable técnico.
+    - **Falta alguno y el sistema está en modo de pruebas** con un buzón de compras configurado → el correo se reenvía completo al área de compras pidiendo el documento faltante, **no se le responde al proveedor**, y la factura queda en **REVISIÓN MANUAL** y sin leer, porque está detenida esperando ese documento. Si el reenvío falla, se avisa por WhatsApp al responsable técnico.
 
     *Importante:* si el buzón de compras no está configurado, el reenvío **nunca ocurre** y la factura se rechaza normalmente, respondiéndole al proveedor. El único rastro de esa situación queda en el registro interno del programa.
 
@@ -92,10 +92,25 @@ Cada correo pasa por estas preguntas **en este orden**. La primera pregunta cuya
     - Sí → sigue.
 
 15. **¿Está el paquete completo?**
-    Deben venir los cinco documentos: cuenta de cobro, cédula, RUT, certificado bancario y orden de compra.
+    Deben venir los cinco documentos —cuenta de cobro, cédula, RUT, certificado bancario y orden de compra— **y el visto bueno del área de compras**, igual que en la factura electrónica. El visto bueno puede venir en un archivo aparte o ir estampado sobre la propia orden de compra: en ese caso el mismo archivo sirve para las dos cosas.
     - **Completo y sin archivos dañados** → **APROBADOS** y se responde al proveedor.
     - **Incompleto** → **RECHAZADOS** y se responde diciendo qué documento falta.
     - **Completo pero con un archivo comprimido dañado** → también **RECHAZADOS**, y se le pide al proveedor que reenvíe. Aquí sí se le reclama, porque el paquete lo arma él y el archivo dañado sí lo puede corregir.
+    - **Lo único que falta es el visto bueno de compras, y el sistema está en modo de pruebas** con un buzón de compras configurado → el correo se reenvía al área de compras pidiendo el visto bueno, **no se le responde al proveedor**, y la cuenta de cobro queda en **REVISIÓN MANUAL** y sin leer. Es el mismo trato que recibe la factura electrónica, y por la misma razón: el visto bueno lo emite la casa, no el proveedor.
+
+    *Ojo:* ese reenvío cubre **solo** el visto bueno. Si además falta cualquier otro documento, o el archivo comprimido viene dañado, la cuenta de cobro se rechaza igual, también en modo de pruebas — porque esa parte sí la puede corregir el proveedor.
+
+### Cuando el área de compras contesta
+
+El correo que se le manda a compras abre **una conversación aparte**, separada de la del proveedor. Se hace así a propósito: si fuera la misma, bastaría con que alguien en compras usara "responder a todos" para que el proveedor recibiera la discusión interna sobre su propia factura.
+
+El correo que recibe compras se lo dice con todas las letras: que responda **a ese mismo correo**, que adjunte el soporte en PDF con texto seleccionable, y que **no cree un correo nuevo**, porque un correo empezado desde cero no queda relacionado con ninguna factura y la radicación se quedaría detenida. Por si acaso, también les indica que si tienen que usar otro correo conserven el identificador de la factura en el asunto. El mensaje les dice de qué proveedor se trata, si es factura electrónica o cuenta de cobro, y qué documento falta.
+
+El programa recuerda cuál factura corresponde a cada conversación con compras. Cuando compras contesta, reconoce esa respuesta y hace tres cosas: marca la respuesta como **REVISIÓN MANUAL**, confirma la factura del proveedor también en **REVISIÓN MANUAL**, y no le responde nada a nadie.
+
+En ese punto la conversación con compras tiene todo junto: los archivos que mandó el proveedor —viajaron en el reenvío— y el documento que faltaba. Una persona revisa y radica.
+
+**El programa no aprueba solo.** Aunque compras devuelva todo completo, la radicación la cierra una persona. Es una decisión tomada a conciencia: reabrir automáticamente una factura ya procesada pondría en riesgo la garantía de que nunca se responde dos veces.
 
 ### Cuando hay que responder un rechazo a un remitente automático
 
@@ -109,11 +124,11 @@ Muchas facturas electrónicas llegan desde direcciones que no aceptan respuestas
 |---|---|---|
 | **APROBADOS** | La facturación llegó completa. El proveedor ya recibió la confirmación. | Continuar con el proceso contable normal. |
 | **RECHAZADOS** | Faltó algo. El proveedor ya recibió el correo diciéndole qué faltó. | Nada de inmediato. Esperar el reenvío del proveedor. |
-| **REVISIÓN MANUAL** | El programa no pudo decidir con seguridad y prefirió no equivocarse. **Al proveedor no se le respondió nada.** | Abrir el correo, revisarlo a mano y resolverlo. Esta es la bandeja que hay que mirar todos los días. |
+| **REVISIÓN MANUAL** | El programa no pudo decidir con seguridad y prefirió no equivocarse, **o** la factura está detenida esperando un documento del área de compras. En los dos casos, **al proveedor no se le respondió nada.** | Abrir el correo, revisarlo a mano y resolverlo. Si es de los que esperaban a compras, la conversación con compras tiene todos los archivos juntos. Esta es la bandeja que hay que mirar todos los días. |
 | **ADMINISTRATIVA** | Es un correo de una entidad administrativa o de caja menor, no una factura de proveedor. No se responde. | Darle el trámite administrativo que corresponda. |
 | **NOTA DE CRÉDITO** | El correo trae una nota de crédito, no una factura para radicar. No se responde. | Aplicarla contablemente. |
 | **NOTA DE DÉBITO** | El correo trae una nota de débito. No se responde. | Aplicarla contablemente. |
-| **Sin etiqueta** | El correo se descartó (sin adjuntos, sin remitente legible) o fue reenviado al área de compras en modo de pruebas. | Si aparece como no leído en la bandeja, es un reenvío a compras en curso. |
+| **Sin etiqueta** | El correo se descartó: llegó sin adjuntos o sin un remitente legible. | Nada. Si esperaba una factura de ese proveedor, pídale que la reenvíe adjuntando los archivos. |
 
 Un correo **nunca queda con dos etiquetas de estado al mismo tiempo**: cada vez que se pone una, se quitan las demás.
 
@@ -131,15 +146,16 @@ Son dos casos distintos y no se mezclan.
 
 Los dos últimos son los que autorizan el pago. Sin ellos no hay forma de saber si la compra fue aprobada internamente, y por eso la factura se rechaza. No sirve que la factura los mencione en su texto: tienen que llegar como archivos.
 
-**Si trabaja por cuenta de cobro** (personas naturales, contratistas), debe enviar cinco documentos:
+**Si trabaja por cuenta de cobro** (personas naturales, contratistas), debe enviar:
 
 - La cuenta de cobro.
 - La cédula.
 - El RUT.
 - El certificado bancario.
 - La orden de compra.
+- El visto bueno del área de compras.
 
-Los tres del medio son los que permiten pagarle correctamente y cumplir con las obligaciones tributarias. Faltando cualquiera, el paquete se rechaza.
+La cédula, el RUT y el certificado bancario son los que permiten pagarle correctamente y cumplir con las obligaciones tributarias. La orden de compra y el visto bueno son los que autorizan el pago, y por eso se exigen aquí igual que en la factura electrónica. Faltando cualquiera, el paquete se rechaza.
 
 ---
 

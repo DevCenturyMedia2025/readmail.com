@@ -595,6 +595,57 @@ def state_mark_replied(state: Dict, message_id: str) -> None:
     state["replied_message_ids"] = arr
 
 
+def state_track_compras_forward(
+    state: Dict,
+    thread_id: Optional[str],
+    radicado: str,
+    original_message_id: str,
+) -> None:
+    """Guarda el vínculo entre el correo enviado a Compras y la factura original.
+
+    El reenvío sale como conversación aparte, a propósito: así el proveedor no
+    puede quedar incluido si alguien en Compras responde a todos. El vínculo se
+    guarda aquí para poder reconocer después la respuesta de Compras.
+    """
+    tracked = state.get("compras_forwards")
+    if not isinstance(tracked, dict):
+        tracked = {}
+    key = str(thread_id or radicado)
+    tracked[key] = {
+        "radicado": radicado,
+        "original_message_id": str(original_message_id),
+    }
+    if len(tracked) > RADICADO_MAP_LIMIT:
+        for stale in list(tracked)[: len(tracked) - RADICADO_MAP_LIMIT]:
+            tracked.pop(stale, None)
+    state["compras_forwards"] = tracked
+
+
+def state_find_compras_forward(
+    state: Dict,
+    thread_id: Optional[str],
+    subject: str,
+) -> Optional[Dict[str, str]]:
+    """Reconoce la respuesta de Compras: primero por hilo, luego por radicado.
+
+    El hilo es la señal fiable. El radicado del asunto es el respaldo para el
+    caso en que alguien reenvíe el correo a mano y se pierda el hilo.
+    """
+    tracked = state.get("compras_forwards")
+    if not isinstance(tracked, dict) or not tracked:
+        return None
+
+    if thread_id and str(thread_id) in tracked:
+        return tracked[str(thread_id)]
+
+    normalized_subject = subject or ""
+    for entry in tracked.values():
+        radicado = str((entry or {}).get("radicado") or "")
+        if radicado and radicado in normalized_subject:
+            return entry
+    return None
+
+
 def get_or_create_radicado(message_id: str, state: Dict) -> str:
     mappings = state.get("message_radicados") or {}
     if not isinstance(mappings, dict):
@@ -2671,6 +2722,12 @@ CUENTA_COBRO_REQUIRED_DOCS = [
     "orden_compra",
 ]
 
+# Un único documento no identificado puede cubrir la ausencia de estos tres,
+# porque son soportes del proveedor y un archivo mal nombrado suele ser uno de
+# ellos. La orden de compra queda fuera a propósito: es el documento que
+# autoriza el pago, así que su ausencia nunca se da por cubierta.
+UNKNOWN_COVERABLE_DOCS = frozenset({"cedula", "rut", "certificado_bancario"})
+
 DOCUMENT_CLASSIFIERS = {
     "cuenta_cobro": {
         "required_any": ("cuenta cobro", "cuenta de cobro", "cuenta_cobro", "cta"),
@@ -2850,7 +2907,12 @@ def validate_cuenta_cobro_package(files: List[UnifiedFile]) -> Dict[str, object]
     identified_required_count = sum(1 for doc_type in CUENTA_COBRO_REQUIRED_DOCS if identified[doc_type])
 
     complete = not faltantes
-    complete_with_unknown = bool(faltantes) and len(unknown) == 1 and identified_required_count >= 4
+    complete_with_unknown = (
+        bool(faltantes)
+        and len(unknown) == 1
+        and identified_required_count >= 4
+        and all(doc_type in UNKNOWN_COVERABLE_DOCS for doc_type in faltantes)
+    )
     estado = "completo" if complete else "completo_con_desconocido" if complete_with_unknown else "incompleto"
     mensaje = (
         "Recibido archivos completos"
@@ -2924,6 +2986,49 @@ def build_approved_email(radicado: str, invoice_type: str, client_name: str, pdf
     return subject, body
 
 
+def build_compras_request_text(
+    radicado: str,
+    invoice_type: str,
+    sender_email: str,
+    missing_documents: List[str],
+) -> str:
+    """Instrucciones para Compras sobre cómo devolver el soporte que falta.
+
+    El vínculo con la factura se reconoce por el hilo de la conversación, y
+    como respaldo por el radicado del asunto. Un correo nuevo con otro asunto
+    no se puede relacionar con nada, así que el texto lo dice explícitamente:
+    es la diferencia entre que la radicación siga o se quede detenida.
+    """
+    tipo_legible = (
+        "una cuenta de cobro" if invoice_type == "CUENTA DE COBRO" else "una factura electrónica"
+    )
+    pendientes = "\n".join(f"  - {item}" for item in missing_documents) or "  - Documentación de compras."
+    return (
+        f"Hola equipo de Compras,\n\n"
+        f"Recibimos {tipo_legible} que no podemos radicar porque falta un documento "
+        f"que emite esta casa, no el proveedor.\n\n"
+        f"ID interno: {radicado}\n"
+        f"Proveedor: {sender_email}\n"
+        f"Documento(s) pendiente(s):\n"
+        f"{pendientes}\n\n"
+        "CÓMO DEVOLVER EL SOPORTE\n\n"
+        "  1. Responda a ESTE MISMO correo, con el botón Responder.\n"
+        "  2. Adjunte el soporte en PDF con texto seleccionable, no como "
+        "fotografía ni escaneo de imagen.\n"
+        "  3. No necesita escribir nada más: con el archivo adjunto basta.\n\n"
+        "IMPORTANTE — no cree un correo nuevo.\n\n"
+        "La respuesta se relaciona con la factura por esta conversación. Un "
+        "correo nuevo, empezado desde cero, no queda vinculado a nada: el "
+        "sistema no puede saber a qué factura pertenece el soporte y la "
+        "radicación se queda detenida esperando indefinidamente.\n\n"
+        f"Si por alguna razón tiene que enviarlo en un correo aparte, conserve "
+        f"el identificador {radicado} en el asunto: es lo único que permite "
+        f"relacionarlo con esta factura.\n\n"
+        "Mientras tanto la factura queda en REVISIÓN MANUAL, sin responderle "
+        "al proveedor.\n"
+    )
+
+
 def build_forward_body(
     rejection_text: str,
     from_header: str,
@@ -2963,9 +3068,10 @@ def send_reply_email(gmail_service, original_msg: Dict, to_email: str, subject: 
     gmail_service.users().messages().send(userId="me", body=payload).execute()
 
 
-def send_new_email(gmail_service, to_email: str, subject: str, body: str) -> None:
+def send_new_email(gmail_service, to_email: str, subject: str, body: str) -> Optional[Dict]:
+    """Devuelve la respuesta de Gmail para poder rastrear el hilo creado."""
     payload = {"raw": create_raw_email(to_email, subject, body)}
-    gmail_service.users().messages().send(userId="me", body=payload).execute()
+    return gmail_service.users().messages().send(userId="me", body=payload).execute()
 
 
 def send_forward_with_attachments(
@@ -2974,9 +3080,10 @@ def send_forward_with_attachments(
     subject: str,
     body: str,
     attachments: List[Dict[str, object]],
-) -> None:
+) -> Optional[Dict]:
+    """Devuelve la respuesta de Gmail para poder rastrear el hilo creado."""
     payload = {"raw": create_forward_email(to_email, subject, body, attachments)}
-    gmail_service.users().messages().send(userId="me", body=payload).execute()
+    return gmail_service.users().messages().send(userId="me", body=payload).execute()
 
 
 def build_token_alert_email(failed_account: str) -> Tuple[str, str]:
@@ -3237,6 +3344,42 @@ def process_message(
         save_state(state, account_id)
         return
 
+    # Respuesta de Compras al correo que se le reenvió. No es una factura
+    # nueva: es el documento que faltaba. Se etiqueta la respuesta y se
+    # confirma la factura original en REVISIÓN MANUAL, para que una persona
+    # radique con la conversación y los archivos ya completos. No se responde
+    # a nadie ni se aprueba nada de forma automática.
+    compras_link = state_find_compras_forward(state, msg.get("threadId"), subject)
+    if compras_link:
+        compras_radicado = str(compras_link.get("radicado") or "")
+        original_message_id = str(compras_link.get("original_message_id") or "")
+        try:
+            apply_single_status_label(
+                gmail_service,
+                message_id,
+                LABEL_REVIEW_NAME,
+                archive=ARCHIVE_REVIEW,
+            )
+        except Exception as error:
+            logger.error("❌ Falló etiquetado de la respuesta de Compras: %s", error)
+        if original_message_id and original_message_id != message_id:
+            try:
+                apply_single_status_label(
+                    gmail_service,
+                    original_message_id,
+                    LABEL_REVIEW_NAME,
+                    archive=ARCHIVE_REVIEW,
+                )
+            except Exception as error:
+                logger.error("❌ Falló re-etiquetado de la factura original: %s", error)
+        print(
+            f"📬 RESPUESTA DE COMPRAS | radicado={compras_radicado} | "
+            f"factura original={original_message_id or 'desconocida'} -> Revisión Manual"
+        )
+        state_add_processed(state, message_id)
+        save_state(state, account_id)
+        return
+
     ahora_ms = int(time.time() * 1000)
     if (
         LIMITE_ANTIGUEDAD_ENABLED
@@ -3408,6 +3551,7 @@ def process_message(
         return
 
     reasons: List[str] = []
+    missing_purchase_documents: List[str] = []
     cuenta_cobro_validation: Optional[Dict[str, object]] = None
     if invoice_type == "CUENTA DE COBRO":
         cuenta_cobro_validation = validate_cuenta_cobro_package(pdfs + images)
@@ -3416,6 +3560,15 @@ def process_message(
         if validation_status == "incompleto":
             faltantes = format_missing_documents(cuenta_cobro_validation.get("faltantes") or [])
             reasons.append("Cuenta de cobro incompleta. Faltan: " + ", ".join(faltantes) + ".")
+
+        # El OK de compras se exige igual que en factura electrónica, con el
+        # mismo detector estricto y no con el clasificador del paquete. Así el
+        # criterio es idéntico en las dos ramas, y un mismo archivo puede
+        # aportar la orden y el OK a la vez (una orden ya firmada por Compras).
+        if not detect_ok_compras(pdfs + images):
+            reasons.append(MISSING_OK_COMPRAS_MESSAGE)
+            missing_purchase_documents.append("OK de compras")
+
         print("📦 Validación cuenta de cobro:", json.dumps(cuenta_cobro_validation, ensure_ascii=False))
         if zip_errors:
             reasons.extend(zip_errors)
@@ -3455,7 +3608,6 @@ def process_message(
         logger.info(f"🔎 Fuente final cliente: {'FALLBACK' if client_match else 'SIN_CLIENTE'}")
 
     has_ok_compras = detect_ok_compras(pdfs)
-    missing_purchase_documents: List[str] = []
     if invoice_type != "CUENTA DE COBRO":
         if not has_order:
             reasons.append(MISSING_ORDER_MESSAGE)
@@ -3464,13 +3616,22 @@ def process_message(
             reasons.append(MISSING_OK_COMPRAS_MESSAGE)
             missing_purchase_documents.append("OK de compras")
 
-    if reasons and invoice_type != "CUENTA DE COBRO" and MODO_PRUEBAS:
+    # El reenvío a Compras se le pide al área que sí puede emitir el documento.
+    # En factura electrónica cubre orden y OK. En cuenta de cobro cubre SOLO el
+    # OK de compras, y solo cuando es lo único que falta: el resto del paquete
+    # lo arma el proveedor, así que un paquete incompleto o un ZIP dañado se le
+    # rechazan a él también en modo pruebas.
+    reenvio_cubre_el_faltante = (
+        invoice_type != "CUENTA DE COBRO" or reasons == [MISSING_OK_COMPRAS_MESSAGE]
+    )
+    if reasons and reenvio_cubre_el_faltante and MODO_PRUEBAS:
         if COMPRAS_EMAIL:
             faltantes = " y ".join(missing_purchase_documents)
-            request_text = (
-                f"Falta documentación para completar la radicación {radicado}:\n"
-                + "\n".join(f"- {item}" for item in missing_purchase_documents)
-                + "\n\nPor favor responder este correo adjuntando el archivo requerido."
+            request_text = build_compras_request_text(
+                radicado=radicado,
+                invoice_type=invoice_type,
+                sender_email=sender_email,
+                missing_documents=missing_purchase_documents,
             )
             forward_body = build_forward_body(
                 rejection_text=request_text,
@@ -3516,14 +3677,14 @@ def process_message(
                         "Adjuntos para Compras superan 20 MB; se envía solo texto | %s",
                         radicado,
                     )
-                    send_new_email(
+                    forward_response = send_new_email(
                         gmail_service,
                         COMPRAS_EMAIL,
                         forward_subject,
                         forward_body,
                     )
                 elif original_attachments:
-                    send_forward_with_attachments(
+                    forward_response = send_forward_with_attachments(
                         gmail_service,
                         COMPRAS_EMAIL,
                         forward_subject,
@@ -3531,12 +3692,21 @@ def process_message(
                         original_attachments,
                     )
                 else:
-                    send_new_email(
+                    forward_response = send_new_email(
                         gmail_service,
                         COMPRAS_EMAIL,
                         forward_subject,
                         forward_body,
                     )
+                # El vínculo permite reconocer la respuesta de Compras cuando
+                # llegue y llevar la factura original a REVISIÓN MANUAL con el
+                # documento que faltaba ya en la conversación.
+                state_track_compras_forward(
+                    state,
+                    (forward_response or {}).get("threadId"),
+                    radicado,
+                    message_id,
+                )
                 logger.info(
                     "📨 Reenviado a Compras (%s) por falta de: %s | %s",
                     COMPRAS_EMAIL,
@@ -3555,6 +3725,19 @@ def process_message(
                     f"[Reenvío Compras] Falló el reenvío de {radicado} "
                     f"a {COMPRAS_EMAIL}: {error}"
                 )
+
+            # La factura queda en REVISIÓN MANUAL desde el envío: está detenida
+            # esperando un documento interno, y así se ve en la bandeja en vez
+            # de quedar sin marca hasta que Compras conteste.
+            try:
+                apply_single_status_label(
+                    gmail_service,
+                    message_id,
+                    LABEL_REVIEW_NAME,
+                    archive=ARCHIVE_REVIEW,
+                )
+            except Exception as error:
+                logger.error("❌ Falló etiquetado de la factura reenviada | %s: %s", radicado, error)
 
             try:
                 gmail_service.users().messages().modify(

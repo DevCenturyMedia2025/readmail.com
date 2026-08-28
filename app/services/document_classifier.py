@@ -105,6 +105,12 @@ CUENTA_COBRO_REQUIRED_DOCS = [
     "orden_compra",
 ]
 
+# Un unico documento no identificado puede cubrir la ausencia de estos tres,
+# porque son soportes del proveedor y un archivo mal nombrado suele ser uno de
+# ellos. La orden de compra queda fuera a proposito: es el documento que
+# autoriza el pago, asi que su ausencia nunca se da por cubierta.
+UNKNOWN_COVERABLE_DOCS = frozenset({"cedula", "rut", "certificado_bancario"})
+
 DOCUMENT_CLASSIFIERS = {
     "cuenta_cobro": {
         "required_any": ("cuenta cobro", "cuenta de cobro", "cuenta_cobro", "cta"),
@@ -417,7 +423,12 @@ def validate_cuenta_cobro_package(files: List[UnifiedFile]) -> Dict[str, object]
     identified_required_count = sum(1 for doc_type in CUENTA_COBRO_REQUIRED_DOCS if identified[doc_type])
 
     complete = not faltantes
-    complete_with_unknown = bool(faltantes) and len(unknown) == 1 and identified_required_count >= 4
+    complete_with_unknown = (
+        bool(faltantes)
+        and len(unknown) == 1
+        and identified_required_count >= 4
+        and all(doc_type in UNKNOWN_COVERABLE_DOCS for doc_type in faltantes)
+    )
     estado = (
         "completo"
         if complete

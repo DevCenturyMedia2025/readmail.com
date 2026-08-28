@@ -259,7 +259,7 @@ def test_fe_pruebas_reenvia_faltante_a_compras(monkeypatch, caplog, pdf, expecte
         compras_email="compras@example.test",
     )
 
-    assert calls["labels"] == []
+    assert calls["labels"] == [(reademail.LABEL_REVIEW_NAME, False)]
     assert calls["replies"] == []
     assert calls["new_emails"] == []
     assert len(calls["forwards"]) == 1
@@ -267,7 +267,8 @@ def test_fe_pruebas_reenvia_faltante_a_compras(monkeypatch, caplog, pdf, expecte
     assert destination == "compras@example.test"
     assert subject.startswith("Falta documentación - Factura Cliente Demo (ID: ")
     assert f"- {expected_missing}" in body
-    assert "Por favor responder este correo adjuntando el archivo requerido." in body
+    assert "Responda a ESTE MISMO correo" in body
+    assert "IMPORTANTE — no cree un correo nuevo." in body
     assert "---------- Mensaje original ----------" in body
     assert "Cuerpo original de la factura." in body
     assert forwarded_attachments == [

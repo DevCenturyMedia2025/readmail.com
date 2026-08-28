@@ -203,10 +203,9 @@ def test_sin_orden_en_pruebas_se_reenvia_a_compras(monkeypatch):
         compras_email="compras@ejemplo.test",
     )
 
-    assert llamadas["labels"] == []
+    assert llamadas["labels"] == [reademail.LABEL_REVIEW_NAME]
     assert len(llamadas["forwards"]) == 1
     assert llamadas["replies"] == []
-    assert reademail.LABEL_REVIEW_NAME not in llamadas["labels"]
 
 
 def test_sin_orden_en_modo_real_se_rechaza_con_el_motivo_de_orden(monkeypatch):
@@ -225,7 +224,7 @@ def test_sin_orden_ni_ok_en_pruebas_se_reenvia_a_compras(monkeypatch):
         compras_email="compras@ejemplo.test",
     )
 
-    assert llamadas["labels"] == []
+    assert llamadas["labels"] == [reademail.LABEL_REVIEW_NAME]
     assert len(llamadas["forwards"]) == 1
 
 
@@ -255,7 +254,7 @@ def test_sin_ok_con_orden_en_pruebas_se_reenvia(monkeypatch):
         compras_email="compras@ejemplo.test",
     )
 
-    assert llamadas["labels"] == []
+    assert llamadas["labels"] == [reademail.LABEL_REVIEW_NAME]
     assert len(llamadas["forwards"]) == 1
 
 
@@ -277,12 +276,13 @@ def test_factura_completa_se_aprueba_con_el_cliente_correcto(monkeypatch):
 # La cuenta de cobro no cambia
 # --------------------------------------------------------------------------
 def _paquete_cuenta_cobro():
+    """Paquete completo: los 5 documentos y el OK de compras sobre la orden."""
     return [
         _pdf("cuenta de cobro.pdf", "CUENTA DE COBRO"),
         _pdf("cedula.pdf", "REPUBLICA DE COLOMBIA CEDULA DE CIUDADANIA"),
         _pdf("rut.pdf", "Registro Unico Tributario RUT DIAN"),
         _pdf("certificado bancario.pdf", "bancolombia certifica cuenta de ahorros nro de producto"),
-        _pdf("orden de compra.pdf", "ORDEN DE COMPRA No 4501"),
+        _pdf("orden de compra.pdf", "ORDEN DE COMPRA No 4501 aprobado por compras"),
     ]
 
 
@@ -317,3 +317,116 @@ def test_cuenta_de_cobro_sin_cliente_no_va_a_revision_por_cliente(monkeypatch):
     llamadas = _correr(monkeypatch, _paquete_cuenta_cobro(), catalogo=[])
 
     assert llamadas["labels"] == [reademail.LABEL_APPROVED_NAME]
+
+
+# --------------------------------------------------------------------------
+# La cuenta de cobro tambien exige el OK de compras
+# --------------------------------------------------------------------------
+def test_cuenta_de_cobro_sin_ok_de_compras_se_rechaza(monkeypatch):
+    paquete = _paquete_cuenta_cobro()
+    paquete[-1] = _pdf("orden de compra.pdf", "ORDEN DE COMPRA No 4501")
+
+    llamadas = _correr(monkeypatch, paquete)
+
+    assert llamadas["labels"] == [reademail.LABEL_REJECTED_NAME]
+    assert len(llamadas["replies"]) == 1
+
+
+def test_cuenta_de_cobro_acepta_el_ok_en_un_archivo_aparte(monkeypatch):
+    paquete = _paquete_cuenta_cobro()
+    paquete[-1] = _pdf("orden de compra.pdf", "ORDEN DE COMPRA No 4501")
+    paquete.append(_pdf("ok compras.pdf", ""))
+
+    llamadas = _correr(monkeypatch, paquete)
+
+    assert llamadas["labels"] == [reademail.LABEL_APPROVED_NAME]
+
+
+def test_cuenta_de_cobro_sin_ok_se_reenvia_a_compras_en_pruebas(monkeypatch):
+    """El OK es interno: en pruebas se le pide a Compras, no al proveedor."""
+    paquete = _paquete_cuenta_cobro()
+    paquete[-1] = _pdf("orden de compra.pdf", "ORDEN DE COMPRA No 4501")
+
+    llamadas = _correr(
+        monkeypatch,
+        paquete,
+        modo_pruebas=True,
+        compras_email="compras@ejemplo.test",
+    )
+
+    assert len(llamadas["forwards"]) == 1
+    assert llamadas["labels"] == [reademail.LABEL_REVIEW_NAME]
+    assert llamadas["replies"] == []
+
+
+def test_cuenta_de_cobro_sin_ok_se_rechaza_sin_compras_email(monkeypatch):
+    """Sin buzon de Compras el reenvio no ocurre y se cae al rechazo normal."""
+    paquete = _paquete_cuenta_cobro()
+    paquete[-1] = _pdf("orden de compra.pdf", "ORDEN DE COMPRA No 4501")
+
+    llamadas = _correr(monkeypatch, paquete, modo_pruebas=True, compras_email="")
+
+    assert llamadas["labels"] == [reademail.LABEL_REJECTED_NAME]
+    assert len(llamadas["replies"]) == 1
+    assert llamadas["forwards"] == []
+
+
+def test_cuenta_de_cobro_incompleta_no_se_reenvia_ni_en_pruebas(monkeypatch):
+    """El reenvio cubre el OK, no el paquete: eso lo arma el proveedor."""
+    paquete = _paquete_cuenta_cobro()[:3]
+
+    llamadas = _correr(
+        monkeypatch,
+        paquete,
+        modo_pruebas=True,
+        compras_email="compras@ejemplo.test",
+    )
+
+    assert llamadas["labels"] == [reademail.LABEL_REJECTED_NAME]
+    assert llamadas["forwards"] == []
+    assert len(llamadas["replies"]) == 1
+
+
+# --------------------------------------------------------------------------
+# El reenvio a Compras es exclusivo del modo pruebas
+# --------------------------------------------------------------------------
+def _cc_sin_ok():
+    paquete = _paquete_cuenta_cobro()
+    paquete[-1] = _pdf("orden de compra.pdf", "ORDEN DE COMPRA No 4501")
+    return paquete
+
+
+@pytest.mark.parametrize(
+    "archivos",
+    [
+        [ORDEN_EN_CATALOGO, XML],
+        [OK_COMPRAS, XML],
+        [_pdf("factura.pdf", "factura de venta"), XML],
+        _cc_sin_ok(),
+        _paquete_cuenta_cobro()[:3],
+    ],
+    ids=[
+        "fe_sin_ok",
+        "fe_sin_orden",
+        "fe_sin_orden_ni_ok",
+        "cuenta_cobro_sin_ok",
+        "cuenta_cobro_incompleta",
+    ],
+)
+def test_modo_real_nunca_reenvia_a_compras(monkeypatch, archivos):
+    """Fuera de MODO_PRUEBAS solo se rechaza, en las dos ramas.
+
+    Se define COMPRAS_EMAIL a proposito: el buzon configurado no debe bastar
+    para que el reenvio ocurra; la unica llave es MODO_PRUEBAS.
+    """
+    llamadas = _correr(
+        monkeypatch,
+        archivos,
+        modo_pruebas=False,
+        compras_email="compras@ejemplo.test",
+    )
+
+    assert llamadas["forwards"] == []
+    assert llamadas["new_emails"] == []
+    assert llamadas["labels"] == [reademail.LABEL_REJECTED_NAME]
+    assert len(llamadas["replies"]) == 1
